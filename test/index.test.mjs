@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { DEFAULT_CONFIG, normalizeConfig, createHandler, makeRecorder } from "../index.js";
+import { DEFAULT_CONFIG, normalizeConfig, createHandler, makeRecorder, makeModeStore } from "../index.js";
 import { mkdtempSync, readFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -211,6 +211,7 @@ test("apply: registers the approval/request listener and self-proves", async () 
 	const logFile = join(mkdtempSync(join(tmpdir(), "dsh-codex-approval-")), "logs", "approval.jsonl");
 	const ctx = {
 		on: (name, fn) => { listeners[name] = fn; },
+		inject: () => {},
 		logger: { info: () => {}, warn: () => {} }
 	};
 	await apply(ctx, { logFile });
@@ -218,4 +219,170 @@ test("apply: registers the approval/request listener and self-proves", async () 
 	// the plugin-loaded self-proof record is written
 	const lines = readFileSync(logFile, "utf8").trim().split("\n");
 	assert.equal(JSON.parse(lines[0]).event, "plugin-loaded");
+});
+
+// ---------- approval-mode dimension (v0.2.0) ----------
+
+function modeConfig(overrides = {}) {
+	return normalizeConfig({
+		...overrides,
+		rules: overrides.rules ?? [{ match: "Bash(git *)", action: "allow" }, { match: "Bash(rm *)", action: "deny" }, { match: "Bash(askme *)", action: "ask" }],
+		ai: { enabled: false }
+	});
+}
+
+async function runWith(handler, req) {
+	const nextCalls = [];
+	const outcome = await handler(req, async () => {
+		nextCalls.push("next");
+		return "unavailable";
+	});
+	return { outcome, nextCalls };
+}
+
+test("handler: manual mode bypasses entirely (no decision, no record)", async () => {
+	const cfg = modeConfig({ mode: "manual" });
+	let recorded = false;
+	const handler = createHandler({ config: cfg, record: async () => { recorded = true; }, llmRunner: async () => ({ ok: true, text: "{}" }) });
+	const { outcome, nextCalls } = await runWith(handler, makeReq({ command: "rm -rf /" }));
+	assert.equal(outcome, "unavailable");
+	assert.equal(nextCalls.length, 1);
+	assert.equal(recorded, false);
+});
+
+test("handler: ai mode routes rule-ask to the human (next)", async () => {
+	const cfg = modeConfig({ mode: "ai" });
+	const handler = createHandler({ config: cfg, record: async () => {}, llmRunner: async () => ({ ok: true, text: "{}" }) });
+	const { outcome, nextCalls } = await runWith(handler, makeReq({ command: "askme something" }));
+	assert.equal(outcome, "unavailable");
+	assert.equal(nextCalls.length, 1);
+});
+
+test("handler: ai-auto resolves rule-ask via mode3OnAsk=deny without next", async () => {
+	const cfg = modeConfig({ mode: "ai-auto", mode3OnAsk: "deny" });
+	const entries = [];
+	const handler = createHandler({ config: cfg, record: async (e) => entries.push(e), llmRunner: async () => ({ ok: true, text: "{}" }) });
+	const { outcome, nextCalls } = await runWith(handler, makeReq({ command: "askme something" }));
+	assert.equal(outcome, "rejected");
+	assert.equal(nextCalls.length, 0);
+	assert.equal(entries[0].mode, "ai-auto");
+	assert.equal(entries[0].viaAskResolution, true);
+	assert.equal(entries[0].action, "deny");
+});
+
+test("handler: ai-auto resolves rule-ask via mode3OnAsk=allow", async () => {
+	const cfg = modeConfig({ mode: "ai-auto", mode3OnAsk: "allow" });
+	const handler = createHandler({ config: cfg, record: async () => {}, llmRunner: async () => ({ ok: true, text: "{}" }) });
+	const { outcome, nextCalls } = await runWith(handler, makeReq({ command: "askme something" }));
+	assert.equal(outcome, "allowed-once");
+	assert.equal(nextCalls.length, 0);
+});
+
+test("handler: ai-auto resolves AI-ask over tolerance via mode3OnAsk", async () => {
+	const cfg = modeConfig({ mode: "ai-auto", ai: { enabled: true, riskTolerance: "medium" } });
+	const handler = createHandler({
+		config: cfg,
+		record: async () => {},
+		llmRunner: async () => ({ ok: true, text: '{"risk":"high","authorization":"ask","reason":"risky"}' })
+	});
+	const { outcome, nextCalls } = await runWith(handler, makeReq({ command: "something" }));
+	assert.equal(outcome, "rejected");
+	assert.equal(nextCalls.length, 0);
+});
+
+test("handler: ai-auto resolves AI failure with failOpen=ask via mode3OnAsk", async () => {
+	const cfg = modeConfig({ mode: "ai-auto", ai: { enabled: true, failOpen: "ask" } });
+	const handler = createHandler({ config: cfg, record: async () => {}, llmRunner: async () => ({ ok: false, error: "timeout" }) });
+	const { outcome, nextCalls } = await runWith(handler, makeReq({ command: "something" }));
+	assert.equal(outcome, "rejected");
+	assert.equal(nextCalls.length, 0);
+});
+
+test("handler: ai-auto keeps rule allow and rule deny unchanged", async () => {
+	const cfg = modeConfig({ mode: "ai-auto" });
+	const handler = createHandler({ config: cfg, record: async () => {}, llmRunner: async () => ({ ok: true, text: "{}" }) });
+	const allowed = await runWith(handler, makeReq({ command: "git status" }));
+	assert.equal(allowed.outcome, "allowed-once");
+	assert.equal(allowed.nextCalls.length, 0);
+	const denied = await runWith(handler, makeReq({ command: "rm -rf /tmp/x" }));
+	assert.equal(denied.outcome, "rejected");
+	assert.equal(denied.nextCalls.length, 0);
+});
+
+test("handler: getSessionMode override switches the effective mode", async () => {
+	const cfg = modeConfig({ mode: "ai" });
+	const handler = createHandler({
+		config: cfg,
+		record: async () => {},
+		llmRunner: async () => ({ ok: true, text: "{}" }),
+		getSessionMode: async (sessionId) => (sessionId === "sess-1" ? "ai-auto" : undefined)
+	});
+	const { outcome, nextCalls } = await runWith(handler, makeReq({ command: "askme something" }));
+	assert.equal(outcome, "rejected"); // sess-1 override → ai-auto → ask resolves deny
+	assert.equal(nextCalls.length, 0);
+});
+
+test("handler: record carries the effective mode", async () => {
+	const cfg = modeConfig({ mode: "ai" });
+	const entries = [];
+	const handler = createHandler({ config: cfg, record: async (e) => entries.push(e), llmRunner: async () => ({ ok: true, text: "{}" }) });
+	await runWith(handler, makeReq({ command: "rm -rf /tmp/x" }));
+	assert.equal(entries[0].mode, "ai");
+});
+
+test("normalizeConfig: mode defaults and validation", () => {
+	assert.equal(normalizeConfig({}).mode, "ai");
+	assert.equal(normalizeConfig({}).mode3OnAsk, "deny");
+	assert.equal(normalizeConfig({ mode: "ai-auto", mode3OnAsk: "allow" }).mode3OnAsk, "allow");
+	assert.throws(() => normalizeConfig({ mode: "auto" }), TypeError);
+	assert.throws(() => normalizeConfig({ mode3OnAsk: "ask" }), TypeError);
+});
+
+test("makeModeStore: memory-only when settings service is absent", async () => {
+	const store = makeModeStore({ inject: () => {} }, undefined);
+	assert.equal(await store.get("s1"), undefined);
+	assert.equal(await store.set("s1", "ai-auto"), "memory-only");
+	assert.equal(await store.get("s1"), "ai-auto");
+	assert.equal(await store.clear("s1"), "memory-only");
+	assert.equal(await store.get("s1"), undefined);
+});
+
+test("registerModeCommand: registers the command and switches modes", async () => {
+	const { registerModeCommand } = await import("../index.js");
+	const store = {
+		get: async () => undefined,
+		set: async (id, mode) => { lastSet = { id, mode }; return "memory-only"; },
+		clear: async () => { cleared = true; return "memory-only"; }
+	};
+	let lastSet, cleared;
+	let registered = null;
+	const ctx = {
+		inject: (deps, fn) => {
+			assert.deepEqual(deps, ["commands"]);
+			fn({ commands: { register: (def) => { registered = def; } } });
+		}
+	};
+	const cfg = normalizeConfig({});
+	registerModeCommand(ctx, cfg, store);
+	assert.equal(registered.name, "approval-mode");
+
+	// show current
+	const shown = await registered.handler({ agent: { session: { id: "s1" } }, rawInput: "" });
+	assert.equal(shown.kind, "success");
+	assert.match(shown.text, /approval mode: ai/);
+
+	// switch via numeric alias
+	const switched = await registered.handler({ agent: { session: { id: "s1" } }, rawInput: "3" });
+	assert.equal(switched.kind, "success");
+	assert.match(switched.text, /ai-auto/);
+	assert.deepEqual(lastSet, { id: "s1", mode: "ai-auto" });
+
+	// invalid input
+	const bad = await registered.handler({ agent: { session: { id: "s1" } }, rawInput: "full" });
+	assert.match(bad.text, /unknown approval mode/);
+
+	// clear
+	const clearedRes = await registered.handler({ agent: { session: { id: "s1" } }, rawInput: "default" });
+	assert.match(clearedRes.text, /cleared/);
+	assert.equal(cleared, true);
 });

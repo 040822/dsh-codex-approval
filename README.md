@@ -34,7 +34,29 @@ approval/request 到达（toolName + callId + reason）
 └─ 4. 兜底：fallback（默认 ask → GUI 弹窗）
 ```
 
-每次决策写入一行 JSONL 审计日志（默认 `~/.dsh/logs/approval.jsonl`）：工具名、命令预览、reason、判定来源（rule / ai / ai-error / fallback）、风险、AI 理由、耗时。
+每次决策写入一行 JSONL 审计日志（默认 `~/.dsh/logs/approval.jsonl`）：工具名、命令预览、reason、判定来源（rule / ai / ai-error / fallback）、**模式（mode）**、风险、AI 理由、耗时。
+
+## 审批模式（v0.2.0）
+
+插件提供一个与 dsh 沙箱模式**正交**的审批模式维度，三种模式按需切换：
+
+| 模式 | 名称 | 行为 | 场景 |
+|---|---|---|---|
+| 1 | `manual` | **完全旁路**：不决策、不写日志，审批全部交回人类弹窗 | 回归未装插件的原生体验 |
+| 2 | `ai`（默认） | 规则 → AI → ask 交人类 | 日常：低风险自动、高风险问人 |
+| 3 | `ai-auto` | 规则 → AI → **ask 永不交人类**，按 `mode3OnAsk`（默认 deny）处理 | 全自动操作但又不放心 full access：AI 全权把关，绝不弹窗 |
+
+**运行时切换**（GUI 斜杠命令，作用于当前会话，持久化到 settings）：
+
+```
+/approval-mode            显示当前模式（覆盖值 + 生效值）
+/approval-mode 3          切换为 ai-auto（也接受 ai-auto / 1 / 2 / manual 等）
+/approval-mode default    清除会话覆盖，回落到配置默认
+```
+
+**ai-auto 下 ask 的归宿**（`mode3OnAsk`，默认 `deny`）：规则 ask、AI 判 ask 且超容忍度、AI 故障 failOpen=ask、兜底 fallback=ask——全部按此处理，绝不弹窗。⚠️ 若设为 `allow`，AI 无法决定时也会放行高风险操作，**慎用**。
+
+**模式持久化**：会话覆盖存 `~/.dsh/settings.yaml` 的 `dsh-codex-approval` 命名空间（settings 服务不可用时降级为纯内存，重启丢失）。默认模式由配置 `mode` 字段决定。
 
 ## 安装
 
@@ -50,6 +72,8 @@ dsh plugin --profile web add dsh-codex-approval
 ```yaml
 - id: dsh-codex-approval
   config:
+    mode: ai                   # manual | ai | ai-auto（默认 ai）
+    mode3OnAsk: deny           # deny | allow（ai-auto 下 ask 的归宿；默认 deny 安全）
     rules:
       - match: 'Bash(git status*)'   # 命中即自动通过（Codex approve-always）
         action: allow

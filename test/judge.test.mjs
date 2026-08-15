@@ -106,3 +106,29 @@ test("judgeWith: unparseable output fails with ok:false", async () => {
 	assert.equal(result.ok, false);
 	assert.equal(result.error, "unparseable judge output");
 });
+
+test("buildJudgeMessages: allowAsk=false forbids ask in the prompt", () => {
+	const [message] = buildJudgeMessages({ toolName: "bash", argsText: "ls", reason: "" }, { allowAsk: false });
+	const text = message.content[0].text;
+	assert.match(text, /"ask" is NOT available/);
+	assert.match(text, /"authorization":"allow\|deny"/);
+	assert.doesNotMatch(text, /When uncertain, prefer "ask"/);
+});
+
+test("buildJudgeMessages: default prompt still allows ask", () => {
+	const [message] = buildJudgeMessages({ toolName: "bash", argsText: "ls", reason: "" });
+	const text = message.content[0].text;
+	assert.match(text, /"authorization":"allow\|ask\|deny"/);
+	assert.match(text, /When uncertain, prefer "ask"/);
+});
+
+test("judgeWith: allowAsk=false is forwarded to the messages", async () => {
+	const seen = [];
+	const runner = async (messages) => {
+		seen.push(messages);
+		return { ok: true, text: '{"risk":"low","authorization":"allow","reason":"fine"}' };
+	};
+	const result = await judgeWith({ runner, input: { toolName: "bash", argsText: "ls", reason: "" }, allowAsk: false });
+	assert.equal(result.ok, true);
+	assert.match(seen[0][0].content[0].text, /"ask" is NOT available/);
+});

@@ -24,10 +24,12 @@ import { appendFile, mkdir } from "node:fs/promises";
 import { mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, dirname } from "node:path";
+import z from "@deepseek-ai/schemastery";
 
 import { evaluateRules } from "./rules.js";
 import { findToolCallArgs, argsPreview } from "./enrich.js";
 import { judgeWith, decideAuthorization } from "./judge.js";
+import { MODES, parseMode, resolveMode, effectiveOnAsk } from "./modes.js";
 
 export const name = "dsh-codex-approval";
 
@@ -43,6 +45,8 @@ export const inject = ["approval", "llm"];
 /** Default configuration — tune via the profile patch id-targeted config. */
 export const DEFAULT_CONFIG = {
 	enabled: true,
+	mode: "ai",
+	mode3OnAsk: "deny",
 	rules: [
 		// read-only / harmless commands: auto-approve
 		{ match: "Bash(git status*)", action: "allow" },
@@ -86,6 +90,8 @@ const TOLERANCES = ["low", "medium", "high"];
 function assertConfig(cfg) {
 	if (typeof cfg !== "object" || cfg === null) throw new TypeError("dsh-codex-approval: config must be an object");
 	if (typeof cfg.enabled !== "boolean") throw new TypeError("dsh-codex-approval: config.enabled must be a boolean");
+	if (!MODES.includes(cfg.mode)) throw new TypeError(`dsh-codex-approval: config.mode must be one of ${MODES.join("/")}`);
+	if (!["deny", "allow"].includes(cfg.mode3OnAsk)) throw new TypeError("dsh-codex-approval: config.mode3OnAsk must be deny/allow");
 	if (!Array.isArray(cfg.rules)) throw new TypeError("dsh-codex-approval: config.rules must be an array");
 	for (const rule of cfg.rules) {
 		if (typeof rule.match !== "string" || rule.match === "") throw new TypeError("dsh-codex-approval: each rule needs a non-empty match");
@@ -141,15 +147,22 @@ export function makeLlmRunner(llm, { provider, model, timeoutMs, maxTokens }) {
 /**
  * Create the approval/request handler with injected dependencies
  * (unit-testable without a cordis ctx).
- * @param deps - { config, record, llmRunner }
+ * @param deps - { config, record, llmRunner, getSessionMode }
  * @returns async (req, next) => ApprovalOutcome
  */
-export function createHandler({ config, record, llmRunner }) {
+export function createHandler({ config, record, llmRunner, getSessionMode }) {
 	const cfg = config;
 	return async (req, next) => {
 		const started = Date.now();
 		if (req.signal?.aborted === true) return "cancelled";
 		if (!cfg.enabled) return next();
+
+		const sessionId = req.agent?.session?.id ?? req.agent?.id;
+		const override = await getSessionMode?.(sessionId);
+		const mode = resolveMode(override, cfg.mode);
+
+		// mode 1: fully bypassed — the pre-plugin experience (no decision, no audit)
+		if (mode === "manual") return next();
 
 		const args = findToolCallArgs(req.agent?.session?.events, req.callId);
 		const argsText = argsPreview(args, req.toolName, cfg.ai.maxPromptChars);
@@ -162,7 +175,8 @@ export function createHandler({ config, record, llmRunner }) {
 		} else if (cfg.ai.enabled) {
 			const judged = await judgeWith({
 				runner: llmRunner,
-				input: { toolName: req.toolName, argsText, reason: req.reason ?? "" }
+				input: { toolName: req.toolName, argsText, reason: req.reason ?? "" },
+				allowAsk: mode !== "ai-auto"
 			});
 			if (judged.ok) {
 				const authorization = decideAuthorization(judged.verdict, cfg.ai.riskTolerance);
@@ -186,9 +200,18 @@ export function createHandler({ config, record, llmRunner }) {
 			verdict = { kind: "fallback", action: cfg.fallback, outcome: outcomeFor(cfg.fallback) };
 		}
 
+		// mode 3 (ai-auto): an "ask" is never routed to a human — resolve it
+		// through mode3OnAsk (default deny), regardless of its source
+		// (rule ask, AI ask over tolerance, failOpen=ask, fallback=ask).
+		if (mode === "ai-auto" && verdict.action === "ask") {
+			const resolved = effectiveOnAsk(mode, cfg.mode3OnAsk);
+			verdict = { ...verdict, action: resolved, outcome: outcomeFor(resolved), viaAskResolution: true };
+		}
+
 		await record({
 			ts: new Date().toISOString(),
-			sessionId: req.agent?.session?.id ?? req.agent?.id ?? "?",
+			sessionId: sessionId ?? "?",
+			mode,
 			toolName: req.toolName,
 			callId: req.callId,
 			argsPreview: argsText.slice(0, 300),
@@ -217,12 +240,106 @@ export function makeRecorder(logFile) {
 	};
 }
 
+/**
+ * Per-session approval-mode store. Persists through the dsh settings service
+ * under the `dsh-codex-approval` namespace when available; falls back to
+ * memory only (survives nothing) otherwise. All writes go through `replace`
+ * so the whole `sessionOverrides` map stays authoritative in one place.
+ */
+export function makeModeStore(ctx, logger) {
+	const memory = new Map();
+	let settings = null;
+	ctx.inject(["settings"], (sctx) => {
+		settings = sctx.settings;
+		try {
+			sctx.settings.register("dsh-codex-approval", z.object({
+				sessionOverrides: z.record(z.string(), z.enum(MODES)).default({})
+			}), { base: {} });
+			const resolved = sctx.settings.get("dsh-codex-approval");
+			const overrides = resolved?.sessionOverrides;
+			if (overrides !== null && typeof overrides === "object") {
+				for (const [key, value] of Object.entries(overrides)) memory.set(key, value);
+			}
+		} catch (error) {
+			logger?.warn?.("[dsh-codex-approval] settings init failed (%s) — session overrides are memory-only", String(error?.message ?? error));
+		}
+	});
+	const persist = async () => {
+		if (settings === null) return "memory-only";
+		try {
+			const next = {};
+			for (const [key, value] of memory) next[key] = value;
+			await settings.replace("dsh-codex-approval", { sessionOverrides: next });
+			return "persisted";
+		} catch {
+			return "memory-only";
+		}
+	};
+	return {
+		async get(sessionId) {
+			if (sessionId === undefined || sessionId === null) return undefined;
+			return memory.get(sessionId);
+		},
+		async set(sessionId, mode) {
+			if (sessionId === undefined || sessionId === null) return "memory-only";
+			memory.set(sessionId, mode);
+			return persist();
+		},
+		async clear(sessionId) {
+			if (sessionId !== undefined && sessionId !== null) memory.delete(sessionId);
+			return persist();
+		}
+	};
+}
+
+/** Register the /approval-mode command (mirrors dsh-plan-mode's /plan). */
+export function registerModeCommand(ctx, cfg, store) {
+	ctx.inject(["commands"], (commandCtx) => {
+		commandCtx.commands.register({
+			name: "approval-mode",
+			description: "Show or switch the approval mode (manual | ai | ai-auto, or 1/2/3)",
+			input: { hint: "[manual|ai|ai-auto|default]" },
+			handler: async ({ agent, rawInput }) => {
+				const sessionId = agent?.session?.id ?? agent?.id;
+				const input = rawInput.trim();
+				if (input === "") {
+					const override = await store.get(sessionId);
+					const effective = resolveMode(override, cfg.mode);
+					const base = override === void 0
+						? `approval mode: ${effective} (config default: ${cfg.mode}, no session override)`
+						: `approval mode: ${effective} (session override: ${override}, config default: ${cfg.mode})`;
+					return { kind: "success", text: base };
+				}
+				if (input === "default" || input === "off" || input === "reset") {
+					const persisted = await store.clear(sessionId);
+					const note = persisted === "persisted" ? "" : " (memory-only: settings unavailable)";
+					return { kind: "success", text: `approval mode: session override cleared — effective ${cfg.mode} (config default)${note}` };
+				}
+				const mode = parseMode(input);
+				if (mode === null) {
+					return { kind: "success", text: `unknown approval mode "${input}" — use manual | ai | ai-auto (or 1/2/3), or "default" to clear the override` };
+				}
+				const persisted = await store.set(sessionId, mode);
+				const note = persisted === "persisted" ? "" : " (memory-only: settings unavailable, lost on restart)";
+				return { kind: "success", text: `approval mode → ${mode} for this session${note}` };
+			}
+		});
+	});
+}
+
 /** Cordis plugin entry: register the answerer when approval is composed. */
 export async function apply(ctx, userConfig) {
 	const cfg = normalizeConfig(userConfig);
+	const store = makeModeStore(ctx, ctx.logger);
 	const llmRunner = makeLlmRunner(ctx.llm, cfg.ai);
-	const handler = createHandler({ config: cfg, record: makeRecorder(cfg.logFile), llmRunner });
+	const handler = createHandler({
+		config: cfg,
+		record: makeRecorder(cfg.logFile),
+		llmRunner,
+		getSessionMode: (sessionId) => store.get(sessionId)
+	});
 	ctx.on("approval/request", handler);
+	registerModeCommand(ctx, cfg, store);
 	// Self-proving startup record: this line in the log after a restart proves
 	// the plugin loaded (decision records follow it). Awaited so a boot that
 	// cannot even write its own log fails loud instead of silently degrading.
@@ -230,11 +347,13 @@ export async function apply(ctx, userConfig) {
 		ts: new Date().toISOString(),
 		event: "plugin-loaded",
 		sessionId: "boot",
+		mode: cfg.mode,
+		mode3OnAsk: cfg.mode3OnAsk,
 		rules: cfg.rules.length,
 		ai: cfg.ai.enabled,
 		tolerance: cfg.ai.riskTolerance,
 		fallback: cfg.fallback
 	});
-	ctx.logger?.info?.("[dsh-codex-approval] answerer registered — rules=%d ai=%s tolerance=%s log=%s",
-		cfg.rules.length, cfg.ai.enabled ? "on" : "off", cfg.ai.riskTolerance, cfg.logFile);
+	ctx.logger?.info?.("[dsh-codex-approval] answerer registered — mode=%s rules=%d ai=%s tolerance=%s log=%s",
+		cfg.mode, cfg.rules.length, cfg.ai.enabled ? "on" : "off", cfg.ai.riskTolerance, cfg.logFile);
 }

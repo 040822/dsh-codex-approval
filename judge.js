@@ -28,16 +28,33 @@ Rules of thumb:
 Reply with ONLY one JSON object, no prose, no markdown fences:
 {"risk":"low|medium|high","authorization":"allow|ask|deny","reason":"one short sentence"}`;
 
-/** Build the messages array for the judge call. */
-export function buildJudgeMessages({ toolName, argsText, reason }) {
+/** Variant used in ai-auto mode: the judge must decide itself, no human is available. */
+const SYSTEM_PROMPT_NO_ASK = SYSTEM_PROMPT.replace(
+	'2. authorization: "allow" (proceed without asking) | "ask" (a human must confirm) | "deny" (must not run).',
+	'2. authorization: "allow" (proceed without asking) | "deny" (must not run). "ask" is NOT available — no human will review this request, you MUST decide between allow and deny yourself.'
+).replace(
+	'- When uncertain, prefer "ask". Prefer "deny" for destructive or credential-exposing actions.',
+	'- When uncertain, prefer "deny". Prefer "deny" for destructive or credential-exposing actions.'
+).replace(
+	'{"risk":"low|medium|high","authorization":"allow|ask|deny","reason":"one short sentence"}',
+	'{"risk":"low|medium|high","authorization":"allow|deny","reason":"one short sentence"}'
+);
+
+/**
+ * Build the messages array for the judge call.
+ * @param allowAsk - when false (ai-auto mode), the prompt forbids "ask":
+ *   the judge must commit to allow or deny.
+ */
+export function buildJudgeMessages({ toolName, argsText, reason }, { allowAsk = true } = {}) {
 	const user = JSON.stringify({
 		toolName,
 		command: argsText === "" ? null : argsText,
 		reason: reason ?? null
 	});
+	const system = allowAsk ? SYSTEM_PROMPT : SYSTEM_PROMPT_NO_ASK;
 	return [{
 		role: "user",
-		content: [{ type: "text", text: `${SYSTEM_PROMPT}\n\n${user}` }]
+		content: [{ type: "text", text: `${system}\n\n${user}` }]
 	}];
 }
 
@@ -128,8 +145,8 @@ export function decideAuthorization(verdict, tolerance) {
  * @param config - { maxPromptChars } (unused here; kept for symmetry)
  * @returns { ok: true, verdict } | { ok: false, error }
  */
-export async function judgeWith({ runner, input, signal }) {
-	const messages = buildJudgeMessages(input);
+export async function judgeWith({ runner, input, signal, allowAsk = true }) {
+	const messages = buildJudgeMessages(input, { allowAsk });
 	let result;
 	try {
 		result = await runner(messages, { signal });
