@@ -347,7 +347,7 @@ test("makeModeStore: memory-only when settings service is absent", async () => {
 	assert.equal(await store.get("s1"), undefined);
 });
 
-test("registerModeCommand: registers the command and switches modes", async () => {
+test("registerModeCommand: registers the command and switches modes (en default)", async () => {
 	const { registerModeCommand } = await import("../index.js");
 	const store = {
 		get: async () => undefined,
@@ -363,26 +363,144 @@ test("registerModeCommand: registers the command and switches modes", async () =
 		}
 	};
 	const cfg = normalizeConfig({});
-	registerModeCommand(ctx, cfg, store);
+	registerModeCommand(ctx, cfg, store); // no getLocale → English
 	assert.equal(registered.name, "approval-mode");
+	assert.match(registered.description, /Show or switch/);
 
 	// show current
 	const shown = await registered.handler({ agent: { session: { id: "s1" } }, rawInput: "" });
 	assert.equal(shown.kind, "success");
-	assert.match(shown.text, /approval mode: ai/);
+	assert.match(shown.text, /^mode: ai \(config default: ai, no session override\)$/);
 
 	// switch via numeric alias
 	const switched = await registered.handler({ agent: { session: { id: "s1" } }, rawInput: "3" });
 	assert.equal(switched.kind, "success");
-	assert.match(switched.text, /ai-auto/);
+	assert.match(switched.text, /^switched → ai-auto \(this session; memory-only/);
 	assert.deepEqual(lastSet, { id: "s1", mode: "ai-auto" });
 
 	// invalid input
 	const bad = await registered.handler({ agent: { session: { id: "s1" } }, rawInput: "full" });
-	assert.match(bad.text, /unknown approval mode/);
+	assert.match(bad.text, /^unknown mode "full"/);
 
 	// clear
 	const clearedRes = await registered.handler({ agent: { session: { id: "s1" } }, rawInput: "default" });
-	assert.match(clearedRes.text, /cleared/);
+	assert.match(clearedRes.text, /^override cleared → ai \(config default; memory-only/);
 	assert.equal(cleared, true);
+});
+
+test("registerModeCommand: zh locale renders Chinese copy and description", async () => {
+	const { registerModeCommand } = await import("../index.js");
+	let registered = null;
+	const ctx = {
+		inject: (deps, fn) => {
+			fn({ commands: { register: (def) => { registered = def; } } });
+		}
+	};
+	const cfg = normalizeConfig({});
+	const store = {
+		get: async () => "ai-auto",
+		set: async () => "persisted",
+		clear: async () => "persisted"
+	};
+	registerModeCommand(ctx, cfg, store, () => "zh");
+	assert.match(registered.description, /显示或切换审批模式/);
+
+	const shown = await registered.handler({ agent: { session: { id: "s1" } }, rawInput: "" });
+	assert.match(shown.text, /^当前模式：ai-auto（会话覆盖：ai-auto，配置默认：ai）$/);
+
+	const switched = await registered.handler({ agent: { session: { id: "s1" } }, rawInput: "3" });
+	assert.match(switched.text, /^已切换 → ai-auto（本会话）$/);
+
+	const bad = await registered.handler({ agent: { session: { id: "s1" } }, rawInput: "x" });
+	assert.match(bad.text, /^未知模式 "x"/);
+
+	const cleared = await registered.handler({ agent: { session: { id: "s1" } }, rawInput: "default" });
+	assert.match(cleared.text, /^已清除会话覆盖 → 回落 ai（配置默认）$/);
+});
+
+test("makeModeStore: persists through a settings service", async () => {
+	const registry = {};
+	const fakeSettings = {
+		register(ns, schema, opts) {
+			registry[ns] = { schema };
+			// resolve initial value (validate the stored section)
+			this.resolved = { sessionOverrides: {} };
+		},
+		get(ns) { return this.resolved; },
+		async replace(ns, section) {
+			this.resolved = registry[ns].schema(section); // function-call validation
+			return { ok: true };
+		}
+	};
+	let injected = null;
+	const ctx = { inject: (deps, fn) => { injected = fn; } };
+	const store = makeModeStore(ctx, undefined);
+	await injected({ settings: fakeSettings }); // settings becomes available
+
+	assert.equal(await store.set("s9", "ai-auto"), "persisted");
+	assert.equal(await store.get("s9"), "ai-auto");
+	assert.deepEqual(fakeSettings.resolved.sessionOverrides, { s9: "ai-auto" });
+
+	assert.equal(await store.set("s9", "manual"), "persisted");
+	assert.equal(await store.clear("s9"), "persisted");
+	assert.equal(await store.get("s9"), undefined);
+	assert.deepEqual(fakeSettings.resolved.sessionOverrides, {});
+});
+
+test("handler: npm publish is an ask rule in ai mode (human confirm)", async () => {
+	const cfg = normalizeConfig({ mode: "ai", rules: [{ match: "Bash(npm publish*)", action: "ask" }], ai: { enabled: false } });
+	const handler = createHandler({ config: cfg, record: async () => {}, llmRunner: async () => ({ ok: true, text: "{}" }) });
+	const { outcome, nextCalls } = await runWith(handler, makeReq({ command: "npm publish" }));
+	assert.equal(outcome, "unavailable"); // delegated to the human answerer
+	assert.equal(nextCalls.length, 1);
+});
+
+test("handler: npm publish rule present in DEFAULT_CONFIG", () => {
+	const cfg = normalizeConfig({});
+	const rule = cfg.rules.find((r) => r.match === "Bash(npm publish*)");
+	assert.ok(rule, "npm publish ask rule must be in defaults");
+	assert.equal(rule.action, "ask");
+});
+
+test("handler: npm publish ask resolves deny under ai-auto + mode3OnAsk=deny", async () => {
+	const cfg = normalizeConfig({ mode: "ai-auto", rules: [{ match: "Bash(npm publish*)", action: "ask" }], ai: { enabled: false } });
+	const handler = createHandler({ config: cfg, record: async () => {}, llmRunner: async () => ({ ok: true, text: "{}" }) });
+	const { outcome, nextCalls } = await runWith(handler, makeReq({ command: "npm publish" }));
+	assert.equal(outcome, "rejected");
+	assert.equal(nextCalls.length, 0);
+});
+
+test("makeGetLocale: explicit zh/en wins; auto follows settings preference", async () => {
+	const { makeGetLocale } = await import("../index.js");
+	// explicit zh
+	assert.equal(makeGetLocale(normalizeConfig({ locale: "zh" }), {})(), "zh");
+	// explicit en
+	assert.equal(makeGetLocale(normalizeConfig({ locale: "en" }), {})(), "en");
+	// auto + settings zh
+	const ctxZh = { get: (n) => (n === "settings" ? { get: (ns) => (ns === "locale" ? { preference: "zh" } : undefined) } : undefined) };
+	assert.equal(makeGetLocale(normalizeConfig({}), ctxZh)(), "zh");
+	// auto + no settings → en
+	assert.equal(makeGetLocale(normalizeConfig({}), {})(), "en");
+	// auto + settings without preference → en
+	const ctxNoPref = { get: (n) => (n === "settings" ? { get: () => undefined } : undefined) };
+	assert.equal(makeGetLocale(normalizeConfig({}), ctxNoPref)(), "en");
+	// auto + throwing settings → en (defensive)
+	const ctxThrow = { get: () => { throw new Error("boom"); } };
+	assert.equal(makeGetLocale(normalizeConfig({}), ctxThrow)(), "en");
+});
+
+test("normalizeConfig: locale validation", () => {
+	assert.equal(normalizeConfig({}).locale, "auto");
+	assert.equal(normalizeConfig({ locale: "zh" }).locale, "zh");
+	assert.throws(() => normalizeConfig({ locale: "fr" }), TypeError);
+});
+
+test("handler: prefixed npm publish (cd && npm publish) also hits the ask rule", async () => {
+	const cfg = normalizeConfig({ mode: "ai", ai: { enabled: false } }); // defaults include both publish rules
+	const handler = createHandler({ config: cfg, record: async () => {}, llmRunner: async () => ({ ok: true, text: "{}" }) });
+	const { outcome, nextCalls } = await runWith(handler, makeReq({ command: "cd /x && npm publish" }));
+	assert.equal(outcome, "unavailable"); // delegated to the human
+	assert.equal(nextCalls.length, 1);
+	const { outcome: o2 } = await runWith(handler, makeReq({ command: "cd /x && npm publish --dry-run" }));
+	assert.equal(o2, "unavailable");
 });

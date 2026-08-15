@@ -30,6 +30,7 @@ import { evaluateRules } from "./rules.js";
 import { findToolCallArgs, argsPreview } from "./enrich.js";
 import { judgeWith, decideAuthorization } from "./judge.js";
 import { MODES, parseMode, resolveMode, effectiveOnAsk } from "./modes.js";
+import { T, pickLocale, commandDescription } from "./i18n.js";
 
 export const name = "dsh-codex-approval";
 
@@ -47,6 +48,7 @@ export const DEFAULT_CONFIG = {
 	enabled: true,
 	mode: "ai",
 	mode3OnAsk: "deny",
+	locale: "auto",
 	rules: [
 		// read-only / harmless commands: auto-approve
 		{ match: "Bash(git status*)", action: "allow" },
@@ -68,7 +70,11 @@ export const DEFAULT_CONFIG = {
 		{ match: "reason:*secret*", action: "ask" },
 		{ match: "reason:*password*", action: "ask" },
 		{ match: "reason:*credential*", action: "ask" },
-		{ match: "reason:*token*", action: "ask" }
+		{ match: "reason:*token*", action: "ask" },
+		// publishing: never auto-decided — a human must confirm every publish
+		// (both bare `npm publish` and prefixed forms like `cd x && npm publish`)
+		{ match: "Bash(npm publish*)", action: "ask" },
+		{ match: "Bash(*npm publish*)", action: "ask" }
 	],
 	ai: {
 		enabled: true,
@@ -92,6 +98,7 @@ function assertConfig(cfg) {
 	if (typeof cfg.enabled !== "boolean") throw new TypeError("dsh-codex-approval: config.enabled must be a boolean");
 	if (!MODES.includes(cfg.mode)) throw new TypeError(`dsh-codex-approval: config.mode must be one of ${MODES.join("/")}`);
 	if (!["deny", "allow"].includes(cfg.mode3OnAsk)) throw new TypeError("dsh-codex-approval: config.mode3OnAsk must be deny/allow");
+	if (!["auto", "zh", "en"].includes(cfg.locale)) throw new TypeError("dsh-codex-approval: config.locale must be auto/zh/en");
 	if (!Array.isArray(cfg.rules)) throw new TypeError("dsh-codex-approval: config.rules must be an array");
 	for (const rule of cfg.rules) {
 		if (typeof rule.match !== "string" || rule.match === "") throw new TypeError("dsh-codex-approval: each rule needs a non-empty match");
@@ -253,7 +260,7 @@ export function makeModeStore(ctx, logger) {
 		settings = sctx.settings;
 		try {
 			sctx.settings.register("dsh-codex-approval", z.object({
-				sessionOverrides: z.record(z.string(), z.enum(MODES)).default({})
+				sessionOverrides: z.dict(z.union(MODES)).default({})
 			}), { base: {} });
 			const resolved = sctx.settings.get("dsh-codex-approval");
 			const overrides = resolved?.sessionOverrides;
@@ -293,38 +300,60 @@ export function makeModeStore(ctx, logger) {
 }
 
 /** Register the /approval-mode command (mirrors dsh-plan-mode's /plan). */
-export function registerModeCommand(ctx, cfg, store) {
+export function registerModeCommand(ctx, cfg, store, getLocale) {
+	const locale = getLocale ? getLocale() : "en";
 	ctx.inject(["commands"], (commandCtx) => {
 		commandCtx.commands.register({
 			name: "approval-mode",
-			description: "Show or switch the approval mode (manual | ai | ai-auto, or 1/2/3)",
+			description: commandDescription(locale),
 			input: { hint: "[manual|ai|ai-auto|default]" },
 			handler: async ({ agent, rawInput }) => {
+				const t = T[getLocale ? getLocale() : "en"];
 				const sessionId = agent?.session?.id ?? agent?.id;
 				const input = rawInput.trim();
 				if (input === "") {
 					const override = await store.get(sessionId);
 					const effective = resolveMode(override, cfg.mode);
-					const base = override === void 0
-						? `approval mode: ${effective} (config default: ${cfg.mode}, no session override)`
-						: `approval mode: ${effective} (session override: ${override}, config default: ${cfg.mode})`;
-					return { kind: "success", text: base };
+					const text = override === void 0
+						? t.showNoOverride(effective, cfg.mode)
+						: t.showWithOverride(effective, override, cfg.mode);
+					return { kind: "success", text };
 				}
 				if (input === "default" || input === "off" || input === "reset") {
 					const persisted = await store.clear(sessionId);
-					const note = persisted === "persisted" ? "" : " (memory-only: settings unavailable)";
-					return { kind: "success", text: `approval mode: session override cleared — effective ${cfg.mode} (config default)${note}` };
+					const text = persisted === "persisted"
+						? t.cleared(cfg.mode)
+						: t.clearedMemoryOnly(cfg.mode);
+					return { kind: "success", text };
 				}
 				const mode = parseMode(input);
 				if (mode === null) {
-					return { kind: "success", text: `unknown approval mode "${input}" — use manual | ai | ai-auto (or 1/2/3), or "default" to clear the override` };
+					return { kind: "success", text: t.unknown(input) };
 				}
 				const persisted = await store.set(sessionId, mode);
-				const note = persisted === "persisted" ? "" : " (memory-only: settings unavailable, lost on restart)";
-				return { kind: "success", text: `approval mode → ${mode} for this session${note}` };
+				const text = persisted === "persisted"
+					? t.switched(mode)
+					: t.switchedMemoryOnly(mode);
+				return { kind: "success", text };
 			}
 		});
 	});
+}
+
+/**
+ * Build the command-copy locale resolver. `auto` follows the dsh settings
+ * preference (`locale.preference`, owned by dsh-client-locale); an explicit
+ * `zh`/`en` config wins. Without settings or preference → English.
+ */
+export function makeGetLocale(cfg, ctx) {
+	return () => {
+		if (cfg.locale === "zh" || cfg.locale === "en") return cfg.locale;
+		try {
+			return pickLocale(ctx.get("settings", false)?.get?.("locale")?.preference);
+		} catch {
+			return "en";
+		}
+	};
 }
 
 /** Cordis plugin entry: register the answerer when approval is composed. */
@@ -339,7 +368,8 @@ export async function apply(ctx, userConfig) {
 		getSessionMode: (sessionId) => store.get(sessionId)
 	});
 	ctx.on("approval/request", handler);
-	registerModeCommand(ctx, cfg, store);
+	// Command copy follows config.locale ("auto" → dsh locale preference)
+	registerModeCommand(ctx, cfg, store, makeGetLocale(cfg, ctx));
 	// Self-proving startup record: this line in the log after a restart proves
 	// the plugin loaded (decision records follow it). Awaited so a boot that
 	// cannot even write its own log fails loud instead of silently degrading.

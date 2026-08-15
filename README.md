@@ -58,6 +58,18 @@ approval/request 到达（toolName + callId + reason）
 
 **模式持久化**：会话覆盖存 `~/.dsh/settings.yaml` 的 `dsh-codex-approval` 命名空间（settings 服务不可用时降级为纯内存，重启丢失）。默认模式由配置 `mode` 字段决定。
 
+**与 dsh 沙箱模式的关系**：
+
+| 沙箱模式 | AI 审核是否生效 |
+|---|---|
+| `read-only` | ✅ 生效——沙箱拒绝写操作，模型可申请升级（`WIDER_MODES` 允许），升级请求照常走审批链 |
+| `workspace-write` | ✅ 生效（推荐组合：工作区内自由，越界 AI 把关） |
+| `danger-full-access` | ⏸ 不触发——沙箱从不拒绝任何操作，没有升级请求，插件自然空闲 |
+
+**命令多语言**：`/approval-mode` 的返回文案跟随 dsh 设置的语言（`locale.preference`，中/英）。命令 `description` 在启动时按当时语言注册，运行中切换语言后需重启才更新 description（返回文本每次实时跟随）。
+
+**npm publish 默认 ask**：内置规则 `Bash(npm publish*) → ask`——agent 执行 `npm publish` 的升级请求**必定弹窗询问人类**，AI 无权自动放行（`ai` 模式下弹窗；`ai-auto` 模式下按 `mode3OnAsk` 处理，默认拒绝）。`npm unpublish` 无规则，由 AI 默认判定（通常判 high 直接拒绝）。
+
 ## 安装
 
 ```bash
@@ -74,6 +86,7 @@ dsh plugin --profile web add dsh-codex-approval
   config:
     mode: ai                   # manual | ai | ai-auto（默认 ai）
     mode3OnAsk: deny           # deny | allow（ai-auto 下 ask 的归宿；默认 deny 安全）
+    locale: auto               # auto | zh | en（命令文案语言；auto=跟随 dsh 设置的语言偏好）
     rules:
       - match: 'Bash(git status*)'   # 命中即自动通过（Codex approve-always）
         action: allow
