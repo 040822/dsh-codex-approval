@@ -1,0 +1,37 @@
+{
+  "name": "dsh-codex-approval",
+  "version": "0.1.0",
+  "description": "Codex-style approval autopilot for DeepSeek Harness: ordered glob rules (allow/ask/deny) plus an AI risk judge (low/medium/high) mapped through a risk tolerance, as an approval answerer.",
+  "type": "module",
+  "main": "index.js",
+  "files": [
+    "index.js",
+    "rules.js",
+    "enrich.js",
+    "judge.js",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "approval",
+    "codex",
+    "risk"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/040822/dsh-codex-approval.git"
+  },
+  "engines": {
+    "node": ">=22.19"
+  }
+}
