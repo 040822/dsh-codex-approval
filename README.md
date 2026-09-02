@@ -70,6 +70,26 @@ approval/request 到达（toolName + callId + reason）
 
 **npm publish 默认 ask**：内置规则 `Bash(npm publish*) → ask`——agent 执行 `npm publish` 的升级请求**必定弹窗询问人类**，AI 无权自动放行（`ai` 模式下弹窗；`ai-auto` 模式下按 `mode3OnAsk` 处理，默认拒绝）。`npm unpublish` 无规则，由 AI 默认判定（通常判 high 直接拒绝）。
 
+## 拒绝归因反馈（denyFeedback，v0.3.0）
+
+**问题**：dsh 的沙箱层把一切审批拒绝硬编码为 "the user rejected..."（`dsh-sandbox` 的 `approveEscalation`），插件 AI 拒绝时主 agent 会误以为用户拒绝了——道歉、停下、或盲目重试，而不是带理由去找更安全路径。
+
+**方案**：插件在自身产生拒绝（规则 deny / AI deny / ai-auto 的 mode3 拒绝 / AI 故障 failOpen deny / 兜底 deny）后，把拒绝记录进内存队列；下一次 `agent/pre-step`（模型即将推理）时向消息列表追加一条**更正消息**（`user` 角色 + `source.kind: "plugin"`，机制同 dsh-time-context / dsh-tool-cordis）：
+
+```
+[auto-review] The previous action `rm -rf /tmp/x` was denied by the automatic
+approval reviewer (source: deterministic rule) — this was NOT a user rejection.
+Do not pursue this action via workaround or indirect execution; continue with
+a materially safer alternative, or stop and ask the user.
+```
+
+- 被拒工具的 `tool/result` 错误与更正消息出现在同一次模型推理中（紧邻），模型可完成正确归因
+- 用户手动拒绝（GUI 弹窗）不经过插件 answerer，**不会被标记为自动审批拒绝**
+- 模型被拒后立即结束回合时，更正留在队列，**下一回合首步注入**（消息持久化在会话中，重启后不重复注入）
+- 每会话未注入队列上限 `denyFeedbackMax`（默认 3，超限丢最旧）
+
+配置：`denyFeedback: true|false`（默认 true）；文案跟随 `locale` 设置（zh/en）。已知边界：源头文案（"the user rejected"）由 dsh 核心生成，本功能通过紧邻更正消息覆盖模型感知，并非源头级修正。
+
 ## 安装
 
 ```bash
@@ -104,6 +124,8 @@ dsh plugin --profile web add dsh-codex-approval
       maxTokens: 512                 # 含 reasoning 余量
       failOpen: ask                  # AI 故障兜底：ask | deny | allow
     fallback: ask                    # 无规则命中且 AI 关闭时：ask | deny | allow
+    denyFeedback: true               # 拒绝后向主 agent 注入归因更正消息（默认 true）
+    denyFeedbackMax: 3               # 未注入拒绝队列上限（1-10）
     logFile: ~/.dsh/logs/approval.jsonl
 ```
 

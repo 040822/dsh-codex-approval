@@ -23,6 +23,7 @@
 import { appendFile, mkdir } from "node:fs/promises";
 import { mkdirSync } from "node:fs";
 import { homedir } from "node:os";
+import { randomUUID } from "node:crypto";
 import { join, dirname } from "node:path";
 import z from "@deepseek-ai/schemastery";
 
@@ -30,7 +31,7 @@ import { evaluateRules } from "./rules.js";
 import { findToolCallArgs, argsPreview } from "./enrich.js";
 import { judgeWith, decideAuthorization } from "./judge.js";
 import { MODES, parseMode, resolveMode, effectiveOnAsk } from "./modes.js";
-import { T, pickLocale, commandDescription } from "./i18n.js";
+import { T, pickLocale, commandDescription, renderDenialNotice } from "./i18n.js";
 
 export const name = "dsh-codex-approval";
 
@@ -87,6 +88,14 @@ export const DEFAULT_CONFIG = {
 		failOpen: "ask"
 	},
 	fallback: "ask",
+	// Rejection-attribution feedback: after the plugin denies an escalation,
+	// inject a corrective user-role (plugin-source) message into the next
+	// model request via the `agent/pre-step` hook, so the main agent learns
+	// the denial came from the automatic reviewer (with rationale) and not
+	// from the user — the sandbox layer hard-codes "the user rejected".
+	denyFeedback: true,
+	// Pending-denial queue cap per session: older entries are dropped first.
+	denyFeedbackMax: 3,
 	logFile: join(homedir(), ".dsh", "logs", "approval.jsonl")
 };
 
@@ -109,6 +118,10 @@ function assertConfig(cfg) {
 	if (!TOLERANCES.includes(cfg.ai.riskTolerance)) throw new TypeError(`dsh-codex-approval: config.ai.riskTolerance must be one of ${TOLERANCES.join("/")}`);
 	if (!ACTIONS.includes(cfg.ai.failOpen)) throw new TypeError("dsh-codex-approval: config.ai.failOpen must be allow/ask/deny");
 	if (!ACTIONS.includes(cfg.fallback)) throw new TypeError("dsh-codex-approval: config.fallback must be allow/ask/deny");
+	if (typeof cfg.denyFeedback !== "boolean") throw new TypeError("dsh-codex-approval: config.denyFeedback must be a boolean");
+	if (!Number.isSafeInteger(cfg.denyFeedbackMax) || cfg.denyFeedbackMax < 1 || cfg.denyFeedbackMax > 10) {
+		throw new TypeError("dsh-codex-approval: config.denyFeedbackMax must be an integer in 1..10");
+	}
 	if (typeof cfg.logFile !== "string" || cfg.logFile === "") throw new TypeError("dsh-codex-approval: config.logFile must be a non-empty path");
 }
 
@@ -154,11 +167,22 @@ export function makeLlmRunner(llm, { provider, model, timeoutMs, maxTokens }) {
 /**
  * Create the approval/request handler with injected dependencies
  * (unit-testable without a cordis ctx).
- * @param deps - { config, record, llmRunner, getSessionMode }
+ * @param deps - { config, record, llmRunner, getSessionMode, denialFeed }
+ *   `denialFeed` is an optional Map<sessionId, Array<DenialRecord>> used to
+ *   stage plugin-originated denials for the `agent/pre-step` injector; when
+ *   omitted the handler creates its own (shared only if the caller passes it).
  * @returns async (req, next) => ApprovalOutcome
  */
-export function createHandler({ config, record, llmRunner, getSessionMode }) {
+export function createHandler({ config, record, llmRunner, getSessionMode, denialFeed }) {
 	const cfg = config;
+	const feed = denialFeed ?? new Map();
+	const stageDenial = (sessionId, denial) => {
+		if (sessionId === undefined || sessionId === null) return;
+		const queue = feed.get(sessionId) ?? [];
+		queue.push(denial);
+		if (queue.length > cfg.denyFeedbackMax) queue.shift();
+		feed.set(sessionId, queue);
+	};
 	return async (req, next) => {
 		const started = Date.now();
 		if (req.signal?.aborted === true) return "cancelled";
@@ -226,6 +250,22 @@ export function createHandler({ config, record, llmRunner, getSessionMode }) {
 			...verdict,
 			ms: Date.now() - started
 		});
+
+		// Stage plugin-originated denials for the pre-step feedback injector.
+		// Only denials the plugin itself produced are staged (rule / ai /
+		// ai-error-failOpen / fallback, incl. ai-auto's mode3 ask-resolution),
+		// so a human denial through the GUI answerer never gets re-attributed.
+		if (verdict.outcome === "rejected" && cfg.denyFeedback) {
+			stageDenial(sessionId, {
+				command: argsText.slice(0, 200),
+				source: verdict.kind,
+				...verdict.match !== void 0 ? { match: verdict.match } : {},
+				...verdict.risk !== void 0 ? { risk: verdict.risk } : {},
+				...typeof verdict.aiReason === "string" && verdict.aiReason !== "" ? { aiReason: verdict.aiReason } : {},
+				...verdict.viaAskResolution === true ? { viaAsk: true } : {},
+				ts: Date.now()
+			});
+		}
 
 		return verdict.outcome === "pass" ? next() : verdict.outcome;
 	};
@@ -341,6 +381,48 @@ export function registerModeCommand(ctx, cfg, store, getLocale) {
 }
 
 /**
+ * Build the `agent/pre-step` listener that feeds staged denials back to the
+ * main agent as corrective context. When the previous step's escalation was
+ * denied by this plugin, the sandbox layer reports it as "the user rejected"
+ * — this injects a plugin-source user message right after that failure in
+ * the next model request, telling the agent the denial came from the
+ * automatic reviewer (with rationale) and how to proceed safely.
+ *
+ * Mirrors the injection pattern used by dsh-time-context and dsh-tool-cordis
+ * (`{ kind: "enter", messages: [...decision.messages, message] }`).
+ * Each staged denial is injected exactly once (queue cleared on hand-off);
+ * a denial staged while the agent ends its turn is picked up by the next
+ * turn's first pre-step (the injected message is durable in the session).
+ *
+ * @param deps - { config, denialFeed, getLocale }
+ * @returns the pre-step listener `(payload, next) => Promise<PreStepDecision>`
+ */
+export function makeDenialInjector({ config, denialFeed, getLocale }) {
+	const cfg = config;
+	const feed = denialFeed;
+	return async ({ agent, messages, signal }, next) => {
+		const decision = await next();
+		if (decision.kind === "reject" || signal?.aborted || !cfg.denyFeedback) return decision;
+		const sessionId = agent?.session?.id ?? agent?.id;
+		const queue = sessionId === undefined ? undefined : feed.get(sessionId);
+		if (queue === undefined || queue.length === 0) return decision;
+		const text = renderDenialNotice(queue, getLocale ? getLocale() : "en");
+		// Clearing happens only after a successful render; a render throw
+		// keeps the queue intact for the next pre-step instead of losing it.
+		feed.delete(sessionId);
+		return {
+			kind: "enter",
+			messages: [...decision.messages, {
+				id: randomUUID(),
+				role: "user",
+				content: [{ type: "text", text }],
+				source: { kind: "plugin", plugin: name, form: "instructions" }
+			}]
+		};
+	};
+}
+
+/**
  * Build the command-copy locale resolver. `auto` follows the dsh settings
  * preference (`locale.preference`, owned by dsh-client-locale); an explicit
  * `zh`/`en` config wins. Without settings or preference → English.
@@ -360,16 +442,22 @@ export function makeGetLocale(cfg, ctx) {
 export async function apply(ctx, userConfig) {
 	const cfg = normalizeConfig(userConfig);
 	const store = makeModeStore(ctx, ctx.logger);
+	const getLocale = makeGetLocale(cfg, ctx);
+	const denialFeed = new Map();
 	const llmRunner = makeLlmRunner(ctx.llm, cfg.ai);
 	const handler = createHandler({
 		config: cfg,
 		record: makeRecorder(cfg.logFile),
 		llmRunner,
-		getSessionMode: (sessionId) => store.get(sessionId)
+		getSessionMode: (sessionId) => store.get(sessionId),
+		denialFeed
 	});
 	ctx.on("approval/request", handler);
+	// Rejection-attribution feedback: inject staged denials into the next
+	// model request so the main agent knows the denial was automatic.
+	ctx.on("agent/pre-step", makeDenialInjector({ config: cfg, denialFeed, getLocale }));
 	// Command copy follows config.locale ("auto" → dsh locale preference)
-	registerModeCommand(ctx, cfg, store, makeGetLocale(cfg, ctx));
+	registerModeCommand(ctx, cfg, store, getLocale);
 	// Self-proving startup record: this line in the log after a restart proves
 	// the plugin loaded (decision records follow it). Awaited so a boot that
 	// cannot even write its own log fails loud instead of silently degrading.
@@ -382,7 +470,9 @@ export async function apply(ctx, userConfig) {
 		rules: cfg.rules.length,
 		ai: cfg.ai.enabled,
 		tolerance: cfg.ai.riskTolerance,
-		fallback: cfg.fallback
+		fallback: cfg.fallback,
+		denyFeedback: cfg.denyFeedback,
+		denyFeedbackMax: cfg.denyFeedbackMax
 	});
 	ctx.logger?.info?.("[dsh-codex-approval] answerer registered — mode=%s rules=%d ai=%s tolerance=%s log=%s",
 		cfg.mode, cfg.rules.length, cfg.ai.enabled ? "on" : "off", cfg.ai.riskTolerance, cfg.logFile);

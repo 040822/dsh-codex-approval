@@ -50,6 +50,27 @@ test("normalizeConfig: rejects invalid values loudly", () => {
 	assert.throws(() => normalizeConfig({ fallback: "whatever" }), TypeError);
 });
 
+test("normalizeConfig: denyFeedback defaults and validation", () => {
+	const cfg = normalizeConfig({});
+	assert.equal(cfg.denyFeedback, true);
+	assert.equal(cfg.denyFeedbackMax, 3);
+	assert.throws(() => normalizeConfig({ denyFeedback: "yes" }), TypeError);
+	assert.throws(() => normalizeConfig({ denyFeedbackMax: 0 }), TypeError);
+	assert.throws(() => normalizeConfig({ denyFeedbackMax: 11 }), TypeError);
+	assert.throws(() => normalizeConfig({ denyFeedbackMax: 1.5 }), TypeError);
+});
+
+test("handler: denial is staged into an injected denialFeed", async () => {
+	const cfg = baseConfig({ ai: { enabled: false } });
+	const denialFeed = new Map();
+	const handler = createHandler({ config: cfg, record: async () => {}, llmRunner: async () => ({ ok: true, text: "{}" }), denialFeed });
+	const { outcome } = await run(handler, makeReq({ command: "rm -rf /tmp/x" }));
+	assert.equal(outcome, "rejected");
+	const queue = denialFeed.get("sess-1");
+	assert.ok(Array.isArray(queue) && queue.length === 1);
+	assert.equal(queue[0].source, "rule");
+});
+
 test("handler: rule allow → allowed-once, no next()", async () => {
 	const cfg = baseConfig({ ai: { enabled: false } });
 	const handler = createHandler({
@@ -215,7 +236,7 @@ test("apply: registers the approval/request listener and self-proves", async () 
 		logger: { info: () => {}, warn: () => {} }
 	};
 	await apply(ctx, { logFile });
-	assert.deepEqual(Object.keys(listeners), ["approval/request"]);
+	assert.deepEqual(Object.keys(listeners), ["approval/request", "agent/pre-step"]);
 	// the plugin-loaded self-proof record is written
 	const lines = readFileSync(logFile, "utf8").trim().split("\n");
 	assert.equal(JSON.parse(lines[0]).event, "plugin-loaded");
