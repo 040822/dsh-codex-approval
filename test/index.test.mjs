@@ -60,6 +60,25 @@ test("normalizeConfig: denyFeedback defaults and validation", () => {
 	assert.throws(() => normalizeConfig({ denyFeedbackMax: 1.5 }), TypeError);
 });
 
+test("normalizeConfig: transcript defaults and validation", () => {
+	const cfg = normalizeConfig({});
+	assert.equal(cfg.transcript, "off");
+	assert.equal(cfg.transcriptMaxChars, 4000);
+	assert.throws(() => normalizeConfig({ transcript: "full" }), TypeError);
+	assert.throws(() => normalizeConfig({ transcriptMaxChars: 99 }), TypeError);
+	assert.throws(() => normalizeConfig({ transcriptMaxChars: 16001 }), TypeError);
+	assert.throws(() => normalizeConfig({ transcriptMaxChars: 1.5 }), TypeError);
+});
+
+test("DEFAULT_CONFIG: includes Pwsh read-only allow rules for Windows", () => {
+	const cfg = normalizeConfig({});
+	const pwshRules = cfg.rules.filter((r) => r.match.toLowerCase().startsWith("pwsh("));
+	assert.ok(pwshRules.length >= 8, `expected Pwsh rules, got ${pwshRules.length}`);
+	assert.ok(pwshRules.every((r) => r.action === "allow"));
+	const bashRules = cfg.rules.filter((r) => r.match.toLowerCase().startsWith("bash("));
+	assert.ok(bashRules.length > 0, "Bash family must remain for Linux/Raspberry Pi");
+});
+
 test("handler: denial is staged into an injected denialFeed", async () => {
 	const cfg = baseConfig({ ai: { enabled: false } });
 	const denialFeed = new Map();

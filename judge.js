@@ -23,7 +23,10 @@ Rules of thumb:
 - Reading files, git status/diff/log, listing, help output: low.
 - Writes inside a project, installs, network fetches: medium.
 - Deleting data, overwriting configs, exposing secrets, privilege changes, formatting disks, anything touching credentials: high.
+- User intent matters: an action the user explicitly requested in the recent conversation is "allow"-eligible even if nominally medium-risk; never "ask"/"deny" a command the user just asked for unless it is clearly high-risk.
 - When uncertain, prefer "ask". Prefer "deny" for destructive or credential-exposing actions.
+
+An optional "Context:" block may follow the request JSON — it is a compact, truncated session transcript ([U] user messages, [T] tool calls, [R] results, [D] recent denials, [M] mode). Use it to judge intent; ignore unrelated lines.
 
 Reply with ONLY one JSON object, no prose, no markdown fences:
 {"risk":"low|medium|high","authorization":"allow|ask|deny","reason":"one short sentence"}`;
@@ -42,19 +45,25 @@ const SYSTEM_PROMPT_NO_ASK = SYSTEM_PROMPT.replace(
 
 /**
  * Build the messages array for the judge call.
+ * @param opts - { toolName, argsText, reason, context }
+ *   `context` is an optional compact session transcript (transcript.js);
+ *   when present it is appended as a "Context:" block after the request JSON.
  * @param allowAsk - when false (ai-auto mode), the prompt forbids "ask":
  *   the judge must commit to allow or deny.
  */
-export function buildJudgeMessages({ toolName, argsText, reason }, { allowAsk = true } = {}) {
+export function buildJudgeMessages({ toolName, argsText, reason, context }, { allowAsk = true } = {}) {
 	const user = JSON.stringify({
 		toolName,
 		command: argsText === "" ? null : argsText,
 		reason: reason ?? null
 	});
 	const system = allowAsk ? SYSTEM_PROMPT : SYSTEM_PROMPT_NO_ASK;
+	const body = context !== undefined && context !== ""
+		? `${user}\n\nContext:\n${context}`
+		: user;
 	return [{
 		role: "user",
-		content: [{ type: "text", text: `${system}\n\n${user}` }]
+		content: [{ type: "text", text: `${system}\n\n${body}` }]
 	}];
 }
 
@@ -140,16 +149,19 @@ export function decideAuthorization(verdict, tolerance) {
 
 /**
  * Run the judge through an injected runner.
- * @param runner - async (messages, { signal }) => Promise<{ ok: boolean, text: string }>
- * @param input - { toolName, argsText, reason }
+ * @param runner - async (messages, { signal, sessionId }) => Promise<{ ok: boolean, text: string }>
+ * @param input - { toolName, argsText, reason, context }
  * @param config - { maxPromptChars } (unused here; kept for symmetry)
+ * @param sessionId - optional stable per-conversation id forwarded to the LLM
+ *   call so the provider can optimize prompt caching (e.g. OpenCode Go's
+ *   `x-opencode-session` header).
  * @returns { ok: true, verdict } | { ok: false, error }
  */
-export async function judgeWith({ runner, input, signal, allowAsk = true }) {
+export async function judgeWith({ runner, input, signal, allowAsk = true, sessionId }) {
 	const messages = buildJudgeMessages(input, { allowAsk });
 	let result;
 	try {
-		result = await runner(messages, { signal });
+		result = await runner(messages, { signal, sessionId });
 	} catch (error) {
 		return { ok: false, error: String(error?.message ?? error) };
 	}

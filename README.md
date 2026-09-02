@@ -126,6 +126,8 @@ dsh plugin --profile web add dsh-codex-approval
     fallback: ask                    # 无规则命中且 AI 关闭时：ask | deny | allow
     denyFeedback: true               # 拒绝后向主 agent 注入归因更正消息（默认 true）
     denyFeedbackMax: 3               # 未注入拒绝队列上限（1-10）
+    transcript: off                  # off | short：AI 审判是否带紧凑会话上下文（默认 off）
+    transcriptMaxChars: 4000         # 上下文骨架字符上限（100-16000）
     logFile: ~/.dsh/logs/approval.jsonl
 ```
 
@@ -141,9 +143,28 @@ dsh plugin --profile web add dsh-codex-approval
 
 ## AI 审判输入/输出
 
-**输入**：固定系统提示（审批员角色 + risk/authorization 定义 + 只输出 JSON 约束）+ `{"toolName", "command", "reason"}`（命令截断 2000 字符，无其他上下文）。
+**输入**：固定系统提示（审批员角色 + risk/authorization 定义 + **意图优先规则** + 只输出 JSON 约束）+ `{"toolName", "command", "reason"}`（命令截断 2000 字符）。
+
+开启 `transcript: "short"` 后追加 **Context 块**（紧凑会话骨架，≤`transcriptMaxChars` 字符）——两级窗口：短窗口（最近用户消息 + ≤3 条工具调用 → `[U]/[T]/[R]` 行）+ 长窗口（更早的真实用户消息意图线）+ 模式行 `[M]` + 最近拒绝 `[D]` + 工作区 `[W]`。超长消息头尾保留 + 省略计数（`…〔省略 N 字符〕…`）；plugin 注入消息与流式 chunk 一律不进骨架。**默认 off 时行为与 v0.3.0 完全一致。**
 
 **输出**：`{"risk":"low|medium|high","authorization":"allow|ask|deny","reason":"一句话"}`；解析策略：整体 JSON → ```json``` 代码块 → 平衡花括号扫描；枚举校验失败按 AI 故障处理。
+
+## 会话上下文（transcript，v0.4.0）
+
+`transcript: "off"`（默认）= 零上下文判定（仅命令本体）；`transcript: "short"` = AI 审判带紧凑上下文，可判断"用户明确要求的操作应放行"（意图优先）。实测口径成本：
+
+| 组成 | off | short |
+|---|---|---|
+| 系统提示 | ~380 token | ~420 token |
+| 上下文骨架（≤4000 字符） | — | ~1,600-1,800 token |
+| 请求体（实测） | ~100-200 token | 同左 |
+| **单次合计** | **~500 token** | **~2,100-2,400 token（≈4 倍）** |
+
+50 次审批的一天会话：off ≈ 25k token，short ≈ 110k token（前缀缓存命中后 ~84k）。绝对量由 `transcriptMaxChars` 硬闸封顶；缓存前缀（系统+模式+长窗口）占比 ~60-70%。实测本会话（5733 事件、含 12891 字符粘贴输出）骨架化后稳定在预算内。
+
+## PowerShell（Windows）规则
+
+默认规则含 `Bash(...)`（Linux/树莓派 toolName=bash 生效）与 `Pwsh(...)`（Windows toolName=pwsh 生效）两族**并存**——工具名大小写不敏感匹配，互不干扰：Windows 上只读命令（git status/diff/log、Get-ChildItem/ls、Get-Content/cat、Get-Location/pwd、Get-Command、Write-Output、Select-Object）自动放行；树莓派继续走 Bash 规则。如需整体替换规则，`cordis.patch.yml` 配 `rules` 即可（覆盖默认）。
 
 ## 安全注意事项
 

@@ -132,3 +132,45 @@ test("judgeWith: allowAsk=false is forwarded to the messages", async () => {
 	assert.equal(result.ok, true);
 	assert.match(seen[0][0].content[0].text, /"ask" is NOT available/);
 });
+
+test("buildJudgeMessages: context block appended after the request JSON", () => {
+	const [message] = buildJudgeMessages({ toolName: "pwsh", argsText: "Remove-Item x", reason: "r", context: "[U] 用户: 清理\n[T] pwsh(ls) → ok" });
+	const text = message.content[0].text;
+	const blockIdx = text.indexOf("\nContext:\n");
+	assert.ok(blockIdx > text.indexOf("Remove-Item"), "context comes after the request JSON");
+	assert.match(text, /Context:\n\[U\] 用户: 清理/);
+});
+
+test("buildJudgeMessages: empty context is omitted entirely", () => {
+	const [withCtx] = buildJudgeMessages({ toolName: "pwsh", argsText: "ls", reason: "" });
+	assert.doesNotMatch(withCtx.content[0].text, /\nContext:\n/);
+	const [withEmpty] = buildJudgeMessages({ toolName: "pwsh", argsText: "ls", reason: "", context: "" });
+	assert.doesNotMatch(withEmpty.content[0].text, /\nContext:\n/);
+});
+
+test("buildJudgeMessages: intent-first rule present in prompt", () => {
+	const [message] = buildJudgeMessages({ toolName: "pwsh", argsText: "ls", reason: "" });
+	assert.match(message.content[0].text, /User intent matters/);
+});
+
+test("buildJudgeMessages: NO_ASK variant keeps intent rule and context", () => {
+	const [message] = buildJudgeMessages({ toolName: "pwsh", argsText: "ls", reason: "", context: "[U] 用户: x" }, { allowAsk: false });
+	const text = message.content[0].text;
+	assert.match(text, /User intent matters/);
+	assert.match(text, /Context:\n\[U\] 用户: x/);
+	assert.match(text, /"ask" is NOT available/);
+});
+
+test("judgeWith: context is forwarded to the runner", async () => {
+	const seen = [];
+	const runner = async (messages) => {
+		seen.push(messages);
+		return { ok: true, text: '{"risk":"low","authorization":"allow","reason":"fine"}' };
+	};
+	const result = await judgeWith({
+		runner,
+		input: { toolName: "pwsh", argsText: "ls", reason: "", context: "[U] 用户: 检查" }
+	});
+	assert.equal(result.ok, true);
+	assert.match(seen[0][0].content[0].text, /Context:\n\[U\] 用户: 检查/);
+});

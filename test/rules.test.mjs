@@ -79,3 +79,24 @@ test("evaluateRules: first matching rule within same priority wins", () => {
 	const rule = evaluateRules(rules, { toolName: "bash", argsText: "git push origin main", reason: "" });
 	assert.equal(rule.match, "Bash(git push*)");
 });
+
+test("evaluateRules: Pwsh rule matches pwsh tool calls (Windows)", () => {
+	const rules = [
+		{ match: "Bash(git status*)", action: "ask" },
+		{ match: "Pwsh(git status*)", action: "allow" }
+	];
+	const rule = evaluateRules(rules, { toolName: "pwsh", argsText: "git status --short", reason: "" });
+	assert.equal(rule.action, "allow");
+	assert.equal(rule.match, "Pwsh(git status*)");
+});
+
+test("evaluateRules: Bash rule does not match pwsh calls and vice versa", () => {
+	const rules = [
+		{ match: "Bash(git *)", action: "allow" },
+		{ match: "Pwsh(Get-ChildItem *)", action: "allow" }
+	];
+	// pwsh call never matches the Bash rule (platform isolation)
+	assert.equal(evaluateRules(rules, { toolName: "pwsh", argsText: "git status", reason: "" }), null);
+	// bash call never matches the Pwsh rule
+	assert.equal(evaluateRules(rules, { toolName: "bash", argsText: "Get-ChildItem /tmp", reason: "" }), null);
+});

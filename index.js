@@ -30,6 +30,7 @@ import z from "@deepseek-ai/schemastery";
 import { evaluateRules } from "./rules.js";
 import { findToolCallArgs, argsPreview } from "./enrich.js";
 import { judgeWith, decideAuthorization } from "./judge.js";
+import { buildTranscript } from "./transcript.js";
 import { MODES, parseMode, resolveMode, effectiveOnAsk } from "./modes.js";
 import { T, pickLocale, commandDescription, renderDenialNotice } from "./i18n.js";
 
@@ -75,7 +76,25 @@ export const DEFAULT_CONFIG = {
 		// publishing: never auto-decided — a human must confirm every publish
 		// (both bare `npm publish` and prefixed forms like `cd x && npm publish`)
 		{ match: "Bash(npm publish*)", action: "ask" },
-		{ match: "Bash(*npm publish*)", action: "ask" }
+		{ match: "Bash(*npm publish*)", action: "ask" },
+		// PowerShell (Windows) counterparts for the read-only allow family:
+		// dsh's shell tool is `pwsh` on Windows, so the Bash(...) rules above
+		// never match there and every request went to the AI judge. These
+		// Pwsh(...) rules match only pwsh tool calls (tool names are
+		// case-insensitive); the Bash rules stay effective on Linux/Raspberry
+		// Pi, where the tool is `bash`. Both families coexist in this array.
+		{ match: "Pwsh(git status*)", action: "allow" },
+		{ match: "Pwsh(git diff*)", action: "allow" },
+		{ match: "Pwsh(git log*)", action: "allow" },
+		{ match: "Pwsh(Get-ChildItem *)", action: "allow" },
+		{ match: "Pwsh(ls *)", action: "allow" },
+		{ match: "Pwsh(Get-Content *)", action: "allow" },
+		{ match: "Pwsh(cat *)", action: "allow" },
+		{ match: "Pwsh(Get-Location)", action: "allow" },
+		{ match: "Pwsh(pwd)", action: "allow" },
+		{ match: "Pwsh(Get-Command *)", action: "allow" },
+		{ match: "Pwsh(Write-Output *)", action: "allow" },
+		{ match: "Pwsh(Select-Object *)", action: "allow" }
 	],
 	ai: {
 		enabled: true,
@@ -96,6 +115,12 @@ export const DEFAULT_CONFIG = {
 	denyFeedback: true,
 	// Pending-denial queue cap per session: older entries are dropped first.
 	denyFeedbackMax: 3,
+	// Compact session transcript for the AI judge: "off" (default) keeps the
+	// v0.3.0 zero-context input; "short" adds a bounded two-level window
+	// skeleton (see transcript.js) so the judge sees user intent and the
+	// surrounding tool chain. Absolute size is capped by transcriptMaxChars.
+	transcript: "off",
+	transcriptMaxChars: 4000,
 	logFile: join(homedir(), ".dsh", "logs", "approval.jsonl")
 };
 
@@ -122,6 +147,10 @@ function assertConfig(cfg) {
 	if (!Number.isSafeInteger(cfg.denyFeedbackMax) || cfg.denyFeedbackMax < 1 || cfg.denyFeedbackMax > 10) {
 		throw new TypeError("dsh-codex-approval: config.denyFeedbackMax must be an integer in 1..10");
 	}
+	if (!["off", "short"].includes(cfg.transcript)) throw new TypeError("dsh-codex-approval: config.transcript must be off/short");
+	if (!Number.isSafeInteger(cfg.transcriptMaxChars) || cfg.transcriptMaxChars < 100 || cfg.transcriptMaxChars > 16000) {
+		throw new TypeError("dsh-codex-approval: config.transcriptMaxChars must be an integer in 100..16000");
+	}
 	if (typeof cfg.logFile !== "string" || cfg.logFile === "") throw new TypeError("dsh-codex-approval: config.logFile must be a non-empty path");
 }
 
@@ -145,13 +174,17 @@ function outcomeFor(action) {
 
 /** The real LLM runner: ctx.llm.prepareCall + stream, bounded by timeout. */
 export function makeLlmRunner(llm, { provider, model, timeoutMs, maxTokens }) {
-	return async (messages, { signal } = {}) => {
+	return async (messages, { signal, sessionId } = {}) => {
 		const timeoutSignal = AbortSignal.timeout(timeoutMs);
 		const combined = signal !== undefined ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
 		try {
 			const prepared = await llm.prepareCall({ provider, model, temperature: 0, maxTokens }, combined);
 			let text = "";
-			for await (const chunk of prepared.stream({ ...prepared.config, messages })) {
+			for await (const chunk of prepared.stream({
+				...prepared.config,
+				messages,
+				...sessionId === undefined ? {} : { sessionId }
+			})) {
 				if (chunk.type === "text-delta") text += chunk.text;
 				else if (chunk.type === "finish" && (chunk.reason?.kind === "error" || chunk.reason?.kind === "aborted")) {
 					return { ok: false, error: `judge stream finished with ${chunk.reason.kind}` };
@@ -167,21 +200,30 @@ export function makeLlmRunner(llm, { provider, model, timeoutMs, maxTokens }) {
 /**
  * Create the approval/request handler with injected dependencies
  * (unit-testable without a cordis ctx).
- * @param deps - { config, record, llmRunner, getSessionMode, denialFeed }
+ * @param deps - { config, record, llmRunner, getSessionMode, denialFeed, denialHistory, getCwd }
  *   `denialFeed` is an optional Map<sessionId, Array<DenialRecord>> used to
  *   stage plugin-originated denials for the `agent/pre-step` injector; when
  *   omitted the handler creates its own (shared only if the caller passes it).
+ *   `denialHistory` is an optional Map<sessionId, Array<DenialRecord>>
+ *   accumulating the last few denials of each session for the transcript
+ *   context ([D] lines) — created internally when omitted.
+ *   `getCwd` optionally returns the workspace path for the transcript [W] line.
  * @returns async (req, next) => ApprovalOutcome
  */
-export function createHandler({ config, record, llmRunner, getSessionMode, denialFeed }) {
+export function createHandler({ config, record, llmRunner, getSessionMode, denialFeed, denialHistory, getCwd }) {
 	const cfg = config;
 	const feed = denialFeed ?? new Map();
+	const history = denialHistory ?? new Map();
 	const stageDenial = (sessionId, denial) => {
 		if (sessionId === undefined || sessionId === null) return;
 		const queue = feed.get(sessionId) ?? [];
 		queue.push(denial);
 		if (queue.length > cfg.denyFeedbackMax) queue.shift();
 		feed.set(sessionId, queue);
+		const hq = history.get(sessionId) ?? [];
+		hq.push(denial);
+		if (hq.length > 5) hq.shift();
+		history.set(sessionId, hq);
 	};
 	return async (req, next) => {
 		const started = Date.now();
@@ -200,14 +242,28 @@ export function createHandler({ config, record, llmRunner, getSessionMode, denia
 		const matchReq = { toolName: req.toolName, argsText, reason: req.reason ?? "" };
 
 		let verdict;
+		let context = "";
 		const rule = evaluateRules(cfg.rules, matchReq);
 		if (rule !== null) {
 			verdict = { kind: "rule", action: rule.action, outcome: outcomeFor(rule.action), match: rule.match };
 		} else if (cfg.ai.enabled) {
+			context = cfg.transcript === "short"
+				? buildTranscript({
+					events: req.agent?.session?.events,
+					cfg,
+					denialHistory: history,
+					sessionId,
+					mode,
+					tolerance: cfg.ai.riskTolerance,
+					mode3OnAsk: cfg.mode3OnAsk,
+					cwd: getCwd !== undefined ? getCwd(req.agent) : undefined
+				})
+				: "";
 			const judged = await judgeWith({
 				runner: llmRunner,
-				input: { toolName: req.toolName, argsText, reason: req.reason ?? "" },
-				allowAsk: mode !== "ai-auto"
+				input: { toolName: req.toolName, argsText, reason: req.reason ?? "", context },
+				allowAsk: mode !== "ai-auto",
+				sessionId
 			});
 			if (judged.ok) {
 				const authorization = decideAuthorization(judged.verdict, cfg.ai.riskTolerance);
@@ -247,6 +303,7 @@ export function createHandler({ config, record, llmRunner, getSessionMode, denia
 			callId: req.callId,
 			argsPreview: argsText.slice(0, 300),
 			reason: (req.reason ?? "").slice(0, 500),
+			transcriptChars: context.length,
 			...verdict,
 			ms: Date.now() - started
 		});
@@ -444,13 +501,16 @@ export async function apply(ctx, userConfig) {
 	const store = makeModeStore(ctx, ctx.logger);
 	const getLocale = makeGetLocale(cfg, ctx);
 	const denialFeed = new Map();
+	const denialHistory = new Map();
 	const llmRunner = makeLlmRunner(ctx.llm, cfg.ai);
 	const handler = createHandler({
 		config: cfg,
 		record: makeRecorder(cfg.logFile),
 		llmRunner,
 		getSessionMode: (sessionId) => store.get(sessionId),
-		denialFeed
+		denialFeed,
+		denialHistory,
+		getCwd: (agent) => agent?.session?.policy?.workspaceRoot ?? agent?.cwd
 	});
 	ctx.on("approval/request", handler);
 	// Rejection-attribution feedback: inject staged denials into the next
@@ -472,7 +532,9 @@ export async function apply(ctx, userConfig) {
 		tolerance: cfg.ai.riskTolerance,
 		fallback: cfg.fallback,
 		denyFeedback: cfg.denyFeedback,
-		denyFeedbackMax: cfg.denyFeedbackMax
+		denyFeedbackMax: cfg.denyFeedbackMax,
+		transcript: cfg.transcript,
+		transcriptMaxChars: cfg.transcriptMaxChars
 	});
 	ctx.logger?.info?.("[dsh-codex-approval] answerer registered — mode=%s rules=%d ai=%s tolerance=%s log=%s",
 		cfg.mode, cfg.rules.length, cfg.ai.enabled ? "on" : "off", cfg.ai.riskTolerance, cfg.logFile);
