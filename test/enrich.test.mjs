@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { findToolCallArgs, argsPreview } from "../enrich.js";
+import { findToolCallArgs, getSessionEvents, argsPreview } from "../enrich.js";
 
 function assistantMsg(parts) {
 	return { type: "assistant/message", data: { message: { content: parts } } };
@@ -14,6 +14,18 @@ test("findToolCallArgs: finds the matching tool-call by callId", () => {
 		])
 	];
 	assert.deepEqual(findToolCallArgs(events, "call-1"), { command: "ls -la", description: "List files" });
+});
+
+test("getSessionEvents: supports legacy events, snapshotEvents, ownEvents, and arrays", () => {
+	const events = [assistantMsg([{ type: "tool-call", id: "x", arguments: "{}" }])];
+	assert.deepEqual(getSessionEvents(events), events);
+	assert.deepEqual(getSessionEvents({ events }), events);
+	assert.deepEqual(getSessionEvents({ snapshotEvents: () => events }), events);
+	assert.deepEqual(getSessionEvents({ ownEvents: () => events }), events);
+});
+
+test("getSessionEvents: returns empty array when a session snapshot throws", () => {
+	assert.deepEqual(getSessionEvents({ snapshotEvents: () => { throw new Error("unavailable"); } }), []);
 });
 
 test("findToolCallArgs: reads a live DSH session through snapshotEvents()", () => {

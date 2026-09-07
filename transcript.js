@@ -61,15 +61,24 @@ function userText(data) {
 /**
  * Collect semantic items from the raw event stream, newest first.
  * Plugin-sourced user messages and streaming chunks are excluded here.
- * @param events - session.events
+ * @param events - a Session-like object or event array
  * @returns array of { seq, kind, ... } with seq counting only semantic items
  *   (newest first, so index 0 is the most recent).
  */
 export function collectSemanticItems(events) {
-	if (!Array.isArray(events)) return [];
+	const list = Array.isArray(events)
+		? events
+		: typeof events?.snapshotEvents === "function"
+			? (() => { try { return events.snapshotEvents(); } catch { return []; } })()
+			: typeof events?.ownEvents === "function"
+				? (() => { try { return events.ownEvents(); } catch { return []; } })()
+				: Array.isArray(events?.events)
+					? events.events
+					: [];
+	if (!Array.isArray(list)) return [];
 	const items = [];
-	for (let i = events.length - 1; i >= 0; i -= 1) {
-		const event = events[i];
+	for (let i = list.length - 1; i >= 0; i -= 1) {
+		const event = list[i];
 		if (event === null || typeof event !== "object") continue;
 		const type = event.type;
 		if (type === "user/message") {

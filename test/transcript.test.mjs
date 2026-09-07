@@ -72,6 +72,13 @@ test("truncateMiddle: tail=0 yields head-only elision", () => {
 // collectSemanticItems
 // ---------------------------------------------------------------------------
 
+test("collect: accepts legacy and current DSH Session-like objects", () => {
+	const events = [userEv("current API")];
+	assert.match(buildTranscript({ events: { events }, cfg: baseCfg() }), /current API/);
+	assert.match(buildTranscript({ events: { snapshotEvents: () => events }, cfg: baseCfg() }), /current API/);
+	assert.match(buildTranscript({ events: { ownEvents: () => events }, cfg: baseCfg() }), /current API/);
+});
+
 test("collect: streaming chunks and plugin messages are excluded", () => {
 	const events = [
 		userEv("real user intent"),

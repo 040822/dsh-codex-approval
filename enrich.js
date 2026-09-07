@@ -18,23 +18,29 @@
  * @param callId - the approval request's callId
  * @returns the parsed arguments object, or null when unrecoverable.
  */
+/**
+ * Read session events across the legacy and current DSH Session APIs.
+ * @param sessionOrEvents - a Session-like object or an event array
+ * @returns an event array; never throws
+ */
+export function getSessionEvents(sessionOrEvents) {
+	try {
+		if (Array.isArray(sessionOrEvents)) return sessionOrEvents;
+		const candidate = typeof sessionOrEvents?.snapshotEvents === "function"
+			? sessionOrEvents.snapshotEvents()
+			: typeof sessionOrEvents?.ownEvents === "function"
+				? sessionOrEvents.ownEvents()
+				: sessionOrEvents?.events;
+		return Array.isArray(candidate) ? candidate : [];
+	} catch {
+		return [];
+	}
+}
+
 export function findToolCallArgs(events, callId) {
 	if (callId === undefined || callId === null) return null;
-	let list;
-	try {
-		list = Array.isArray(events)
-			? events
-			: typeof events?.snapshotEvents === "function"
-				? events.snapshotEvents()
-				: typeof events?.ownEvents === "function"
-					? events.ownEvents()
-					: Array.isArray(events?.events)
-						? events.events
-						: null;
-	} catch {
-		return null;
-	}
-	if (!Array.isArray(list)) return null;
+	const list = getSessionEvents(events);
+	if (list.length === 0) return null;
 	for (let i = list.length - 1; i >= 0; i -= 1) {
 		const event = list[i];
 		if (event === null || typeof event !== "object" || event.type !== "assistant/message") continue;

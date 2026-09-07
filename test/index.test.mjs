@@ -13,12 +13,14 @@ function baseConfig(overrides = {}) {
 }
 
 /** Build a fake request with a session event containing the tool call. */
-function makeReq({ toolName = "bash", callId = "call-1", reason = "", aborted = false, command = "git status" } = {}) {
+function makeReq({ toolName = "bash", callId = "call-1", reason = "", aborted = false, command = "git status", sessionShape = "both" } = {}) {
 	const events = [{
 		type: "assistant/message",
 		data: { message: { content: [{ type: "tool-call", id: callId, name: toolName, arguments: JSON.stringify({ command, description: "x" }) }] } }
 	}];
-	const session = { id: "sess-1", events, snapshotEvents: () => events };
+	const session = { id: "sess-1" };
+	if (sessionShape === "legacy" || sessionShape === "both") session.events = events;
+	if (sessionShape === "current" || sessionShape === "both") session.snapshotEvents = () => events;
 	const req = { toolName, callId, reason, agent: { id: "agent-1", session } };
 	if (aborted) req.signal = { aborted: true, addEventListener() {} };
 	return req;
@@ -114,6 +116,13 @@ test("makeLlmRunner: sends the prepared config and messages to the DSH LLM API",
 	assert.equal(calls.length, 1);
 	assert.deepEqual(calls[0].config, { provider: "p", model: "m", temperature: 0, maxTokens: 7 });
 	assert.ok(calls[0].signal instanceof AbortSignal);
+});
+
+test("handler: current Session shape still matches rules", async () => {
+	const cfg = baseConfig({ ai: { enabled: false } });
+	const handler = createHandler({ config: cfg, record: async () => {}, llmRunner: async () => ({ ok: false, error: "AI must not run" }) });
+	const { outcome } = await run(handler, makeReq({ command: "git status", sessionShape: "current" }));
+	assert.equal(outcome, "allowed-once");
 });
 
 test("handler: rule allow → allowed-once, no next()", async () => {

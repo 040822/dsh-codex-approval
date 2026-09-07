@@ -250,7 +250,7 @@ export function createHandler({ config, record, llmRunner, getSessionMode, denia
 		} else if (cfg.ai.enabled) {
 			context = cfg.transcript === "short"
 				? buildTranscript({
-					events: req.agent?.session?.events,
+					events: req.agent?.session,
 					cfg,
 					denialHistory: history,
 					sessionId,
