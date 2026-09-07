@@ -16,6 +16,21 @@ test("findToolCallArgs: finds the matching tool-call by callId", () => {
 	assert.deepEqual(findToolCallArgs(events, "call-1"), { command: "ls -la", description: "List files" });
 });
 
+test("findToolCallArgs: reads a live DSH session through snapshotEvents()", () => {
+	const session = {
+		snapshotEvents: () => [assistantMsg([
+			{ type: "tool-call", id: "call-live", name: "bash", arguments: JSON.stringify({ command: "git status" }) }
+		])]
+	};
+	assert.deepEqual(findToolCallArgs(session, "call-live"), { command: "git status" });
+});
+
+test("findToolCallArgs: handles a throwing session snapshot defensively", () => {
+	const session = { snapshotEvents: () => { throw new Error("session unavailable"); } };
+	assert.doesNotThrow(() => findToolCallArgs(session, "call-1"));
+	assert.equal(findToolCallArgs(session, "call-1"), null);
+});
+
 test("findToolCallArgs: scans newest events first", () => {
 	const events = [
 		assistantMsg([{ type: "tool-call", id: "call-old", name: "bash", arguments: JSON.stringify({ command: "old" }) }]),

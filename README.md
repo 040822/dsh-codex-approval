@@ -4,6 +4,8 @@
 
 dsh 原生只有两种审批策略：模式级沙箱（`read-only` / `workspace-write` / `danger-full-access`）和一刀切的 `ask`/`never` 策略——**没有命令级规则，也没有 AI 风险评估**。本插件在 dsh 的 `approval/request` 应答者（answerer）seam 上实现了一个完整的自动审批决策链：
 
+> 兼容声明：当前包从 `0.2.3` 起声明兼容 DSH `>=0.1.2-rc.1`。插件读取 live session 的 `snapshotEvents()`，因此不依赖已移除的 `session.events` 属性。
+
 ```
 规则层（Codex approve-always / reject-always 风格）
   → AI 审判层（Codex 三级风险 + 三级授权 + risk tolerance）

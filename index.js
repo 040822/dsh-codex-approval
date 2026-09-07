@@ -4,7 +4,7 @@
  * Codex-style approval autopilot for DeepSeek Harness. Registers an
  * `approval/request` answerer (waterfall listener) that decides each request:
  *
- *   1. enrich — recover the full tool arguments by callId from the session log
+ *   1. enrich — recover the full tool arguments by callId from the session snapshot
  *   2. rules   — ordered glob rules with safety-first priority deny > ask > allow
  *   3. AI judge — LLM verdict {risk, authorization} mapped through riskTolerance
  *   4. fallback — delegate to the next answerer (the human GUI prompt)
@@ -183,6 +183,7 @@ export function makeLlmRunner(llm, { provider, model, timeoutMs, maxTokens }) {
 			for await (const chunk of prepared.stream({
 				...prepared.config,
 				messages,
+				signal: combined,
 				...sessionId === undefined ? {} : { sessionId }
 			})) {
 				if (chunk.type === "text-delta") text += chunk.text;
@@ -237,7 +238,7 @@ export function createHandler({ config, record, llmRunner, getSessionMode, denia
 		// mode 1: fully bypassed — the pre-plugin experience (no decision, no audit)
 		if (mode === "manual") return next();
 
-		const args = findToolCallArgs(req.agent?.session?.events, req.callId);
+		const args = findToolCallArgs(req.agent?.session, req.callId);
 		const argsText = argsPreview(args, req.toolName, cfg.ai.maxPromptChars);
 		const matchReq = { toolName: req.toolName, argsText, reason: req.reason ?? "" };
 

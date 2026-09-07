@@ -14,14 +14,29 @@
 
 /**
  * Find the parsed tool-call arguments for a callId in a session event list.
- * @param events - session.events (or any event array)
+ * @param events - a Session-like object (`snapshotEvents()`/`ownEvents()`) or any event array
  * @param callId - the approval request's callId
  * @returns the parsed arguments object, or null when unrecoverable.
  */
 export function findToolCallArgs(events, callId) {
-	if (!Array.isArray(events) || callId === undefined) return null;
-	for (let i = events.length - 1; i >= 0; i -= 1) {
-		const event = events[i];
+	if (callId === undefined || callId === null) return null;
+	let list;
+	try {
+		list = Array.isArray(events)
+			? events
+			: typeof events?.snapshotEvents === "function"
+				? events.snapshotEvents()
+				: typeof events?.ownEvents === "function"
+					? events.ownEvents()
+					: Array.isArray(events?.events)
+						? events.events
+						: null;
+	} catch {
+		return null;
+	}
+	if (!Array.isArray(list)) return null;
+	for (let i = list.length - 1; i >= 0; i -= 1) {
+		const event = list[i];
 		if (event === null || typeof event !== "object" || event.type !== "assistant/message") continue;
 		const content = event.data?.message?.content;
 		if (!Array.isArray(content)) continue;

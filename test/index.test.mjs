@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { DEFAULT_CONFIG, normalizeConfig, createHandler, makeRecorder, makeModeStore } from "../index.js";
+import { DEFAULT_CONFIG, normalizeConfig, createHandler, makeLlmRunner, makeRecorder, makeModeStore } from "../index.js";
 import { mkdtempSync, readFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -18,7 +18,8 @@ function makeReq({ toolName = "bash", callId = "call-1", reason = "", aborted = 
 		type: "assistant/message",
 		data: { message: { content: [{ type: "tool-call", id: callId, name: toolName, arguments: JSON.stringify({ command, description: "x" }) }] } }
 	}];
-	const req = { toolName, callId, reason, agent: { id: "agent-1", session: { id: "sess-1", events } } };
+	const session = { id: "sess-1", events, snapshotEvents: () => events };
+	const req = { toolName, callId, reason, agent: { id: "agent-1", session } };
 	if (aborted) req.signal = { aborted: true, addEventListener() {} };
 	return req;
 }
@@ -88,6 +89,31 @@ test("handler: denial is staged into an injected denialFeed", async () => {
 	const queue = denialFeed.get("sess-1");
 	assert.ok(Array.isArray(queue) && queue.length === 1);
 	assert.equal(queue[0].source, "rule");
+});
+
+test("makeLlmRunner: sends the prepared config and messages to the DSH LLM API", async () => {
+	const calls = [];
+	const llm = {
+		async prepareCall(config, signal) {
+			calls.push({ config, signal });
+			return {
+				config,
+				stream: async function* ({ messages, signal }) {
+					assert.equal(messages[0].content[0].text, "judge");
+					assert.ok(signal instanceof AbortSignal);
+					yield { type: "text-delta", text: "{\"risk\":\"low\"}" };
+					yield { type: "finish", reason: { kind: "stop" } };
+				}
+			};
+		}
+	};
+	const runner = makeLlmRunner(llm, { provider: "p", model: "m", timeoutMs: 1000, maxTokens: 7 });
+	const result = await runner([{ role: "user", content: [{ type: "text", text: "judge" }] }]);
+	assert.equal(result.ok, true);
+	assert.equal(result.text, "{\"risk\":\"low\"}");
+	assert.equal(calls.length, 1);
+	assert.deepEqual(calls[0].config, { provider: "p", model: "m", temperature: 0, maxTokens: 7 });
+	assert.ok(calls[0].signal instanceof AbortSignal);
 });
 
 test("handler: rule allow → allowed-once, no next()", async () => {
