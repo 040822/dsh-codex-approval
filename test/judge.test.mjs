@@ -91,6 +91,20 @@ test("judgeWith: runner failure surfaces error", async () => {
 	assert.equal(result.error, "timeout");
 });
 
+test("judgeWith: runner failure preserves structured stream details", async () => {
+	const failure = { code: "TIMEOUT", message: "upstream request timed out" };
+	const runner = async () => ({
+		ok: false,
+		error: "judge stream finished with error [TIMEOUT]: upstream request timed out",
+		finishKind: "error",
+		failure
+	});
+	const result = await judgeWith({ runner, input: { toolName: "bash", argsText: "ls", reason: "" } });
+	assert.equal(result.ok, false);
+	assert.equal(result.finishKind, "error");
+	assert.deepEqual(result.failure, failure);
+});
+
 test("judgeWith: thrown runner error is caught", async () => {
 	const runner = async () => {
 		throw new Error("boom");

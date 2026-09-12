@@ -74,6 +74,26 @@ test("handler: ai deny stages a denial record with risk and aiReason", async () 
 	assert.equal(queue[0].aiReason, "credential exposure");
 });
 
+test("handler: AI stream failure stages safe diagnostics for feedback", async () => {
+	const feed = new Map();
+	const cfg = baseConfig({ ai: { enabled: true, failOpen: "deny" } });
+	const handler = createHandler({
+		config: cfg,
+		record: async () => {},
+		llmRunner: async () => ({
+			ok: false,
+			error: "judge stream finished with error [TIMEOUT]: upstream request timed out",
+			finishKind: "error",
+			failure: { code: "TIMEOUT", message: "upstream request timed out" }
+		}),
+		denialFeed: feed
+	});
+	const outcome = await run(handler, makeReq({ command: "npx tinyfish" }));
+	assert.equal(outcome, "rejected");
+	assert.deepEqual(feed.get("sess-1")[0].failure, { code: "TIMEOUT", message: "upstream request timed out" });
+	assert.equal(feed.get("sess-1")[0].finishKind, "error");
+});
+
 test("handler: rule allow does not stage", async () => {
 	const feed = new Map();
 	const cfg = baseConfig({ ai: { enabled: false } });
@@ -188,6 +208,21 @@ test("injector: missing rationale falls back to default sentence", async () => {
 	assert.match(decision.messages[1].content[0].text, /No rationale was provided/);
 });
 
+test("injector: AI failure renders safe provider diagnostics", async () => {
+	const feed = new Map();
+	feed.set("s", [{
+		command: "npx tinyfish",
+		source: "ai-error",
+		finishKind: "error",
+		failure: { code: "TIMEOUT", message: "Bearer [REDACTED] request timed out" },
+		ts: 1
+	}]);
+	const injector = makeDenialInjector({ config: baseConfig(), denialFeed: feed, getLocale: () => "en" });
+	const decision = await injector({ agent: { id: "a", session: { id: "s" } }, messages: [], signal: undefined }, plainNext);
+	const text = decision.messages[1].content[0].text;
+	assert.match(text, /Review call failed: error \(TIMEOUT\): Bearer \[REDACTED\] request timed out/);
+});
+
 test("injector: empty command rendered as unknown-command", async () => {
 	const feed = new Map();
 	feed.set("s", [{ command: "", source: "rule", ts: 1 }]);
@@ -265,6 +300,17 @@ test("renderDenialNotice: zh locale renders the corrective notice", () => {
 	assert.match(text, /风险：high/);
 	assert.match(text, /评审理由：数据删除/);
 	assert.match(text, /变通手段/);
+});
+
+test("renderDenialNotice: zh locale renders AI failure diagnostics", () => {
+	const text = renderDenialNotice([{
+		command: "npx tinyfish",
+		source: "ai-error",
+		finishKind: "error",
+		failure: { code: "RATE_LIMIT", message: "quota exceeded" },
+		ts: 1
+	}], "zh");
+	assert.match(text, /评审调用失败：error（RATE_LIMIT）：quota exceeded/);
 });
 
 test("renderDenialNotice: en locale has the NOT-by-user attribution", () => {

@@ -1,11 +1,25 @@
 {
   "name": "dsh-codex-approval",
-  "version": "0.4.1",
+  "version": "0.5.4",
   "description": "Codex-style approval autopilot for DeepSeek Harness: ordered glob rules (allow/ask/deny) plus an AI risk judge (low/medium/high) mapped through a risk tolerance, as an approval answerer.",
   "type": "module",
   "main": "index.js",
+  "scripts": {
+    "build:client": "node scripts/build-client.mjs",
+    "test": "node --test"
+  },
+  "exports": {
+    ".": {
+      "default": "./index.js"
+    },
+    "./client": "./lib/client.js"
+  },
   "files": [
     "index.js",
+    "lib/client.js",
+    "client-model-picker.js",
+    "client-remote.js",
+    "client-card-style.js",
     "rules.js",
     "enrich.js",
     "i18n.js",
@@ -13,6 +27,7 @@
     "modes.js",
     "transcript.js",
     "cordis.patch.yml",
+    "scripts/build-client.mjs",
     "README.md",
     "LICENSE"
   ],
@@ -20,11 +35,22 @@
     "bundle": {
       "patch": "./cordis.patch.yml"
     },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-renderer",
+        "@deepseek-ai/dsh-client-ui-settings",
+        "@deepseek-ai/dsh-client-ui-settings-plugins",
+        "@deepseek-ai/dsh-api-remotes",
+        "@deepseek-ai/dsh-client-locale"
+      ]
+    },
     "compatibility": {
       "dsh": ">=0.1.2-rc.1",
       "dshReleases": {
         "0.1.0-rc.6": "compatible",
-        "0.1.2-rc.1": "compatible"
+        "0.1.2-rc.1": "compatible",
+        "0.1.5-rc.1": "compatible"
       }
     }
   },

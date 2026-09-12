@@ -155,7 +155,11 @@ export function decideAuthorization(verdict, tolerance) {
  * @param sessionId - optional stable per-conversation id forwarded to the LLM
  *   call so the provider can optimize prompt caching (e.g. OpenCode Go's
  *   `x-opencode-session` header).
- * @returns { ok: true, verdict } | { ok: false, error }
+ * @returns { ok: true, verdict, judgeModel?, judgeFallbackFrom?, judgeAttempts? }
+ *   | { ok: false, error, finishKind?, failure?, judgeAttempts?, judgeTried? }
+ *   The `judge*` fields are present only when the runner used a fallback chain
+ *   (see makeLlmRunner): they name the model that answered and how many
+ *   candidates were tried, so the audit log shows a degraded judge.
  */
 export async function judgeWith({ runner, input, signal, allowAsk = true, sessionId }) {
 	const messages = buildJudgeMessages(input, { allowAsk });
@@ -166,11 +170,29 @@ export async function judgeWith({ runner, input, signal, allowAsk = true, sessio
 		return { ok: false, error: String(error?.message ?? error) };
 	}
 	if (result === null || result.ok !== true) {
-		return { ok: false, error: result?.error ?? "judge runner failed" };
+		return {
+			ok: false,
+			error: result?.error ?? "judge runner failed",
+			...result?.finishKind === undefined ? {} : { finishKind: result.finishKind },
+			...result?.failure === undefined ? {} : { failure: result.failure },
+			...result?.judgeAttempts === undefined ? {} : { judgeAttempts: result.judgeAttempts },
+			...result?.judgeTried === undefined ? {} : { judgeTried: result.judgeTried }
+		};
 	}
 	const verdict = parseVerdict(result.text);
 	if (verdict === null) {
-		return { ok: false, error: "unparseable judge output", rawText: result.text.slice(0, 500) };
+		return {
+			ok: false,
+			error: "unparseable judge output",
+			rawText: result.text.slice(0, 500),
+			...result.judgeModel === undefined ? {} : { judgeModel: result.judgeModel }
+		};
 	}
-	return { ok: true, verdict };
+	return {
+		ok: true,
+		verdict,
+		...result.judgeModel === undefined ? {} : { judgeModel: result.judgeModel },
+		...result.judgeFallbackFrom === undefined ? {} : { judgeFallbackFrom: result.judgeFallbackFrom },
+		...result.judgeAttempts === undefined ? {} : { judgeAttempts: result.judgeAttempts }
+	};
 }

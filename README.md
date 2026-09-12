@@ -29,14 +29,47 @@ approval/request 到达（toolName + callId + reason）
 ├─ 1. 参数反查：按 callId 从会话日志恢复完整命令（bash/pwsh 取原始 command）
 ├─ 2. 规则层（deny > ask > allow，命中即定，0ms）
 │     deny → 直接拒绝（AI 无权覆盖）│ allow → 静默放行 │ ask → 交人类
-├─ 3. AI 审判层（规则未命中时；默认 opencode-go / deepseek-v4-flash）
+├─ 3. AI 审判层（规则未命中时；默认 cpa-wx301 / command/deepseek/deepseek-v4.1-flash）
 │     LLM 裁决 {risk, authorization, reason}
 │     allow/deny 直接生效；ask 按 riskTolerance 映射
-│     AI 报错/超时/输出非法 → failOpen（默认 ask → 人类）
+│     主模型失败 → 依次尝试 ai.fallbacks（默认 deepseek-official / deepseek-flash）
+│     全部候选失败/超时/输出非法 → failOpen（默认 ask → 人类）
 └─ 4. 兜底：fallback（默认 ask → GUI 弹窗）
 ```
 
+> 默认审判模型原为 `opencode-go / deepseek-v4-flash`。OpenCode Go 订阅到期后该路由返回
+> `401 CreditsError`，会让 AI 审判层整体退化到 `failOpen`；现在默认改走本机 CLIProxyAPI
+> （`cpa-wx301`）的 Command Code 通道，并以 DeepSeek 官方 API（`deepseek-official`）作为兜底。
+
 每次决策写入一行 JSONL 审计日志（默认 `~/.dsh/logs/approval.jsonl`）：工具名、命令预览、reason、判定来源（rule / ai / ai-error / fallback）、**模式（mode）**、风险、AI 理由、耗时。
+
+当 LLM stream 以 `finish.reason.kind = "error"` 或 `"aborted"` 结束时，`ai-error` 记录还会保留安全裁剪后的 `finishKind` 和 `failure` 字段，并把错误摘要带入 `error` 字段。例如：
+
+```json
+{"kind":"ai-error","finishKind":"error","failure":{"code":"TIMEOUT","message":"upstream request timed out"},"error":"judge stream finished with error [TIMEOUT]: upstream request timed out"}
+```
+
+`failure.message`、`failure.code` 和 `requestId` 有长度上限，并会脱敏 Bearer/API key/token/password/secret 以及 URL 敏感查询参数；不会把凭据原文写入审计日志或拒绝反馈。常见 code 的排查方向：`AUTH`（鉴权/密钥）、`RATE_LIMIT` 或 `QUOTA_EXCEEDED`（限流/额度）、`SERVER`（上游 5xx）、`TIMEOUT`（超时）、`TRANSPORT`（网络/连接/流中断）、`CONTEXT_WINDOW_EXCEEDED`（上下文超限）。这些字段只增强诊断，不改变 `failOpen`、`mode3OnAsk` 或人工审批策略。
+
+## Web 配置与模型可用性
+
+**卡片在哪**：Web UI → **设置 → 插件 → 插件配置**（英文 `Settings → Plugins → Plugin configuration`）。该标签页按 settings namespace 列出可配置插件，本插件的卡片由自身浏览器半边注册在 `settings.plugin.item` slot 上，key 为 `dsh-codex-approval-config`。看不到卡片时先确认 Host 已加载新代码并刷新页面（见下方构建与重启说明）。
+
+**卡片长什么样**：与内置插件卡片一致——`<ul>` 里的 `<li>` 卡片（`.5px` 边框、16px 圆角、`bg-layer-3`／展开后 `bg-layer-2`），可折叠 header（名称 + 描述 + 未保存 Tag + 箭头）、body 表单、footer 的「放弃 / 保存」。样式取值逐条抄自内置的 `PluginCard.module.css` 与 `fields.module.css`（边框、圆角、14/16px 内边距、15px/600 标题、13px 描述、34px 控件高、focus 用 `--dsw-alias-brand-primary` 描边），并作用域在 `dsh-ca-` 前缀下，通过 `data-plugin-css` 约定的 `<style>` 注入（`client-card-style.js`，测试见 `test/client-card-style.test.mjs`）。图标、`Tag`、`Switch` 来自 shell 静态表模块 `@deepseek-ai/dsh-client-ui-primitives`。卡片默认折叠，与其它插件卡片行为一致。
+
+卡片里可以配置：**主模型**（下拉，按 provider 分组，可用项在前、不可用项标 `⚠` 并置底）、**兜底候选**（最多 4 项，可增删、可上下移动调序）、风险容忍度、`failOpen`、`mode3OnAsk`、超时、最大输出 token、拒绝反馈开关。改动后 header 出现「未保存」Tag 并启用「保存 / 放弃」；保存经 settings revision fence 写入并在 Host 侧 live 生效。
+
+可用性来自 `session.modelCatalog()`：`failures` 里的 provider 显示具体失败原因（如 401 额度），不在 `routableProviders` 里的 provider 标注“不可路由”；两种都**仍可选**，只是标红置底，避免冷却中的路由被藏起来。当前配置的 provider 若不在目录中，下拉会保留一个“（不在模型目录中）”项，防止静默改值。
+
+配置变更通过 settings revision fence 保存，并在 Host 侧 live 更新运行时配置；正在进行的 judge 调用不会被中途替换。真实 provider failure 仍以审批日志中的脱敏 `failure.code/message` 为准；API key 不存入该 namespace。
+
+审判模型是一条**有序候选链**：先试 `provider`/`model`，失败（AUTH/额度/上游 5xx/连接/超时）再依次试 `fallbacks` 里的每一项，按 provider+model 去重。第一个给出回复的候选胜出；全部失败时按**主模型**的失败信息记 `ai-error`（它才是配置意图），并附带 `judgeAttempts`/`judgeTried`。走兜底时成功记录会带 `judgeModel`（实际作答的模型）、`judgeFallbackFrom`（被跳过的主模型）与 `judgeAttempts`。候选链也读同一个 settings namespace 的 `fallbacks` 字段（最多 4 项），修改同样 live 生效；调用方取消（`signal` 已 abort）时不会再花下一次调用。
+
+注意：链只在**provider 层失败**时推进。"模型答了但输出无法解析成 `{risk, authorization, reason}`" 仍按原逻辑走 `failOpen`，不会静默换模型。
+
+上游 `opencode-go` 订阅到期后，`cpa-wx301` 上的 `opencode/*` 模型同样因渠道 `auth_unavailable` 不可用；`ai.fallbacks` 因此默认选 DeepSeek 官方 API（`deepseek-official`，即 DSH 原生 `llm-deepseek` 适配器，走 `DEEPSEEK_API_KEY`），与主模型同属 DeepSeek V4.x 家族但路由独立。
+
+当前 DSH 0.1.2-rc.1 的 `dsh-llm-pi-ai` 安装产物还需要应用工作区中的 `patches/dsh-llm-pi-ai-opencode-session.patch`，让 `opencode-go` 请求把每个会话的 `sessionId` 映射为动态 `x-opencode-session`。该补丁不会影响其他 provider；全局 npm/npx 重装后需要重新应用。
 
 ## 审批模式（v0.2.0）
 
@@ -118,8 +151,11 @@ dsh plugin --profile web add dsh-codex-approval
         action: ask
     ai:
       enabled: true
-      provider: opencode-go          # 与主 agent 同一 provider（成本一致）
-      model: deepseek-v4-flash       # deepseek-chat 官方 API 已弃用
+      provider: cpa-wx301                      # 本机 CLIProxyAPI（Command Code 通道）
+      model: command/deepseek/deepseek-v4.1-flash
+      fallbacks:                               # 主模型失败时按序尝试（最多 4 项）
+        - provider: deepseek-official          # DSH 原生 llm-deepseek（api.deepseek.com）
+          model: deepseek-flash
       riskTolerance: medium          # low | medium | high（仿 Codex risk tolerance）
       maxPromptChars: 2000
       timeoutMs: 15000
@@ -172,7 +208,8 @@ dsh plugin --profile web add dsh-codex-approval
 
 - **deny 规则永远最先求值**，AI 无权覆盖显式拒绝
 - AI 输出只映射为三种结果之一，不存在注入面；命令文本进 prompt 前截断
-- AI 调用有超时上限（默认 15s），失败默认交还人类（fail-open，不会静默全拒）
+- AI 调用有超时上限（默认 15s，**每个候选各自计时**），失败默认交还人类（fail-open，不会静默全拒）
+- 审判候选链只在 provider 层失败时推进；候选全部失败才落到 `failOpen`
 - 审批审计对（approval/asked + approval/decided）由 dsh 审批服务持久化，插件只追加自己的决策日志
 - `danger-full-access` 模式下沙箱不拒绝任何操作，审批请求不会发生，插件自然空闲
 - 单次 AI 审批成本约 0.3~0.7 分钱（官方价估算），仅规则未命中时产生
@@ -184,11 +221,30 @@ dsh plugin --profile web add dsh-codex-approval
 | 典型（短命令） | ~400-500 | ≈ 0.003 元 |
 | 最坏（命令 2000 字符） | ~1,500 | ≈ 0.007 元 |
 
+## 版本适配记录（DSH 0.1.5-rc.1）
+
+三处与 0.1.2 不同的地方，都会表现为"设置卡片不见了 / 改了不生效 / 卡片崩了"：
+
+1. **`settings.register()` 返回 owner scope**。0.1.5 里它是 `register(ns, schema, options) → { get, watch, update, replace }`，**服务级没有 `watch`**。旧写法 `settings.watch(...)` 会抛 `TypeError`，又因为包在 try/catch 里，表现为"配置改了要重启才生效"甚至静默失效。现在走返回的 scope，并兼容旧的服务级形状（见 `installConfigSettings` 与 `test/config-settings.test.mjs`）。
+2. **客户端 `dsh.client.inject` 要写模块提供者，不是服务名**。`slots` 服务由 `@deepseek-ai/dsh-client-ui-renderer` 的客户端半边提供，模块图里并不存在 `@deepseek-ai/dsh-client-ui-slots` 这一行；写错会导致卡片永不注册，于是"插件配置"标签页里看不到本卡片（该标签页只列出**既注册了卡片、又被 Host 认领**的 namespace）。
+3. **`remote.session` 是点号服务名，必须在 cordis `inject` 里显式声明**（DSH 自带的设置面板声明的是 `["slots","locale","remote","remote.credentials","remote.session","settingsScope"]`）。只声明 `remote` 会抛 `cannot get property "remote.session" without inject`；而且 slot 卡片是在**标签页的 fiber** 里渲染的，在那里碰这个代理会直接 `slot entry crashed in 'settings.plugin.item'`，整张卡片消失。所以本插件在自己的 fiber 里把 `modelCatalog()` 解析成普通函数再交给卡片（`client-remote.js`，测试见 `test/client-remote.test.mjs`）。
+
+自查：重启后在浏览器控制台执行
+
+```js
+JSON.stringify(window.__DSH_BOOT__).includes('dsh-codex-approval')   // true = 客户端半边已在模块图里
+```
+
+插件自身也会把启动证据写进审批日志 `~/.dsh/logs/approval.jsonl`：`{"event":"config-settings","ok":true,"scope":"owner-scope","namespace":"dsh-codex-approval-config",...}` 表示 Host 侧 namespace 注册成功；`ok:false` 会带 `error` 说明原因。
+
 ## 开发与测试
 
 ```bash
-node --test        # 覆盖规则、旧/新 Session API、transcript、deny feedback、AI 裁决与决策流
+node --test              # 规则、Session API、transcript、deny feedback、AI 裁决、兜底链、模型选择器与浏览器半边冒烟测试
+npm run build:client     # 重新构建 lib/client.js（esbuild 经 npx 获取；改 src/client/* 后必须重建）
 ```
+
+浏览器半边是 esbuild 的 CJS bundle，外面包一层 DSH 的 `window.__ModuleLoader__.load({ id, factory })` 加载壳（`scripts/build-client.mjs` 生成）。React 与 `@deepseek-ai/*` 均为 external，由 Host 的模块加载器提供。`test/client-bundle.test.mjs` 用假加载器 + 极简 React stub 真实渲染卡片，因此改完前端后 `node --test` 能发现产物损坏或渲染异常。
 
 ## License
 

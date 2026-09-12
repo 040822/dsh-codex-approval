@@ -89,6 +89,7 @@ const NOTICE = {
 		unknownCommand: "（未知命令）",
 		sourceLine: (src, risk) => `来源：${src}${risk !== void 0 ? `；风险：${risk}` : ""}`,
 		viaAsk: "（全自动模式下 \"ask\" 被解析为 \"deny\"，未经过人类确认）",
+		failure: (kind, failure) => `评审调用失败：${kind ?? "unknown"}${failure?.code !== undefined ? `（${failure.code}）` : ""}${failure?.message !== undefined ? `：${failure.message}` : ""}`,
 		rationale: (text) => `评审理由：${text}`,
 		rationaleMissing: "未提供评审理由。",
 		directive: "不要通过变通手段或间接执行绕开该操作；请改用实质更安全的替代方案，或停下来询问用户。"
@@ -98,6 +99,7 @@ const NOTICE = {
 		unknownCommand: "(unknown command)",
 		sourceLine: (src, risk) => `Source: ${src}${risk !== void 0 ? `; risk: ${risk}` : ""}`,
 		viaAsk: " (denied by the auto mode default: \"ask\" resolved to \"deny\" without a human)",
+		failure: (kind, failure) => `Review call failed: ${kind ?? "unknown"}${failure?.code !== undefined ? ` (${failure.code})` : ""}${failure?.message !== undefined ? `: ${failure.message}` : ""}`,
 		rationale: (text) => `Review rationale: ${text}`,
 		rationaleMissing: "No rationale was provided.",
 		directive: "Do not pursue this action via workaround or indirect execution. Continue with a materially safer alternative, or stop and ask the user."
@@ -106,7 +108,7 @@ const NOTICE = {
 
 /**
  * Render one staged denial record into a corrective paragraph.
- * @param record - { command, source, match?, risk?, aiReason?, viaAsk? }
+ * @param record - { command, source, match?, risk?, aiReason?, finishKind?, failure?, viaAsk? }
  * @param t - the locale's NOTICE table
  * @returns the paragraph text (no trailing newline).
  */
@@ -118,9 +120,11 @@ function renderNoticeOne(record, t, locale) {
 	const lines = [
 		t.deniedByReviewer(command),
 		t.sourceLine(src, record.risk) + (record.viaAsk === true ? t.viaAsk : ""),
-		record.aiReason !== undefined
-			? t.rationale(record.aiReason)
-			: t.rationaleMissing
+		record.failure !== undefined
+			? t.failure(record.finishKind, record.failure)
+			: record.aiReason !== undefined
+				? t.rationale(record.aiReason)
+				: t.rationaleMissing
 	];
 	return lines.join("\n");
 }

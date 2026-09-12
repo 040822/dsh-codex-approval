@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { DEFAULT_CONFIG, normalizeConfig, createHandler, makeLlmRunner, makeRecorder, makeModeStore } from "../index.js";
+import { DEFAULT_CONFIG, normalizeConfig, applyConfigSettings, createHandler, makeLlmRunner, makeRecorder, makeModeStore } from "../index.js";
 import { mkdtempSync, readFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -42,6 +42,27 @@ test("normalizeConfig: defaults are valid and complete", () => {
 	assert.equal(cfg.ai.riskTolerance, "medium");
 	assert.equal(cfg.fallback, "ask");
 	assert.ok(cfg.rules.length > 0);
+});
+
+test("applyConfigSettings: projects UI settings onto the runtime config", () => {
+	const cfg = applyConfigSettings(normalizeConfig({}), {
+		provider: "cpa-wx301",
+		model: "codex/gpt-5.6-luna",
+		riskTolerance: "low",
+		failOpen: "deny",
+		mode3OnAsk: "allow",
+		timeoutMs: 7000,
+		maxTokens: 256,
+		denyFeedback: false
+	});
+	assert.equal(cfg.ai.provider, "cpa-wx301");
+	assert.equal(cfg.ai.model, "codex/gpt-5.6-luna");
+	assert.equal(cfg.ai.riskTolerance, "low");
+	assert.equal(cfg.ai.failOpen, "deny");
+	assert.equal(cfg.mode3OnAsk, "allow");
+	assert.equal(cfg.ai.timeoutMs, 7000);
+	assert.equal(cfg.ai.maxTokens, 256);
+	assert.equal(cfg.denyFeedback, false);
 });
 
 test("normalizeConfig: rejects invalid values loudly", () => {
@@ -116,6 +137,126 @@ test("makeLlmRunner: sends the prepared config and messages to the DSH LLM API",
 	assert.equal(calls.length, 1);
 	assert.deepEqual(calls[0].config, { provider: "p", model: "m", temperature: 0, maxTokens: 7 });
 	assert.ok(calls[0].signal instanceof AbortSignal);
+});
+
+test("makeLlmRunner: preserves structured provider failure details", async () => {
+	const llm = {
+		async prepareCall(config) {
+			return {
+				config,
+				stream: async function* () {
+					yield {
+						type: "finish",
+						reason: {
+							kind: "error",
+							failure: {
+								code: "TIMEOUT",
+								message: "upstream request timed out",
+								status: 504,
+								requestId: "req-123"
+							}
+						}
+					};
+				}
+			};
+		}
+	};
+	const runner = makeLlmRunner(llm, { provider: "p", model: "m", timeoutMs: 1000, maxTokens: 7 });
+	const result = await runner([]);
+	assert.equal(result.ok, false);
+	assert.equal(result.finishKind, "error");
+	assert.deepEqual(result.failure, {
+		code: "TIMEOUT",
+		message: "upstream request timed out",
+		status: 504,
+		requestId: "req-123"
+	});
+	assert.match(result.error, /TIMEOUT/);
+	assert.match(result.error, /upstream request timed out/);
+});
+
+test("makeLlmRunner: falls back safely when provider failure details are missing", async () => {
+	const llm = {
+		async prepareCall(config) {
+			return {
+				config,
+				stream: async function* () {
+					yield { type: "finish", reason: { kind: "error", failure: { code: 42, message: null } } };
+				}
+			};
+		}
+	};
+	const result = await makeLlmRunner(llm, { provider: "p", model: "m", timeoutMs: 1000, maxTokens: 7 })([]);
+	assert.equal(result.ok, false);
+	assert.equal(result.finishKind, "error");
+	assert.equal(result.failure, undefined);
+	assert.equal(result.error, "judge stream finished with error");
+});
+
+test("makeLlmRunner: bounds long provider failure messages", async () => {
+	const llm = {
+		async prepareCall(config) {
+			return {
+				config,
+				stream: async function* () {
+					yield { type: "finish", reason: { kind: "error", failure: { code: "SERVER", message: "x".repeat(700) } } };
+				}
+			};
+		}
+	};
+	const result = await makeLlmRunner(llm, { provider: "p", model: "m", timeoutMs: 1000, maxTokens: 7 })([]);
+	assert.equal(result.ok, false);
+	assert.equal(result.failure.message.length, 500);
+	assert.equal(result.failure.message.endsWith("…"), true);
+});
+
+test("makeLlmRunner: redacts credentials in provider failure diagnostics", async () => {
+	const llm = {
+		async prepareCall(config) {
+			return {
+				config,
+				stream: async function* () {
+					yield {
+						type: "finish",
+						reason: {
+							kind: "error",
+							failure: {
+								code: "AUTH",
+								message: "Bearer super-secret-token apiKey=hidden-value https://example.test/?token=query-secret"
+							}
+						}
+					};
+				}
+			};
+		}
+	};
+	const runner = makeLlmRunner(llm, { provider: "p", model: "m", timeoutMs: 1000, maxTokens: 7 });
+	const result = await runner([]);
+	assert.equal(result.ok, false);
+	assert.match(result.error, /Bearer \[REDACTED\]/);
+	assert.match(result.error, /apiKey=\[REDACTED\]/);
+	assert.match(result.error, /token=\[REDACTED\]/);
+	assert.doesNotMatch(result.error, /super-secret-token|hidden-value|query-secret/);
+});
+
+test("makeLlmRunner: preserves aborted finish details", async () => {
+	const llm = {
+		async prepareCall(config) {
+			return {
+				config,
+				stream: async function* () {
+					yield {
+						type: "finish",
+						reason: { kind: "aborted", failure: { code: "ABORTED", message: "request canceled" } }
+					};
+				}
+			};
+		}
+	};
+	const result = await makeLlmRunner(llm, { provider: "p", model: "m", timeoutMs: 1000, maxTokens: 7 })([]);
+	assert.equal(result.ok, false);
+	assert.equal(result.finishKind, "aborted");
+	assert.deepEqual(result.failure, { code: "ABORTED", message: "request canceled" });
 });
 
 test("handler: current Session shape still matches rules", async () => {
@@ -214,6 +355,28 @@ test("handler: AI error → failOpen deny → rejected without next()", async ()
 	const { outcome, nextCalls } = await run(handler, makeReq({ command: "something" }));
 	assert.equal(outcome, "rejected");
 	assert.equal(nextCalls.length, 0);
+});
+
+test("handler: AI stream failure is recorded without changing failOpen", async () => {
+	const cfg = baseConfig({ rules: [], ai: { failOpen: "deny" } });
+	const entries = [];
+	const handler = createHandler({
+		config: cfg,
+		record: async (entry) => entries.push(entry),
+		llmRunner: async () => ({
+			ok: false,
+			error: "judge stream finished with error [RATE_LIMIT]: quota exceeded",
+			finishKind: "error",
+			failure: { code: "RATE_LIMIT", message: "quota exceeded", status: 429 }
+		})
+	});
+	const { outcome, nextCalls } = await run(handler, makeReq({ command: "npx tinyfish" }));
+	assert.equal(outcome, "rejected");
+	assert.equal(nextCalls.length, 0);
+	assert.equal(entries[0].kind, "ai-error");
+	assert.equal(entries[0].finishKind, "error");
+	assert.deepEqual(entries[0].failure, { code: "RATE_LIMIT", message: "quota exceeded", status: 429 });
+	assert.match(entries[0].error, /RATE_LIMIT/);
 });
 
 test("handler: no rules + AI disabled → fallback ask → next()", async () => {

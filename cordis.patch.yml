@@ -1,4 +1,4 @@
-# dsh-codex-approval bundle layer: insert the plugin row into the profile.
+# dsh-codex-approval bundle layer: insert the host + browser plugin row.
 - insert:
     - id: dsh-codex-approval
       name: dsh-codex-approval
