@@ -34,9 +34,19 @@ test("parseVerdict: balanced scan handles nested braces inside string values", (
 	assert.deepEqual(parseVerdict(text), { risk: "high", authorization: "deny", reason: "removes {important} data {a} {b}" });
 });
 
-test("parseVerdict: balanced scan takes the first complete object", () => {
+test("parseVerdict: two verdict objects are ambiguous and rejected outright", () => {
 	const text = '{"risk":"low","authorization":"allow","reason":"one"} then {"risk":"high","authorization":"deny","reason":"two"}';
-	assert.deepEqual(parseVerdict(text), { risk: "low", authorization: "allow", reason: "one" });
+	assert.equal(parseVerdict(text), null);
+});
+
+test("parseVerdict: one verdict plus an unrelated object still parses", () => {
+	const text = 'meta {"note":"not a verdict"} verdict {"risk":"high","authorization":"deny","reason":"rm -rf /"}';
+	assert.deepEqual(parseVerdict(text), { risk: "high", authorization: "deny", reason: "rm -rf /" });
+});
+
+test("parseVerdict: a verdict wrapped in another object is rejected (fail-safe)", () => {
+	const text = '{"wrapper":{"risk":"low","authorization":"ask","reason":"nested"}}';
+	assert.equal(parseVerdict(text), null);
 });
 
 test("parseVerdict: bare JSON with escaped quotes inside reason", () => {

@@ -16,7 +16,7 @@ dsh 原生只有两种审批策略：模式级沙箱（`read-only` / `workspace-
 
 | Codex CLI | 本插件 |
 |---|---|
-| `--approve-always 'Bash(git diff)'` / `--reject-always` | glob 规则（`Bash(git *)` / `reason:*curl*`），动作 `allow` / `ask` / `deny`，安全优先级 **deny > ask > allow** |
+| `--approve-always 'Bash(git diff)'` / `--reject-always` | glob 规则（`Bash(git *)` / `reason:*curl*`）**与结构化 argv 前缀规则**（`{tool: bash, pattern: [git, status]}`，仿 Codex `prefix_rule`），动作 `allow` / `ask` / `deny`，安全优先级 **deny > ask > allow** |
 | 工具风险分级 `low` / `medium` / `high` | AI 对每次审批请求输出 `risk: low\|medium\|high`（只读=low、有界修改=medium、破坏/泄密/系统级=high） |
 | 三级授权 | AI 输出 `authorization: allow\|ask\|deny`——直接放行 / 交人类 / 禁止 |
 | `risk_tolerance` 配置 | `riskTolerance: low\|medium\|high`：AI 判 ask 时按容忍度映射（风险 ≤ 容忍度 → 自动放行） |
@@ -26,15 +26,19 @@ dsh 原生只有两种审批策略：模式级沙箱（`read-only` / `workspace-
 
 ```
 approval/request 到达（toolName + callId + reason）
-├─ 1. 参数反查：按 callId 从会话日志恢复完整命令（bash/pwsh 取原始 command）
-├─ 2. 规则层（deny > ask > allow，命中即定，0ms）
+├─ 1. 参数反查：按 callId 从会话日志恢复**完整**命令（bash/pwsh 取原始 command；不截断）
+├─ 2. 形状判定（shell-shape.js，bash/pwsh）：simple（单条纯命令）/ compound（安全分隔符串联）/ opaque（重定向、替换、变量、通配、控制流…）
+│     只有 simple 才可能被 allow 规则放行；compound/opaque 一律交规则 ask/deny → AI/人类
+├─ 3. 证据门槛：参数缺失或命令超 `ai.maxJudgeCommandChars` → 标记 evidence-incomplete，**不问 AI**
+│      ai → 交人类；ai-auto → 拒绝（mode3OnAsk=allow 也不能放行）
+├─ 4. 规则层（deny > ask > allow，命中即定，0ms）
 │     deny → 直接拒绝（AI 无权覆盖）│ allow → 静默放行 │ ask → 交人类
-├─ 3. AI 审判层（规则未命中时；默认 cpa-wx301 / command/deepseek/deepseek-v4.1-flash）
-│     LLM 裁决 {risk, authorization, reason}
+├─ 5. AI 审判层（规则未命中时；默认 cpa-wx301 / command/deepseek/deepseek-v4.1-flash）
+│     LLM 裁决 {risk, authorization, reason}——要求**单个**合法 JSON 对象，多裁决视为非法
 │     allow/deny 直接生效；ask 按 riskTolerance 映射
 │     主模型失败 → 依次尝试 ai.fallbacks（默认 deepseek-official / deepseek-flash）
 │     全部候选失败/超时/输出非法 → failOpen（默认 ask → 人类）
-└─ 4. 兜底：fallback（默认 ask → GUI 弹窗）
+└─ 6. 兜底：fallback（默认 ask → GUI 弹窗）
 ```
 
 > 默认审判模型原为 `opencode-go / deepseek-v4-flash`。OpenCode Go 订阅到期后该路由返回
@@ -89,7 +93,7 @@ approval/request 到达（toolName + callId + reason）
 /approval-mode default    清除会话覆盖，回落到配置默认
 ```
 
-**ai-auto 下 ask 的归宿**（`mode3OnAsk`，默认 `deny`）：规则 ask、AI 判 ask 且超容忍度、AI 故障 failOpen=ask、兜底 fallback=ask——全部按此处理，绝不弹窗。⚠️ 若设为 `allow`，AI 无法决定时也会放行高风险操作，**慎用**。
+**ai-auto 下 ask 的归宿**（`mode3OnAsk`，默认 `deny`）：规则 ask、AI 判 ask 且超容忍度、AI 故障 failOpen=ask、兜底 fallback=ask——全部按此处理，绝不弹窗。⚠️ 若设为 `allow`，AI 无法决定时也会放行高风险操作，**慎用**。唯一例外是 `evidence-incomplete`（参数缺失 / 命令超预算）：那是"没看到操作"，不是"AI 判定不确定"，ai-auto 一律拒绝，`mode3OnAsk: allow` 不会把它翻成放行。
 
 **模式持久化**：会话覆盖存 `~/.dsh/settings.yaml` 的 `dsh-codex-approval` 命名空间（settings 服务不可用时降级为纯内存，重启丢失）。默认模式由配置 `mode` 字段决定。
 
@@ -143,9 +147,18 @@ dsh plugin --profile web add dsh-codex-approval
     mode3OnAsk: deny           # deny | allow（ai-auto 下 ask 的归宿；默认 deny 安全）
     locale: auto               # auto | zh | en（命令文案语言；auto=跟随 dsh 设置的语言偏好）
     rules:
-      - match: 'Bash(git status*)'   # 命中即自动通过（Codex approve-always）
+      - tool: bash                  # 结构化 argv 前缀（推荐）：git status / git status --short 命中
+        pattern: [git, status]
         action: allow
-      - match: 'Bash(rm -rf /*)'     # 危险命令直接拒绝（Codex reject-always）
+      - tool: bash                  # 只读命令里带写副作用的选项要单独禁掉
+        pattern: [git, diff]
+        action: allow
+        forbidOptions: [--output, '-O']
+      - tool: bash                  # 需要所有路径参数都在工作区内（静态检查 + realpath 复核）
+        pattern: [cat]
+        action: allow
+        pathGuard: workspace-relative
+      - match: '*rm -rf /*'         # glob 规则仍可用（危险命令直接拒绝）
         action: deny
       - match: 'reason:*credential*' # 敏感场景强制询问
         action: ask
@@ -154,10 +167,11 @@ dsh plugin --profile web add dsh-codex-approval
       provider: cpa-wx301                      # 本机 CLIProxyAPI（Command Code 通道）
       model: command/deepseek/deepseek-v4.1-flash
       fallbacks:                               # 主模型失败时按序尝试（最多 4 项）
-        - provider: deepseek-official          # DSH 原生 llm-deepseek（api.deepseek.com）
+        - provider: deepseek-official          # DSH 原生 llm-deepseek (api.deepseek.com)
           model: deepseek-flash
-      riskTolerance: medium          # low | medium | high（仿 Codex risk tolerance）
-      maxPromptChars: 2000
+      riskTolerance: medium          # low | medium | high（仿 Codex risk tolerance；越高越宽松）
+      maxPromptChars: 2000           # 仅限审计日志/UI 预览长度，不参与决策
+      maxJudgeCommandChars: 8000     # 审判命令预算：超限按 evidence-incomplete 处理（200..200000）
       timeoutMs: 15000
       maxTokens: 512                 # 含 reasoning 余量
       failOpen: ask                  # AI 故障兜底：ask | deny | allow
@@ -167,11 +181,18 @@ dsh plugin --profile web add dsh-codex-approval
     transcript: off                  # off | short：AI 审判是否带紧凑会话上下文（默认 off）
     transcriptMaxChars: 4000         # 上下文骨架字符上限（100-16000）
     logFile: ~/.dsh/logs/approval.jsonl
+    logMaxBytes: 5000000             # 审计日志超过该字节数轮转为 approval.jsonl.1
 ```
 
-不配置即用内置默认：只读命令（git status/diff/log、ls、cat、pwd、which、echo）自动放行，破坏性命令（`rm -rf /`、`rm -rf ~`、`sudo rm`、`shutdown`、`reboot`、`mkfs`）直接拒绝，敏感词（secret/password/credential/token）询问。
+不配置即用内置默认：只读命令（git status/diff/log、ls、cat（限工作区内路径）、pwd、which、echo）自动放行，破坏性命令（`rm -rf /`、`rm -rf ~`、`sudo rm`、`mkfs`、`shutdown`、`reboot`、pwsh 的 `Format-Volume` 等）直接拒绝，敏感词（secret/password/credential/token）与凭据/审批配置路径（`*/.ssh/*`、`*/.aws/*`、`*/.codex/auth.json*`、`*/.dsh/profiles/*`、审计日志本体）询问。
+
+`rules: []`（显式空数组）= **真的没有规则**，不再是"回落默认规则"——想让每次审批都交给 AI 判定时用它。
 
 ## 规则语法
+
+两种形态可混用：
+
+**① glob（文本匹配）**
 
 - 匹配对象（任一表面命中即中，大小写不敏感）：
   - `ToolName(args preview)` — 如 `Bash(git status)`（bash/pwsh 为原始命令）
@@ -179,13 +200,28 @@ dsh plugin --profile web add dsh-codex-approval
 - 通配：`*` 任意序列、`?` 单字符
 - 优先级：**deny > ask > allow**（与列表顺序无关）；同优先级内按列表顺序取首个
 
+**② 结构化 argv 前缀（Codex `prefix_rule` 风格）**
+
+```yaml
+- tool: bash                    # 只匹配该工具（大小写不敏感）
+  pattern: [git, status]        # argv 精确前缀，逐项相等
+  action: allow
+  forbidOptions: [--output]     # 出现这些选项（含 --opt=value / -O<file>）则本规则不命中
+  pathGuard: workspace-relative # 所有非选项参数必须是工作区相对路径
+```
+
+**形状闸门（allow 专属，安全关键）**：bash/pwsh 的 allow 规则只在命令被 `shell-shape.js` 判定为 `simple`（单条纯命令，无重定向、替换、变量、通配、控制流、赋值、换行）时才可能命中。`git status; rm -rf /tmp/x`、`echo $(touch x)`、`cat /dev/null > /tmp/x`、`Get-ChildItem .; Remove-Item x -Recurse -Force` 都是 compound/opaque，**任何 allow 规则都不会命中它们**（与 Codex 一致：不能安全拆分时整条脚本视为一个不透明调用，前缀规则自然不命中）。ask/deny 规则不受闸门限制——它们是 fail-safe 那一侧。
+
+> 边界说明：本模块是**保守识别器**，不是 shell 解析器。它只回答"这条命令能否信任其 argv"，不做子命令拆分（那是后续工作）。真正不可绕过的边界仍是沙箱与宿主工具审批策略；规则里的 deny 是加速拒绝，不是沙箱强制。
+
+
 ## AI 审判输入/输出
 
-**输入**：固定系统提示（审批员角色 + risk/authorization 定义 + **意图优先规则** + 只输出 JSON 约束）+ `{"toolName", "command", "reason"}`（命令截断 2000 字符）。
+**输入**：固定系统提示（审批员角色 + risk/authorization 定义 + **意图优先规则** + 只输出 JSON 约束）+ `{"toolName", "command", "reason"}`。**命令本体不截断**（截断只用于审计/UI 预览）；超过 `ai.maxJudgeCommandChars`（默认 8000）时不问 AI，按 evidence-incomplete 处理。命令与 reason 在进入 prompt 前统一脱敏（`redact.js`）。
 
-开启 `transcript: "short"` 后追加 **Context 块**（紧凑会话骨架，≤`transcriptMaxChars` 字符）——两级窗口：短窗口（最近用户消息 + ≤3 条工具调用 → `[U]/[T]/[R]` 行）+ 长窗口（更早的真实用户消息意图线）+ 模式行 `[M]` + 最近拒绝 `[D]` + 工作区 `[W]`。超长消息头尾保留 + 省略计数（`…〔省略 N 字符〕…`）；plugin 注入消息与流式 chunk 一律不进骨架。**默认 off 时行为与 v0.3.0 完全一致。**
+开启 `transcript: "short"` 后追加 **Context 块**（紧凑会话骨架，≤`transcriptMaxChars` 字符）——两级窗口：短窗口（**最近** ≤3 条工具调用 + 各自按 callId 关联的结果状态行 → `[T]/[R]` 行）+ 长窗口（更早的真实用户消息意图线）+ 模式行 `[M]` + 最近拒绝 `[D]` + 工作区 `[W]`，**最近的用户消息作为意图锚点渲染在最后一行**（受预算保护）。`[R]` 只带成功/失败状态与失败文本（≤80 字符），**成功的 stdout 一律不喂给模型**（原始工具输出是间接注入面）；超长消息头尾保留 + 省略计数（`…〔省略 N 字符〕…`）；plugin 注入消息与流式 chunk 一律不进骨架。**默认 off。**
 
-**输出**：`{"risk":"low|medium|high","authorization":"allow|ask|deny","reason":"一句话"}`；解析策略：整体 JSON → ```json``` 代码块 → 平衡花括号扫描；枚举校验失败按 AI 故障处理。
+**输出**：`{"risk":"low|medium|high","authorization":"allow|ask|deny","reason":"一句话"}`。解析策略：整串 JSON，或"恰好一个**判决形状**的平衡对象"（允许前后散文/代码围栏）；出现两个及以上裁决、或判决被包在别的对象里、或枚举非法 → 视为 AI 故障走 failOpen。**不接受"取第一个对象"**：模型先说 allow 再说 deny 时不会被解读成 allow。
 
 ## 会话上下文（transcript，v0.4.0）
 
@@ -202,14 +238,19 @@ dsh plugin --profile web add dsh-codex-approval
 
 ## PowerShell（Windows）规则
 
-默认规则含 `Bash(...)`（Linux/树莓派 toolName=bash 生效）与 `Pwsh(...)`（Windows toolName=pwsh 生效）两族**并存**——工具名大小写不敏感匹配，互不干扰：Windows 上只读命令（git status/diff/log、Get-ChildItem/ls、Get-Content/cat、Get-Location/pwd、Get-Command、Write-Output、Select-Object）自动放行；树莓派继续走 Bash 规则。如需整体替换规则，`cordis.patch.yml` 配 `rules` 即可（覆盖默认）。
+默认规则含 `Bash(...)` 与 `Pwsh(...)` 两族**并存**——工具名大小写不敏感，结构化规则只匹配自己的 `tool` 字段，互不干扰：Windows 上只读命令（git status/diff/log、Get-ChildItem/ls、Get-Content/cat（限工作区内路径）、Get-Location/pwd、Get-Command、Write-Output、Select-Object）自动放行；树莓派继续走 Bash 规则。pwsh 的形状判定比 bash 更严格（`;`/`|`/`$()`/反引号/数组运算符一律 opaque），因此 PowerShell 链式命令不会被放行。如需整体替换规则，`cordis.patch.yml` 配 `rules` 即可（覆盖默认）。
 
 ## 安全注意事项
 
 - **deny 规则永远最先求值**，AI 无权覆盖显式拒绝
-- AI 输出只映射为三种结果之一，不存在注入面；命令文本进 prompt 前截断
+- **形状闸门**：命令文本不是"单条纯命令"就绝不被 allow 规则放行（复合命令/重定向/命令替换/变量/通配/控制流全部交 AI 或人类）
+- **原文进判**：规则与 AI 看到的是完整命令；截断只用于日志与 UI 预览
+- **证据门槛**：参数缺失/无法解析/命令超预算 → 不问 AI，直接交人类（ai-auto 下直接拒绝），审计标 `evidenceIncomplete`
+- **统一脱敏**：命令与 reason 在进入 AI prompt、审计日志、拒绝反馈前一律脱敏；插件新建的审计日志为 `0600` 并按 `logMaxBytes` 轮转（已存在的旧日志权限不会被自动改动）
+- 枚举校验只约束 AI 输出的**格式**，不能保证裁判不受提示注入影响——因此固定政策与不可信请求文本分开处理，且 `authorization` 仍要过规则层
 - AI 调用有超时上限（默认 15s，**每个候选各自计时**），失败默认交还人类（fail-open，不会静默全拒）
 - 审判候选链只在 provider 层失败时推进；候选全部失败才落到 `failOpen`
+- 审批期间取消会传播给模型链（`signal`），取消的请求审计为 `cancelled`，不会留下过时的 `allowed-once`
 - 审批审计对（approval/asked + approval/decided）由 dsh 审批服务持久化，插件只追加自己的决策日志
 - `danger-full-access` 模式下沙箱不拒绝任何操作，审批请求不会发生，插件自然空闲
 - 单次 AI 审批成本约 0.3~0.7 分钱（官方价估算），仅规则未命中时产生
@@ -219,7 +260,9 @@ dsh plugin --profile web add dsh-codex-approval
 | 场景 | 单次 Token | 单次成本（官方高峰价） |
 |---|---|---|
 | 典型（短命令） | ~400-500 | ≈ 0.003 元 |
-| 最坏（命令 2000 字符） | ~1,500 | ≈ 0.007 元 |
+| 最坏（命令 8000 字符以内） | ~3,500 | ≈ 0.016 元 |
+
+超过 `ai.maxJudgeCommandChars` 的命令不再送模型（按 evidence-incomplete 处理），所以单次成本有硬上限。
 
 ## 版本适配记录（DSH 0.1.5-rc.1）
 

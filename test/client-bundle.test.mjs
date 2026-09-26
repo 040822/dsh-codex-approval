@@ -175,6 +175,16 @@ async function expandWithCatalog(react, component, props) {
 
 const VALUE = { provider: "cpa-wx301", model: "command/deepseek/deepseek-v4.1-flash", fallbacks: [{ provider: "deepseek-official", model: "deepseek-flash" }] };
 
+/** The risk-tolerance `<select>`, found by its option values rather than its position. */
+function toleranceSelect(tree) {
+	return collectElements(tree)
+		.filter((element) => element.type === "select")
+		.find((select) => collectElements(select)
+			.filter((element) => element.type === "option")
+			.map((option) => option.props.value)
+			.join(",") === "low,medium,high");
+}
+
 test("bundle: loads, exports inject and registers the settings card", () => {
 	const react = makeReact();
 	const mod = loadBundle(react);
@@ -242,7 +252,8 @@ test("card: an edit marks the card unsaved and enables save", () => {
 	const props = { settingsScope: scope, loadModelCatalog: slotProps.loadModelCatalog };
 	let tree = expand(react, component, props);
 
-	const tolerance = collectElements(tree).filter((element) => element.type === "select")[3];
+	const tolerance = toleranceSelect(tree);
+	assert.ok(tolerance !== undefined, "the card renders the risk-tolerance select");
 	tolerance.props.onChange({ target: { value: "high" } });
 	react.__rewind();
 	tree = component(props);
@@ -283,4 +294,31 @@ test("card: a downgraded catalog sinks unavailable providers and flags a dead pr
 	const options = elements.filter((element) => element.type === "option").map((element) => collectText(element.props.children).join(""));
 	assert.ok(options.includes("⚠ CPA WX301 / V4.1 Flash"), `unavailable marking missing: ${JSON.stringify(options)}`);
 	assert.match(collectText(tree).join(" | "), /该 provider 当前不可路由/);
+});
+
+test("card: risk-tolerance copy agrees with the judge's actual permissiveness", async () => {
+	const { decideAuthorization } = await import("../judge.js");
+	const react = makeReact();
+	const mod = loadBundle(react);
+	const { component, scope, slotProps } = mountCard(mod, { value: VALUE });
+	const tree = expand(react, component, { settingsScope: scope, loadModelCatalog: slotProps.loadModelCatalog });
+
+	// The risk-tolerance select is found by its option values, not its position.
+	const tolerance = toleranceSelect(tree);
+	const options = collectElements(tolerance).filter((element) => element.type === "option");
+	assert.deepEqual(options.map((option) => option.props.value), ["low", "medium", "high"]);
+	const labels = options.map((option) => collectText(option.props.children).join(""));
+
+	// Ground truth from the decision mapping: higher tolerance = more permissive.
+	assert.equal(decideAuthorization({ risk: "high", authorization: "ask" }, "low"), "ask");
+	assert.equal(decideAuthorization({ risk: "medium", authorization: "ask" }, "low"), "ask");
+	assert.equal(decideAuthorization({ risk: "medium", authorization: "ask" }, "medium"), "allow");
+	assert.equal(decideAuthorization({ risk: "high", authorization: "ask" }, "high"), "allow");
+
+	// The copy must not claim the opposite of that, which is exactly what the
+	// shipped labels did ("low · 尽量放行" / "high · 尽量询问").
+	assert.match(labels[0], /严格/);
+	assert.match(labels[2], /宽松/);
+	assert.doesNotMatch(labels[0], /尽量放行|宽松/);
+	assert.doesNotMatch(labels[2], /尽量询问|严格/);
 });

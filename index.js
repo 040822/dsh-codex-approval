@@ -16,23 +16,32 @@
  *
  * Safety properties:
  * - deny rules are always evaluated first and can never be overridden.
+ * - A shell command is only auto-approved when its text is a single plain
+ *   command (shell-shape.js); compound/opaque text never reaches an allow rule.
+ * - The operation is never truncated before rules or the judge see it, and
+ *   missing/oversized evidence is never auto-approved.
  * - AI errors/timeouts fail open to the configured failOpen (default ask).
- * - The AI output is only ever mapped onto the three outcomes — no injection.
+ * - The AI's closed-enum verdict is mapped onto the three outcomes, which
+ *   bounds the *output* format; it does not make the judge immune to prompt
+ *   injection, so the fixed policy and the untrusted request text are kept
+ *   apart and the judge's `authorization` is checked against the hard rules.
  */
 
-import { appendFile, mkdir } from "node:fs/promises";
-import { mkdirSync } from "node:fs";
+import { appendFile, realpath } from "node:fs/promises";
+import { mkdirSync, renameSync, statSync, unlinkSync } from "node:fs";
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
-import { join, dirname } from "node:path";
+import { join, dirname, isAbsolute, relative, resolve } from "node:path";
 import z from "@deepseek-ai/schemastery";
 
-import { evaluateRules } from "./rules.js";
+import { classifyRequest, evaluateRules, ruleLabel } from "./rules.js";
 import { findToolCallArgs, argsPreview } from "./enrich.js";
 import { judgeWith, decideAuthorization } from "./judge.js";
 import { buildTranscript } from "./transcript.js";
 import { MODES, parseMode, resolveMode, effectiveOnAsk } from "./modes.js";
 import { T, pickLocale, commandDescription, renderDenialNotice } from "./i18n.js";
+import { redactSensitive, boundedText } from "./redact.js";
+import { isShellTool, positionalArgs } from "./shell-shape.js";
 
 export const name = "dsh-codex-approval";
 
@@ -52,49 +61,74 @@ export const DEFAULT_CONFIG = {
 	mode3OnAsk: "deny",
 	locale: "auto",
 	rules: [
-		// read-only / harmless commands: auto-approve
-		{ match: "Bash(git status*)", action: "allow" },
-		{ match: "Bash(git diff*)", action: "allow" },
-		{ match: "Bash(git log*)", action: "allow" },
-		{ match: "Bash(ls *)", action: "allow" },
-		{ match: "Bash(cat *)", action: "allow" },
-		{ match: "Bash(pwd)", action: "allow" },
-		{ match: "Bash(which *)", action: "allow" },
-		{ match: "Bash(echo *)", action: "allow" },
-		// destructive: always deny, never ask, never judged by AI
-		{ match: "Bash(rm -rf /*)", action: "deny" },
-		{ match: "Bash(rm -rf ~*)", action: "deny" },
-		{ match: "Bash(sudo rm*)", action: "deny" },
+		// ---- bash: read-only commands as structured argv prefixes -------------
+		// An allow rule may only claim a command that shell-shape.js recognised
+		// as `simple` — one command of plain words. `git status; rm -rf /tmp/x`,
+		// `echo $(touch /tmp/x)`, `cat /dev/null > /tmp/x` and pwsh chains are
+		// compound/opaque, so NO allow rule matches them; they reach the ask/deny
+		// rules below and then the judge / human. `git diff --output=<file>`
+		// writes a file, and `cat` only auto-approves workspace-relative paths.
+		{ tool: "bash", pattern: ["git", "status"], action: "allow" },
+		{ tool: "bash", pattern: ["git", "diff"], action: "allow", forbidOptions: ["--output", "-O"] },
+		{ tool: "bash", pattern: ["git", "log"], action: "allow", forbidOptions: ["--output", "-O"] },
+		{ tool: "bash", pattern: ["ls"], action: "allow" },
+		{ tool: "bash", pattern: ["pwd"], action: "allow" },
+		{ tool: "bash", pattern: ["which"], action: "allow" },
+		{ tool: "bash", pattern: ["echo"], action: "allow" },
+		{ tool: "bash", pattern: ["cat"], action: "allow", pathGuard: "workspace-relative" },
+		// ---- pwsh (Windows): the same families, pwsh tool calls only ---------
+		// dsh's shell tool is `pwsh` on Windows; tool names are matched
+		// case-insensitively and a structured rule only ever matches its own
+		// tool, so the Bash and Pwsh families coexist.
+		{ tool: "pwsh", pattern: ["git", "status"], action: "allow" },
+		{ tool: "pwsh", pattern: ["git", "diff"], action: "allow", forbidOptions: ["--output", "-O"] },
+		{ tool: "pwsh", pattern: ["git", "log"], action: "allow", forbidOptions: ["--output", "-O"] },
+		{ tool: "pwsh", pattern: ["Get-ChildItem"], action: "allow" },
+		{ tool: "pwsh", pattern: ["ls"], action: "allow" },
+		{ tool: "pwsh", pattern: ["Get-Location"], action: "allow" },
+		{ tool: "pwsh", pattern: ["pwd"], action: "allow" },
+		{ tool: "pwsh", pattern: ["Get-Command"], action: "allow" },
+		{ tool: "pwsh", pattern: ["Write-Output"], action: "allow" },
+		{ tool: "pwsh", pattern: ["Select-Object"], action: "allow" },
+		{ tool: "pwsh", pattern: ["Get-Content"], action: "allow", pathGuard: "workspace-relative" },
+		{ tool: "pwsh", pattern: ["cat"], action: "allow", pathGuard: "workspace-relative" },
+		// ---- destructive: always deny ---------------------------------------
+		// A deny claims the request outright — the human is never asked — so
+		// these stay as narrow as the threat allows. The `*` prefix is what
+		// catches a destructive command smuggled behind a separator; compound
+		// and opaque text never reaches an allow rule anyway.
+		{ match: "*rm -rf /*", action: "deny" },
+		{ match: "*rm -rf ~*", action: "deny" },
+		{ match: "*rm -fr /*", action: "deny" },
+		{ match: "*sudo rm*", action: "deny" },
+		{ match: "*mkfs*", action: "deny" },
 		{ match: "Bash(shutdown*)", action: "deny" },
-		{ match: "Bash(reboot)", action: "deny" },
-		{ match: "Bash(mkfs*)", action: "deny" },
-		// sensitive: always ask a human
-		{ match: "reason:*secret*", action: "ask" },
-		{ match: "reason:*password*", action: "ask" },
-		{ match: "reason:*credential*", action: "ask" },
-		{ match: "reason:*token*", action: "ask" },
+		{ match: "Bash(reboot*)", action: "deny" },
+		{ match: "Pwsh(Format-Volume*)", action: "deny" },
+		{ match: "Pwsh(Stop-Computer*)", action: "deny" },
+		{ match: "Pwsh(Restart-Computer*)", action: "deny" },
+		// ---- always ask a human ---------------------------------------------
 		// publishing: never auto-decided — a human must confirm every publish
 		// (both bare `npm publish` and prefixed forms like `cd x && npm publish`)
 		{ match: "Bash(npm publish*)", action: "ask" },
 		{ match: "Bash(*npm publish*)", action: "ask" },
-		// PowerShell (Windows) counterparts for the read-only allow family:
-		// dsh's shell tool is `pwsh` on Windows, so the Bash(...) rules above
-		// never match there and every request went to the AI judge. These
-		// Pwsh(...) rules match only pwsh tool calls (tool names are
-		// case-insensitive); the Bash rules stay effective on Linux/Raspberry
-		// Pi, where the tool is `bash`. Both families coexist in this array.
-		{ match: "Pwsh(git status*)", action: "allow" },
-		{ match: "Pwsh(git diff*)", action: "allow" },
-		{ match: "Pwsh(git log*)", action: "allow" },
-		{ match: "Pwsh(Get-ChildItem *)", action: "allow" },
-		{ match: "Pwsh(ls *)", action: "allow" },
-		{ match: "Pwsh(Get-Content *)", action: "allow" },
-		{ match: "Pwsh(cat *)", action: "allow" },
-		{ match: "Pwsh(Get-Location)", action: "allow" },
-		{ match: "Pwsh(pwd)", action: "allow" },
-		{ match: "Pwsh(Get-Command *)", action: "allow" },
-		{ match: "Pwsh(Write-Output *)", action: "allow" },
-		{ match: "Pwsh(Select-Object *)", action: "allow" }
+		// credentials and approval configuration: reading, copying or writing
+		// these always needs a human, however harmless the command looks
+		{ match: "*id_rsa*", action: "ask" },
+		{ match: "*id_ed25519*", action: "ask" },
+		{ match: "*/.ssh/*", action: "ask" },
+		{ match: "*/.aws/*", action: "ask" },
+		{ match: "*/.codex/auth.json*", action: "ask" },
+		{ match: "*/.dsh/profiles/*", action: "ask" },
+		{ match: "*/.dsh/settings.yaml*", action: "ask" },
+		{ match: "*/.dsh/logs/approval.jsonl*", action: "ask" },
+		{ match: "*/.dsh-codex-approval/*", action: "ask" },
+		// the agent's own justification (`reason:`) can only raise strictness,
+		// never grant: these patterns only ever add an ask
+		{ match: "reason:*secret*", action: "ask" },
+		{ match: "reason:*password*", action: "ask" },
+		{ match: "reason:*credential*", action: "ask" },
+		{ match: "reason:*token*", action: "ask" }
 	],
 	ai: {
 		enabled: true,
@@ -113,7 +147,14 @@ export const DEFAULT_CONFIG = {
 			{ provider: "deepseek-official", model: "deepseek-flash" }
 		],
 		riskTolerance: "medium",
+		// Display-only cap: the audit record / UI preview is truncated to this,
+		// and it never feeds a decision.
 		maxPromptChars: 2000,
+		// The judge's command budget. The operation is never truncated before
+		// rule matching; a command longer than this is treated as *incomplete
+		// evidence* (human in `ai`, denied in `ai-auto`) instead of being judged
+		// on a prefix.
+		maxJudgeCommandChars: 8000,
 		timeoutMs: 15000,
 		maxTokens: 512,
 		failOpen: "ask"
@@ -133,7 +174,11 @@ export const DEFAULT_CONFIG = {
 	// surrounding tool chain. Absolute size is capped by transcriptMaxChars.
 	transcript: "off",
 	transcriptMaxChars: 4000,
-	logFile: join(homedir(), ".dsh", "logs", "approval.jsonl")
+	logFile: join(homedir(), ".dsh", "logs", "approval.jsonl"),
+	// Rotate the audit log to `<logFile>.1` once it grows past this many bytes.
+	// A log the plugin creates itself is created with mode 0600; an existing
+	// file's permissions are left untouched (chmod is an operator decision).
+	logMaxBytes: 5_000_000
 };
 
 const ACTIONS = ["allow", "ask", "deny"];
@@ -163,13 +208,31 @@ function assertConfig(cfg) {
 	if (!["auto", "zh", "en"].includes(cfg.locale)) throw new TypeError("dsh-codex-approval: config.locale must be auto/zh/en");
 	if (!Array.isArray(cfg.rules)) throw new TypeError("dsh-codex-approval: config.rules must be an array");
 	for (const rule of cfg.rules) {
-		if (typeof rule.match !== "string" || rule.match === "") throw new TypeError("dsh-codex-approval: each rule needs a non-empty match");
+		if (rule === null || typeof rule !== "object") throw new TypeError("dsh-codex-approval: each rule must be an object");
 		if (!ACTIONS.includes(rule.action)) throw new TypeError(`dsh-codex-approval: rule action must be one of ${ACTIONS.join("/")}`);
+		if (Array.isArray(rule.pattern) || typeof rule.tool === "string") {
+			// structured argv-prefix rule (Codex `prefix_rule` style)
+			if (typeof rule.tool !== "string" || rule.tool === "") throw new TypeError("dsh-codex-approval: a structured rule needs a non-empty tool");
+			if (!Array.isArray(rule.pattern) || rule.pattern.length === 0 || !rule.pattern.every((part) => typeof part === "string" && part !== "")) {
+				throw new TypeError("dsh-codex-approval: a structured rule needs a non-empty string pattern");
+			}
+			if (rule.forbidOptions !== void 0 && (!Array.isArray(rule.forbidOptions) || !rule.forbidOptions.every((option) => typeof option === "string" && option !== ""))) {
+				throw new TypeError("dsh-codex-approval: rule.forbidOptions must be a list of non-empty strings");
+			}
+			if (rule.pathGuard !== void 0 && rule.pathGuard !== "workspace-relative") {
+				throw new TypeError("dsh-codex-approval: rule.pathGuard must be \"workspace-relative\"");
+			}
+			continue;
+		}
+		if (typeof rule.match !== "string" || rule.match === "") throw new TypeError("dsh-codex-approval: each rule needs a non-empty match");
 	}
 	if (typeof cfg.ai !== "object" || cfg.ai === null) throw new TypeError("dsh-codex-approval: config.ai must be an object");
 	if (typeof cfg.ai.enabled !== "boolean") throw new TypeError("dsh-codex-approval: config.ai.enabled must be a boolean");
 	if (!TOLERANCES.includes(cfg.ai.riskTolerance)) throw new TypeError(`dsh-codex-approval: config.ai.riskTolerance must be one of ${TOLERANCES.join("/")}`);
 	if (!ACTIONS.includes(cfg.ai.failOpen)) throw new TypeError("dsh-codex-approval: config.ai.failOpen must be allow/ask/deny");
+	if (!Number.isSafeInteger(cfg.ai.maxJudgeCommandChars) || cfg.ai.maxJudgeCommandChars < 200 || cfg.ai.maxJudgeCommandChars > 200_000) {
+		throw new TypeError("dsh-codex-approval: config.ai.maxJudgeCommandChars must be an integer in 200..200000");
+	}
 	if (!Array.isArray(cfg.ai.fallbacks)) throw new TypeError("dsh-codex-approval: config.ai.fallbacks must be an array");
 	if (cfg.ai.fallbacks.length > MAX_FALLBACKS) throw new TypeError(`dsh-codex-approval: config.ai.fallbacks must hold at most ${MAX_FALLBACKS} entries`);
 	for (const entry of cfg.ai.fallbacks) {
@@ -187,6 +250,7 @@ function assertConfig(cfg) {
 		throw new TypeError("dsh-codex-approval: config.transcriptMaxChars must be an integer in 100..16000");
 	}
 	if (typeof cfg.logFile !== "string" || cfg.logFile === "") throw new TypeError("dsh-codex-approval: config.logFile must be a non-empty path");
+	if (!Number.isSafeInteger(cfg.logMaxBytes) || cfg.logMaxBytes < 0) throw new TypeError("dsh-codex-approval: config.logMaxBytes must be a non-negative integer");
 }
 
 /** Deep-merge user config over defaults (ai sub-object merged). */
@@ -195,7 +259,11 @@ export function normalizeConfig(userConfig) {
 		...DEFAULT_CONFIG,
 		...(userConfig ?? {}),
 		ai: { ...DEFAULT_CONFIG.ai, ...(userConfig?.ai ?? {}) },
-		rules: Array.isArray(userConfig?.rules) && userConfig.rules.length > 0 ? userConfig.rules : DEFAULT_CONFIG.rules
+		// An explicitly empty list means "no rules" — it must not silently be
+		// replaced by the defaults, or a user who wants everything judged by the
+		// AI keeps the default auto-approvals (and the escapes that came with
+		// them). Only an absent `rules` key falls back to the defaults.
+		rules: Array.isArray(userConfig?.rules) ? userConfig.rules : DEFAULT_CONFIG.rules
 	};
 	assertConfig(cfg);
 	return cfg;
@@ -229,26 +297,14 @@ function outcomeFor(action) {
 const FAILURE_CODE_MAX_CHARS = 100;
 const FAILURE_MESSAGE_MAX_CHARS = 500;
 const FAILURE_REQUEST_ID_MAX_CHARS = 160;
+/** Display cap for the `argsPreview` field of the audit record. */
+const ARGS_PREVIEW_MAX_CHARS = 300;
+/** Display cap for the command text embedded in the denial feedback. */
+const DENIAL_COMMAND_MAX_CHARS = 200;
 
-/** Redact common credential-shaped values before they reach logs or prompts. */
-function redactSensitive(text) {
-	return text
-		.replace(/\bBearer\s+[^\s,;]+/gi, "Bearer [REDACTED]")
-		.replace(/\b(?:sk|pk)-[A-Za-z0-9_-]{8,}\b/g, "[REDACTED]")
-		.replace(/([?&](?:api[_-]?key|access[_-]?token|auth(?:orization)?|password|passwd|secret|token)=)[^&#\s]*/gi, "$1[REDACTED]")
-		.replace(/\b(?:api[_-]?key|access[_-]?token|auth(?:orization)?|password|passwd|secret|token)\s*[:=]\s*[^\s,;]+/gi, (match) => {
-			const separator = match.match(/\s*[:=]\s*/)?.[0] ?? "=";
-			const label = match.slice(0, match.indexOf(separator));
-			return `${label}${separator}[REDACTED]`;
-		});
-}
-
-function boundedText(value, maxChars) {
-	if (typeof value !== "string") return undefined;
-	const text = redactSensitive(value).trim();
-	if (text === "") return undefined;
-	return text.length > maxChars ? `${text.slice(0, maxChars - 1)}…` : text;
-}
+// `redactSensitive` / `boundedText` live in redact.js now: the same boundary has
+// to cover the judge prompt, the audit record, the denial feedback and provider
+// failure diagnostics, not just the last one.
 
 function boundedCode(value) {
 	return boundedText(value, FAILURE_CODE_MAX_CHARS);
@@ -364,19 +420,80 @@ export function makeLlmRunner(llm, configOrGetter) {
 }
 
 /**
+ * Why the request's evidence is not good enough to auto-decide, or null.
+ *
+ * Two cases are deliberately never resolved by the judge:
+ *   - `arguments-unavailable`: the tool arguments could not be recovered (no
+ *     event for the callId, unparseable JSON, or a shell call without a command
+ *     string). Asking a model about `command: null` produced `allowed-once` in
+ *     the audit — the program, not the model, has to refuse.
+ *   - `command-too-long`: the operation exceeds the judge's command budget. A
+ *     truncated operation must never be *approved on its prefix*; either the
+ *     whole operation is judged or the request goes to the human.
+ * @param args - the recovered tool arguments (or null)
+ * @param toolName - the request's tool name
+ * @param argsText - the full redacted arguments text
+ * @param cfg - effective config (uses ai.maxJudgeCommandChars)
+ */
+export function evidenceProblem({ args, toolName, argsText, cfg }) {
+	if (args === null || args === undefined) return "arguments-unavailable";
+	if (isShellTool(toolName) && (typeof args.command !== "string" || args.command.trim() === "")) return "arguments-unavailable";
+	if (typeof argsText === "string" && argsText.length > cfg.ai.maxJudgeCommandChars) return "command-too-long";
+	return null;
+}
+
+/**
+ * The realpath containment check behind a `pathGuard: "workspace-relative"`
+ * allow rule. The static check in rules.js only rejects what is obviously
+ * outside (absolute paths, `~`, `..`, drive letters); this catches a path that
+ * *looks* relative but resolves outside the root through a symlink.
+ *
+ * Every failure mode is a refusal: no root to compare against, a path that does
+ * not resolve, or a target outside the root all mean "no auto-approval".
+ *
+ * @param args - the rule's path arguments (already filtered to positionals)
+ * @param opts - { cwd, root, resolvePath } — `resolvePath` is injectable so the
+ *   check is unit-testable without touching the filesystem.
+ * @returns true when every argument resolves inside the workspace root.
+ */
+export async function pathGuardAllows(args, { cwd, root, resolvePath = realpath } = {}) {
+	if (args.length === 0) return true;
+	if (typeof root !== "string" || root === "") return false;
+	let rootReal;
+	try {
+		rootReal = await resolvePath(root);
+	} catch {
+		return false;
+	}
+	for (const arg of args) {
+		let argReal;
+		try {
+			argReal = await resolvePath(resolve(typeof cwd === "string" && cwd !== "" ? cwd : root, arg));
+		} catch {
+			return false;
+		}
+		const rel = relative(rootReal, argReal);
+		if (rel !== "" && (rel.startsWith("..") || isAbsolute(rel))) return false;
+	}
+	return true;
+}
+
+/**
  * Create the approval/request handler with injected dependencies
  * (unit-testable without a cordis ctx).
- * @param deps - { config, record, llmRunner, getSessionMode, denialFeed, denialHistory, getCwd }
+ * @param deps - { config, record, llmRunner, getSessionMode, denialFeed, denialHistory, getCwd, resolvePath }
  *   `denialFeed` is an optional Map<sessionId, Array<DenialRecord>> used to
  *   stage plugin-originated denials for the `agent/pre-step` injector; when
  *   omitted the handler creates its own (shared only if the caller passes it).
  *   `denialHistory` is an optional Map<sessionId, Array<DenialRecord>>
  *   accumulating the last few denials of each session for the transcript
  *   context ([D] lines) — created internally when omitted.
- *   `getCwd` optionally returns the workspace path for the transcript [W] line.
+ *   `getCwd` optionally returns the workspace path for the transcript [W] line
+ *   and for the path-guard check; `resolvePath` overrides the realpath used by
+ *   that check (tests inject a pure resolver).
  * @returns async (req, next) => ApprovalOutcome
  */
-export function createHandler({ config, record, llmRunner, getSessionMode, denialFeed, denialHistory, getCwd }) {
+export function createHandler({ config, record, llmRunner, getSessionMode, denialFeed, denialHistory, getCwd, resolvePath }) {
 	let cfg = config;
 	const feed = denialFeed ?? new Map();
 	const history = denialHistory ?? new Map();
@@ -394,6 +511,24 @@ export function createHandler({ config, record, llmRunner, getSessionMode, denia
 	const updateConfig = (nextConfig) => {
 		cfg = nextConfig;
 	};
+	/**
+	 * The rule that decides this request, with the path-guard hardening applied.
+	 * A rule whose path guard refuses (a "workspace-relative" path that resolves
+	 * outside the root through a symlink) is dropped and evaluation continues,
+	 * so a later ask/deny rule for the same command still wins instead of the
+	 * request silently becoming "no rule matched".
+	 */
+	const resolveRule = async (request, shapeInfo, pathOpts) => {
+		let remaining = cfg.rules;
+		for (;;) {
+			const match = evaluateRules(remaining, request, shapeInfo);
+			if (match === null) return null;
+			if (match.action !== "allow" || match.pathGuard !== "workspace-relative") return match;
+			const args = positionalArgs(shapeInfo.argv, match.pattern.length);
+			if (await pathGuardAllows(args, pathOpts)) return match;
+			remaining = remaining.filter((candidate) => candidate !== match);
+		}
+	};
 	const handler = async (req, next) => {
 		const started = Date.now();
 		if (req.signal?.aborted === true) return "cancelled";
@@ -406,15 +541,44 @@ export function createHandler({ config, record, llmRunner, getSessionMode, denia
 		// mode 1: fully bypassed — the pre-plugin experience (no decision, no audit)
 		if (mode === "manual") return next();
 
+		const cwd = getCwd !== undefined ? getCwd(req.agent) : undefined;
+
+		// 1) Recover the FULL tool arguments by callId. Nothing is truncated on
+		//    the way to a decision: truncating first is what let
+		//    `echo <2200 chars>; npm publish` match the `echo` allow rule while
+		//    the publish tail was invisible. `argsPreview` without a cap keeps
+		//    the whole text; the capped form is only used for the audit preview.
 		const args = findToolCallArgs(req.agent?.session, req.callId);
-		const argsText = argsPreview(args, req.toolName, cfg.ai.maxPromptChars);
-		const matchReq = { toolName: req.toolName, argsText, reason: req.reason ?? "" };
+		const fullText = argsPreview(args, req.toolName);
+
+		// 2) Classify the command's shape from the ORIGINAL text — redaction must
+		//    never turn an opaque command into an approvable one — then redact
+		//    once, so rules, the judge, the log and the denial feedback all see
+		//    the same credential-free text.
+		const shapeInfo = classifyRequest(req.toolName, fullText);
+		const argsText = redactSensitive(fullText);
+		const reasonText = redactSensitive(req.reason ?? "");
+		const matchReq = { toolName: req.toolName, argsText, reason: reasonText };
+		const preview = boundedText(argsText, ARGS_PREVIEW_MAX_CHARS) ?? "";
+		const evidenceIssue = evidenceProblem({ args, toolName: req.toolName, argsText, cfg });
 
 		let verdict;
 		let context = "";
-		const rule = evaluateRules(cfg.rules, matchReq);
-		if (rule !== null) {
-			verdict = { kind: "rule", action: rule.action, outcome: outcomeFor(rule.action), match: rule.match };
+		let rule = null;
+		if (evidenceIssue === null) {
+			rule = await resolveRule(matchReq, shapeInfo, { cwd, root: cwd, resolvePath });
+		}
+		if (evidenceIssue !== null) {
+			// Incomplete evidence is never auto-approved, and the judge is not
+			// even asked (it would only be judging `command: null` / a prefix).
+			verdict = {
+				kind: "evidence-incomplete",
+				action: "ask",
+				outcome: "pass",
+				evidenceIncomplete: evidenceIssue
+			};
+		} else if (rule !== null) {
+			verdict = { kind: "rule", action: rule.action, outcome: outcomeFor(rule.action), match: ruleLabel(rule) };
 		} else if (cfg.ai.enabled) {
 			context = cfg.transcript === "short"
 				? buildTranscript({
@@ -425,12 +589,15 @@ export function createHandler({ config, record, llmRunner, getSessionMode, denia
 					mode,
 					tolerance: cfg.ai.riskTolerance,
 					mode3OnAsk: cfg.mode3OnAsk,
-					cwd: getCwd !== undefined ? getCwd(req.agent) : undefined
+					cwd
 				})
 				: "";
 			const judged = await judgeWith({
 				runner: llmRunner,
-				input: { toolName: req.toolName, argsText, reason: req.reason ?? "", context },
+				input: { toolName: req.toolName, argsText, reason: reasonText, context },
+				// Cancel propagation: without this the judge chain keeps spending
+				// model calls (and fallbacks) after the approval was cancelled.
+				signal: req.signal,
 				allowAsk: mode !== "ai-auto",
 				sessionId
 			});
@@ -463,11 +630,35 @@ export function createHandler({ config, record, llmRunner, getSessionMode, denia
 			verdict = { kind: "fallback", action: cfg.fallback, outcome: outcomeFor(cfg.fallback) };
 		}
 
+		// A request cancelled while the judge was running has no valid verdict:
+		// answer `cancelled` (the host already races the request signal, so this
+		// is about not auditing a stale `allowed-once` and not staging a denial).
+		if (req.signal?.aborted === true) {
+			await record({
+				ts: new Date().toISOString(),
+				sessionId: sessionId ?? "?",
+				mode,
+				toolName: req.toolName,
+				callId: req.callId,
+				argsPreview: preview,
+				reason: boundedText(reasonText, 500) ?? "",
+				commandChars: argsText.length,
+				shape: shapeInfo.shape,
+				transcriptChars: context.length,
+				kind: "cancelled",
+				outcome: "cancelled",
+				ms: Date.now() - started
+			});
+			return "cancelled";
+		}
+
 		// mode 3 (ai-auto): an "ask" is never routed to a human — resolve it
 		// through mode3OnAsk (default deny), regardless of its source
 		// (rule ask, AI ask over tolerance, failOpen=ask, fallback=ask).
+		// Evidence-incomplete is exempt: a mode switch must not turn "the
+		// operation could not be seen" into permission.
 		if (mode === "ai-auto" && verdict.action === "ask") {
-			const resolved = effectiveOnAsk(mode, cfg.mode3OnAsk);
+			const resolved = verdict.kind === "evidence-incomplete" ? "deny" : effectiveOnAsk(mode, cfg.mode3OnAsk);
 			verdict = { ...verdict, action: resolved, outcome: outcomeFor(resolved), viaAskResolution: true };
 		}
 
@@ -477,8 +668,10 @@ export function createHandler({ config, record, llmRunner, getSessionMode, denia
 			mode,
 			toolName: req.toolName,
 			callId: req.callId,
-			argsPreview: argsText.slice(0, 300),
-			reason: (req.reason ?? "").slice(0, 500),
+			argsPreview: preview,
+			reason: boundedText(reasonText, 500) ?? "",
+			commandChars: argsText.length,
+			shape: shapeInfo.shape,
 			transcriptChars: context.length,
 			...verdict,
 			ms: Date.now() - started
@@ -490,11 +683,11 @@ export function createHandler({ config, record, llmRunner, getSessionMode, denia
 		// so a human denial through the GUI answerer never gets re-attributed.
 		if (verdict.outcome === "rejected" && cfg.denyFeedback) {
 			stageDenial(sessionId, {
-				command: argsText.slice(0, 200),
+				command: preview.slice(0, DENIAL_COMMAND_MAX_CHARS),
 				source: verdict.kind,
 				...verdict.match !== void 0 ? { match: verdict.match } : {},
 				...verdict.risk !== void 0 ? { risk: verdict.risk } : {},
-				...typeof verdict.aiReason === "string" && verdict.aiReason !== "" ? { aiReason: verdict.aiReason } : {},
+				...boundedText(verdict.aiReason, 200) !== void 0 ? { aiReason: boundedText(verdict.aiReason, 200) } : {},
 				...verdict.finishKind !== void 0 ? { finishKind: verdict.finishKind } : {},
 				...verdict.failure !== void 0 ? { failure: verdict.failure } : {},
 				...verdict.viaAskResolution === true ? { viaAsk: true } : {},
@@ -508,16 +701,55 @@ export function createHandler({ config, record, llmRunner, getSessionMode, denia
 	return handler;
 }
 
-/** Fire-and-forget JSONL appender (never throws into the approval path). */
-export function makeRecorder(logFile) {
-	let dirChecked = false;
+/** Size of an existing log file, or 0 when it is absent/unreadable. */
+function existingLogBytes(logFile) {
+	try {
+		return statSync(logFile).size;
+	} catch {
+		return 0;
+	}
+}
+
+/** Move the audit log aside to `<logFile>.1` (the previous `.1` is replaced). */
+function rotateLog(logFile) {
+	const target = `${logFile}.1`;
+	try {
+		unlinkSync(target);
+	} catch {
+		/* no previous rotation */
+	}
+	renameSync(logFile, target);
+}
+
+/**
+ * Fire-and-forget JSONL appender (never throws into the approval path).
+ *
+ * A log this recorder creates is created with mode 0600 — audit records carry
+ * command text (redacted, but still operator data) and must not be
+ * world-readable. An already-existing file keeps its permissions: tightening
+ * those is an operator decision, not something the plugin does behind a user's
+ * back. Once the file passes `maxBytes` it is rotated to `<logFile>.1`.
+ *
+ * @param logFile - the JSONL path
+ * @param opts - { maxBytes } rotation threshold (0/undefined disables rotation)
+ */
+export function makeRecorder(logFile, { maxBytes = 0 } = {}) {
+	let ready = false;
+	let bytes = 0;
 	return async (entry) => {
 		try {
-			if (!dirChecked) {
+			const line = `${JSON.stringify(entry)}\n`;
+			if (!ready) {
 				mkdirSync(dirname(logFile), { recursive: true });
-				dirChecked = true;
+				bytes = existingLogBytes(logFile);
+				ready = true;
 			}
-			await appendFile(logFile, `${JSON.stringify(entry)}\n`, "utf8");
+			if (Number.isFinite(maxBytes) && maxBytes > 0 && bytes > 0 && bytes + line.length > maxBytes) {
+				rotateLog(logFile);
+				bytes = 0;
+			}
+			await appendFile(logFile, line, { encoding: "utf8", mode: 0o600 });
+			bytes += line.length;
 		} catch {
 			/* logging must never break an approval decision */
 		}
@@ -731,7 +963,7 @@ export async function apply(ctx, userConfig) {
 	const getConfig = () => cfg;
 	const getLocale = makeGetLocale(cfg, ctx, getConfig);
 	const llmRunner = makeLlmRunner(ctx.llm, () => cfg.ai);
-	const record = makeRecorder(cfg.logFile);
+	const record = makeRecorder(cfg.logFile, { maxBytes: cfg.logMaxBytes });
 	const handler = createHandler({
 		config: cfg,
 		record,

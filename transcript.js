@@ -11,9 +11,14 @@
  *                          turn markers; drop streaming chunks and plugin-
  *                          sourced user messages (denyFeedback / time-context
  *                          injections must never be fed back to the judge).
- *   2. two-level window  — short window (recent user message + ≤3 tool
- *                          calls) rendered in full skeleton; long window
- *                          (older user messages only) as an intent line.
+ *   2. two-level window  — short window (the ≤3 NEWEST tool calls after the
+ *                          recent user message, plus each call's result status)
+ *                          rendered in full skeleton, the newest user message
+ *                          last as the intent anchor; long window (older user
+ *                          messages only) as an intent line.
+ *                          Result lines carry the exit status only: successful
+ *                          stdout is dropped (raw tool output is an indirect
+ *                          prompt-injection surface), failure text is bounded.
  *   3. head/tail truncation — overlong messages keep head + tail with an
  *                          elision counter (error-report pastes: head =
  *                          action, tail = crux, middle = noise).
@@ -59,11 +64,39 @@ function userText(data) {
 }
 
 /**
+ * Pair every `tool/result` with the tool call it answers. The session log's
+ * `tool/result` event carries no `callId` (only turn/step/message/error), so
+ * results are matched FIFO to the tool calls that precede them in event order.
+ * @param list - the raw event list in chronological order
+ * @returns Map<event index, callId>
+ */
+function pairResultsToCalls(list) {
+	const paired = new Map();
+	const pending = [];
+	for (let i = 0; i < list.length; i += 1) {
+		const event = list[i];
+		if (event === null || typeof event !== "object") continue;
+		if (event.type === "assistant/message") {
+			const content = event.data?.message?.content;
+			if (!Array.isArray(content)) continue;
+			for (const part of content) {
+				if (part?.type === "tool-call" && part.id !== undefined) pending.push(part.id);
+			}
+		} else if (event.type === "tool/result") {
+			const callId = pending.shift();
+			if (callId !== undefined) paired.set(i, callId);
+		}
+	}
+	return paired;
+}
+
+/**
  * Collect semantic items from the raw event stream, newest first.
  * Plugin-sourced user messages and streaming chunks are excluded here.
  * @param events - a Session-like object or event array
  * @returns array of { seq, kind, ... } with seq counting only semantic items
- *   (newest first, so index 0 is the most recent).
+ *   (newest first, so index 0 is the most recent). Tool and result items carry
+ *   a `callId` so a window can pull the result of a specific call.
  */
 export function collectSemanticItems(events) {
 	const list = Array.isArray(events)
@@ -76,6 +109,7 @@ export function collectSemanticItems(events) {
 					? events.events
 					: [];
 	if (!Array.isArray(list)) return [];
+	const callIdByIndex = pairResultsToCalls(list);
 	const items = [];
 	for (let i = list.length - 1; i >= 0; i -= 1) {
 		const event = list[i];
@@ -93,7 +127,7 @@ export function collectSemanticItems(events) {
 			for (const part of content) {
 				if (part?.type !== "tool-call") continue;
 				const args = typeof part.arguments === "string" ? part.arguments : "";
-				items.push({ seq: items.length, kind: "tool", name: part.name, args, time: event.time });
+				items.push({ seq: items.length, kind: "tool", name: part.name, args, callId: part.id, time: event.time });
 			}
 		} else if (type === "tool/result") {
 			const msg = event.data?.message;
@@ -105,6 +139,7 @@ export function collectSemanticItems(events) {
 			items.push({
 				seq: items.length,
 				kind: "result",
+				callId: callIdByIndex.get(i),
 				ok: error === undefined,
 				errorCode: error?.code,
 				text: text === "" ? "" : truncateMiddle(text, 120, 60),
@@ -129,7 +164,10 @@ export function renderItem(item) {
 	}
 	if (item.kind === "result") {
 		const marker = item.ok ? "→ ok" : `→ error${item.errorCode ? ` (${item.errorCode})` : ""}`;
-		const extra = item.text === "" ? "" : ` ${truncateMiddle(item.text, 80, 40)}`;
+		// Successful stdout is deliberately dropped: raw tool output is an
+		// indirect prompt-injection surface, and the exit status is what the
+		// judge actually needs. Only failure text survives, bounded.
+		const extra = item.ok || item.text === "" ? "" : ` ${truncateMiddle(item.text, 80, 40)}`;
 		return `[R] ${marker}${extra}`;
 	}
 	return "";
@@ -153,21 +191,37 @@ export function buildTranscript({ events, cfg, denialHistory, sessionId, mode, t
 	const items = collectSemanticItems(events);
 	if (items.length === 0) return "";
 
-	// Two-level window split (items are newest-first).
+	// Two-level window split (items are newest-first: index 0 is the most
+	// recent semantic item, and lower indexes are NEWER than the user message).
 	const firstUserIdx = items.findIndex((item) => item.kind === "user");
 	const shortItems = [];
 	const longUsers = [];
-	let userBudget = 0;
+	let intentItem = null;
 	if (firstUserIdx !== -1) {
-		// Short window: the newest user message + up to 3 tool items around it.
-		shortItems.push(items[firstUserIdx]);
-		let tools = 0;
-		for (let i = firstUserIdx - 1; i >= 0 && tools < 3; i -= 1) {
-			if (items[i].kind === "tool") {
-				shortItems.push(items[i]);
-				tools += 1;
+		intentItem = items[firstUserIdx];
+		// Short window: the newest user message (rendered last, as the intent
+		// anchor) plus the ≤3 NEWEST tool calls that followed it, each with its
+		// paired result status. Walking indexes upward from 0 visits newest
+		// first — walking downward (the old behaviour) selected the *oldest*
+		// three of the recent calls and dropped the ones that explain the
+		// request being judged.
+		const windowTools = [];
+		for (let i = 0; i < firstUserIdx && windowTools.length < 3; i += 1) {
+			if (items[i].kind === "tool") windowTools.push(items[i]);
+		}
+		const wantedCalls = new Set(windowTools.map((item) => item.callId).filter((id) => id !== undefined));
+		const windowResults = [];
+		if (wantedCalls.size > 0) {
+			const seenCalls = new Set();
+			for (let i = 0; i < items.length; i += 1) {
+				const item = items[i];
+				if (item.kind !== "result" || item.callId === undefined) continue;
+				if (!wantedCalls.has(item.callId) || seenCalls.has(item.callId)) continue;
+				seenCalls.add(item.callId);
+				windowResults.push(item);
 			}
 		}
+		shortItems.push(...[...windowTools, ...windowResults].sort((a, b) => b.seq - a.seq));
 		// Long window: every older user message (intent line), capped per entry.
 		for (let i = items.length - 1; i > firstUserIdx; i -= 1) {
 			if (items[i].kind === "user") {
@@ -189,7 +243,8 @@ export function buildTranscript({ events, cfg, denialHistory, sessionId, mode, t
 	if (cwd !== undefined && cwd !== "") sections.push(`[W] ${cwd}`);
 	for (const line of longUsers) sections.push(`[U] 用户: ${line}`);
 	for (const item of [...fallbackTools].reverse()) sections.push(renderItem(item));
-	for (const item of [...shortItems].reverse()) sections.push(renderItem(item));
+	for (const item of shortItems) sections.push(renderItem(item));
+	if (intentItem !== null) sections.push(renderItem(intentItem));
 
 	// Denial history (P2, dropped first on overflow).
 	const denials = denialHistory?.get(sessionId) ?? [];

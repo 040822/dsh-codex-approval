@@ -61,11 +61,20 @@ export function findToolCallArgs(events, callId) {
 }
 
 /**
- * Build the Codex-style args preview used for rule matching and the AI
- * prompt: the raw command for bash/pwsh, compact JSON otherwise.
+ * Build the arguments text: the raw command for bash/pwsh, compact JSON
+ * otherwise.
+ *
+ * Two callers with different needs share this function:
+ *   - rule matching and the judge prompt pass **no** `maxChars`, so the whole
+ *     operation is judged. Truncating first is what let `echo <2200 chars>;
+ *     npm publish` slip past the publish rule — the dangerous tail was cut
+ *     before any rule saw it.
+ *   - the audit record and the UI pass `maxChars` for a bounded *display*
+ *     preview only.
  * @param args - parsed tool arguments (or null)
  * @param toolName - the tool that was called
- * @param maxChars - preview length cap
+ * @param maxChars - display cap; omit it (or pass a non-finite value) to keep
+ *   the whole text.
  */
 export function argsPreview(args, toolName, maxChars) {
 	let preview;
@@ -84,6 +93,6 @@ export function argsPreview(args, toolName, maxChars) {
 	} else {
 		preview = String(args);
 	}
-	if (preview.length > maxChars) preview = `${preview.slice(0, maxChars)}…`;
+	if (Number.isFinite(maxChars) && preview.length > maxChars) preview = `${preview.slice(0, maxChars)}…`;
 	return preview;
 }

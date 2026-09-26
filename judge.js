@@ -9,6 +9,8 @@
  * without any model; index.js supplies the real ctx.llm-backed runner.
  */
 
+import { redactSensitive } from "./redact.js";
+
 export const RISKS = ["low", "medium", "high"];
 export const AUTHORIZATIONS = ["allow", "ask", "deny"];
 export const RISK_RANK = { low: 0, medium: 1, high: 2 };
@@ -68,26 +70,20 @@ export function buildJudgeMessages({ toolName, argsText, reason, context }, { al
 }
 
 /**
- * Parse a judge verdict out of model output. Tries, in order:
- *   1. whole-string JSON (models that emit pure JSON)
- *   2. a fenced ```json ... ``` block
- *   3. a balanced-brace scan from the first `{` (robust against prose,
- *      multiple objects, and nested braces inside string values)
- * The first candidate that parses AND passes the closed-enum validation
- * wins. Returns null when nothing qualifies.
+ * Every balanced `{...}` slice of a text, respecting JSON string literals (so
+ * braces inside a `reason` value neither open nor close an object). Nested
+ * objects are part of their enclosing slice, not reported separately.
  */
-export function parseVerdict(text) {
-	if (typeof text !== "string") return null;
-	const candidates = [];
-	const trimmed = text.trim();
-	if (trimmed.startsWith("{")) candidates.push(trimmed);
-	const fence = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i);
-	if (fence !== null) candidates.push(fence[1].trim());
-	const start = text.indexOf("{");
-	if (start !== -1) {
+function balancedObjects(text) {
+	const objects = [];
+	let cursor = 0;
+	while (cursor < text.length) {
+		const start = text.indexOf("{", cursor);
+		if (start === -1) break;
 		let depth = 0;
 		let inString = false;
 		let escaped = false;
+		let end = -1;
 		for (let i = start; i < text.length; i += 1) {
 			const ch = text[i];
 			if (inString) {
@@ -107,29 +103,64 @@ export function parseVerdict(text) {
 			if (ch === "}") {
 				depth -= 1;
 				if (depth === 0) {
-					candidates.push(text.slice(start, i + 1));
+					end = i;
 					break;
 				}
 			}
 		}
+		if (end === -1) break;
+		objects.push(text.slice(start, end + 1));
+		cursor = end + 1;
 	}
-	for (const candidate of candidates) {
-		let parsed;
-		try {
-			parsed = JSON.parse(candidate);
-		} catch {
-			continue;
-		}
-		if (parsed === null || typeof parsed !== "object") continue;
-		const { risk, authorization, reason } = parsed;
-		if (!RISKS.includes(risk) || !AUTHORIZATIONS.includes(authorization)) continue;
-		return {
-			risk,
-			authorization,
-			reason: typeof reason === "string" ? reason.slice(0, 200) : ""
-		};
+	return objects;
+}
+
+/** Parse one candidate slice into a closed-enum verdict, or null. */
+function toVerdict(candidate) {
+	let parsed;
+	try {
+		parsed = JSON.parse(candidate);
+	} catch {
+		return null;
 	}
-	return null;
+	if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+	const { risk, authorization, reason } = parsed;
+	if (!RISKS.includes(risk) || !AUTHORIZATIONS.includes(authorization)) return null;
+	return {
+		risk,
+		authorization,
+		reason: typeof reason === "string" ? reason.slice(0, 200) : ""
+	};
+}
+
+/**
+ * Parse a judge verdict out of model output.
+ *
+ * Accepted shapes: the whole reply is one JSON object, or the reply contains
+ * exactly **one** verdict-shaped balanced object (surrounding prose and a
+ * markdown fence are tolerated).
+ *
+ * Anything ambiguous is rejected — a model that emits `{allow…} then {deny…}`
+ * returns null (→ failOpen) instead of the first object winning, and a reply
+ * with two verdict-shaped objects is never resolved by position.
+ *
+ * @param text - the model's raw reply
+ * @returns { risk, authorization, reason } or null.
+ */
+export function parseVerdict(text) {
+	if (typeof text !== "string") return null;
+	const trimmed = text.trim();
+	if (trimmed === "") return null;
+	if (trimmed.startsWith("{")) {
+		const direct = toVerdict(trimmed);
+		if (direct !== null) return direct;
+	}
+	const verdicts = [];
+	for (const candidate of balancedObjects(text)) {
+		const verdict = toVerdict(candidate);
+		if (verdict !== null) verdicts.push(verdict);
+	}
+	return verdicts.length === 1 ? verdicts[0] : null;
 }
 
 /**
@@ -184,7 +215,7 @@ export async function judgeWith({ runner, input, signal, allowAsk = true, sessio
 		return {
 			ok: false,
 			error: "unparseable judge output",
-			rawText: result.text.slice(0, 500),
+			rawText: redactSensitive(result.text).slice(0, 500),
 			...result.judgeModel === undefined ? {} : { judgeModel: result.judgeModel }
 		};
 	}

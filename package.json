@@ -21,6 +21,8 @@
     "client-remote.js",
     "client-card-style.js",
     "rules.js",
+    "shell-shape.js",
+    "redact.js",
     "enrich.js",
     "i18n.js",
     "judge.js",

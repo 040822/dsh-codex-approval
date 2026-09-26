@@ -85,7 +85,11 @@ test("evaluateRules: Pwsh rule matches pwsh tool calls (Windows)", () => {
 		{ match: "Bash(git status*)", action: "ask" },
 		{ match: "Pwsh(git status*)", action: "allow" }
 	];
-	const rule = evaluateRules(rules, { toolName: "pwsh", argsText: "git status --short", reason: "" });
+	const rule = evaluateRules(
+		rules,
+		{ toolName: "pwsh", argsText: "git status --short", reason: "" },
+		{ shape: "simple", argv: ["git", "status", "--short"] }
+	);
 	assert.equal(rule.action, "allow");
 	assert.equal(rule.match, "Pwsh(git status*)");
 });

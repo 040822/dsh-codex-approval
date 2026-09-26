@@ -53,10 +53,18 @@ const fallbackModels = [
 ]
 
 const NUL = '\u0000'
+/**
+ * Risk tolerance decides how much of the AI's *ask* verdict is auto-approved:
+ * `decideAuthorization` returns allow when `risk <= tolerance`, otherwise ask.
+ * A HIGHER tolerance is therefore MORE permissive, and the copy has to say so —
+ * the previous labels ("low · 尽量放行" / "high · 尽量询问") were inverted, so a
+ * user picking the stricter-sounding option silently widened auto-approval.
+ * A direct allow/deny verdict is respected regardless of this setting.
+ */
 const TOLERANCES = [
-  { value: 'low', label: 'low · 尽量放行' },
+  { value: 'low', label: 'low · 严格：只放行 low 风险的 ask' },
   { value: 'medium', label: 'medium · 平衡（默认）' },
-  { value: 'high', label: 'high · 尽量询问' },
+  { value: 'high', label: 'high · 宽松：high 风险的 ask 也放行' },
 ]
 const FAIL_OPEN = [
   { value: 'ask', label: 'ask · 交给人确认（默认）' },
@@ -262,7 +270,7 @@ export function DshCodexApprovalCard({ settingsScope, loadModelCatalog }: Props)
           </Field>
 
           <div className="dsh-ca-grid">
-            <Field label="风险容忍度">
+            <Field label="风险容忍度" hint="只约束 AI 判 ask 时的落点；越高越宽松。AI 直接返回 allow/deny 时不受此项影响。">
               <select className="dsh-ca-select" value={String(value.riskTolerance ?? 'medium')} disabled={disabled}
                 onChange={(event) => setField('riskTolerance', event.target.value)}>
                 {TOLERANCES.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}

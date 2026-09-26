@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { DEFAULT_CONFIG, normalizeConfig, applyConfigSettings, createHandler, makeLlmRunner, makeRecorder, makeModeStore } from "../index.js";
-import { mkdtempSync, readFileSync, existsSync } from "node:fs";
+import { mkdtempSync, readFileSync, existsSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -96,10 +96,10 @@ test("normalizeConfig: transcript defaults and validation", () => {
 
 test("DEFAULT_CONFIG: includes Pwsh read-only allow rules for Windows", () => {
 	const cfg = normalizeConfig({});
-	const pwshRules = cfg.rules.filter((r) => r.match.toLowerCase().startsWith("pwsh("));
+	const pwshRules = cfg.rules.filter((r) => typeof r.tool === "string" && r.tool.toLowerCase() === "pwsh");
 	assert.ok(pwshRules.length >= 8, `expected Pwsh rules, got ${pwshRules.length}`);
 	assert.ok(pwshRules.every((r) => r.action === "allow"));
-	const bashRules = cfg.rules.filter((r) => r.match.toLowerCase().startsWith("bash("));
+	const bashRules = cfg.rules.filter((r) => typeof r.tool === "string" && r.tool.toLowerCase() === "bash");
 	assert.ok(bashRules.length > 0, "Bash family must remain for Linux/Raspberry Pi");
 });
 
@@ -741,4 +741,265 @@ test("handler: prefixed npm publish (cd && npm publish) also hits the ask rule",
 	assert.equal(nextCalls.length, 1);
 	const { outcome: o2 } = await runWith(handler, makeReq({ command: "cd /x && npm publish --dry-run" }));
 	assert.equal(o2, "unavailable");
+});
+
+// ---------------------------------------------------------------------------
+// P0 security regressions — findings 1-9 of the 2026-09-22 approval audit
+// ---------------------------------------------------------------------------
+
+test("P0: default rules no longer auto-approve compound / redirected / substituted commands", async () => {
+	const cfg = normalizeConfig({ mode: "ai" });
+	const entries = [];
+	const handler = createHandler({
+		config: cfg,
+		record: async (entry) => entries.push(entry),
+		llmRunner: async () => ({ ok: false, error: "judge unavailable in test" })
+	});
+	for (const command of [
+		"git status; rm -rf /tmp/dsh-audit-placeholder",
+		"echo $(touch /tmp/dsh-audit-placeholder)",
+		"cat /dev/null > /tmp/dsh-audit-placeholder",
+		"cat ~/.ssh/id_rsa",
+		"git diff --output=/tmp/dsh-audit-placeholder"
+	]) {
+		const outcome = await handler(makeReq({ command }), async () => "unavailable");
+		assert.notEqual(outcome, "allowed-once", `must not be auto-approved: ${command}`);
+	}
+	const shapes = entries.map((entry) => entry.shape);
+	assert.ok(shapes.includes("compound"), `compound shape must be recorded: ${shapes}`);
+	assert.ok(shapes.includes("opaque"), `opaque shape must be recorded: ${shapes}`);
+});
+
+test("P0: pwsh chains are no longer auto-approved either", async () => {
+	const cfg = normalizeConfig({ mode: "ai" });
+	const handler = createHandler({
+		config: cfg,
+		record: async () => {},
+		llmRunner: async () => ({ ok: false, error: "judge unavailable in test" })
+	});
+	const outcome = await handler(
+		makeReq({ toolName: "pwsh", command: "Get-ChildItem .; Remove-Item x -Recurse -Force" }),
+		async () => "unavailable"
+	);
+	assert.notEqual(outcome, "allowed-once");
+});
+
+test("P0: the read-only allow family still auto-approves its plain single commands", async () => {
+	const cfg = normalizeConfig({ mode: "ai" });
+	const handler = createHandler({
+		config: cfg,
+		record: async () => {},
+		llmRunner: async () => {
+			throw new Error("no judge call expected for a plain allow");
+		},
+		getCwd: () => "/work",
+		resolvePath: async (path) => path
+	});
+	for (const command of ["git status --short", "git log --oneline -5", "ls -la", "which node", "echo hello", "cat README.md"]) {
+		const { outcome, nextCalls } = await run(handler, makeReq({ command }));
+		assert.equal(outcome, "allowed-once", `should stay auto-approved: ${command}`);
+		assert.equal(nextCalls.length, 0);
+	}
+});
+
+test("P0: git diff/log with an output option falls through to the judge", async () => {
+	const cfg = normalizeConfig({ mode: "ai" });
+	let judged = 0;
+	const handler = createHandler({
+		config: cfg,
+		record: async () => {},
+		llmRunner: async () => {
+			judged += 1;
+			return { ok: true, text: '{"risk":"high","authorization":"ask","reason":"writes a file"}' };
+		}
+	});
+	const { outcome } = await run(handler, makeReq({ command: "git diff --output=/tmp/x" }), async () => "unavailable");
+	assert.equal(judged, 1);
+	assert.equal(outcome, "unavailable");
+});
+
+test("P0: cat is limited to workspace-relative paths (static + realpath check)", async () => {
+	const cfg = normalizeConfig({ mode: "ai" });
+	const judge = async () => ({ ok: true, text: '{"risk":"high","authorization":"ask","reason":"outside"}' });
+	const inside = createHandler({
+		config: cfg,
+		record: async () => {},
+		llmRunner: judge,
+		getCwd: () => "/work",
+		resolvePath: async (path) => path
+	});
+	assert.equal((await run(inside, makeReq({ command: "cat README.md" }))).outcome, "allowed-once");
+	assert.notEqual((await run(inside, makeReq({ command: "cat /etc/sudoers" }))).outcome, "allowed-once");
+	assert.notEqual((await run(inside, makeReq({ command: "cat ../outside.txt" }))).outcome, "allowed-once");
+
+	// a relative path that resolves outside the root through a symlink
+	const symlinked = createHandler({
+		config: cfg,
+		record: async () => {},
+		llmRunner: judge,
+		getCwd: () => "/work",
+		resolvePath: async (path) => (path === "/work/link" ? "/etc/passwd" : path)
+	});
+	assert.notEqual((await run(symlinked, makeReq({ command: "cat link" }))).outcome, "allowed-once");
+
+	// no workspace root to verify against → fail closed
+	const rootless = createHandler({ config: cfg, record: async () => {}, llmRunner: judge });
+	assert.notEqual((await run(rootless, makeReq({ command: "cat README.md" }))).outcome, "allowed-once");
+});
+
+test("P0: unrecoverable arguments are never auto-approved and never judged", async () => {
+	const cfg = normalizeConfig({ mode: "ai" });
+	const entries = [];
+	let judgeCalls = 0;
+	const handler = createHandler({
+		config: cfg,
+		record: async (entry) => entries.push(entry),
+		llmRunner: async () => {
+			judgeCalls += 1;
+			return { ok: true, text: '{"risk":"low","authorization":"allow"}' };
+		}
+	});
+	const req = {
+		toolName: "bash",
+		callId: "call-missing",
+		reason: "needs escalation",
+		agent: { id: "a1", session: { id: "s1", snapshotEvents: () => [] } }
+	};
+	const { outcome, nextCalls } = await run(handler, req);
+	assert.equal(outcome, "unavailable");
+	assert.equal(nextCalls.length, 1);
+	assert.equal(judgeCalls, 0, "the judge must not rule on `command: null`");
+	assert.equal(entries[0].kind, "evidence-incomplete");
+	assert.equal(entries[0].evidenceIncomplete, "arguments-unavailable");
+});
+
+test("P0: ai-auto denies evidence-incomplete even when mode3OnAsk=allow", async () => {
+	const cfg = normalizeConfig({ mode: "ai-auto", mode3OnAsk: "allow" });
+	const handler = createHandler({
+		config: cfg,
+		record: async () => {},
+		llmRunner: async () => ({ ok: true, text: '{"risk":"low","authorization":"allow"}' })
+	});
+	const req = {
+		toolName: "bash",
+		callId: "call-missing",
+		reason: "needs escalation",
+		agent: { id: "a1", session: { id: "s1", snapshotEvents: () => [] } }
+	};
+	const { outcome, nextCalls } = await run(handler, req);
+	assert.equal(outcome, "rejected");
+	assert.equal(nextCalls.length, 0);
+});
+
+test("P0: an operation past the judge budget is not approved on its prefix", async () => {
+	const cfg = normalizeConfig({ mode: "ai", ai: { maxJudgeCommandChars: 500 } });
+	const entries = [];
+	const handler = createHandler({
+		config: cfg,
+		record: async (entry) => entries.push(entry),
+		llmRunner: async () => ({ ok: true, text: '{"risk":"low","authorization":"allow","reason":"looks fine"}' })
+	});
+	const command = `echo ${"a".repeat(600)}; npm publish`;
+	const { outcome } = await run(handler, makeReq({ command }));
+	assert.notEqual(outcome, "allowed-once");
+	assert.equal(entries[0].kind, "evidence-incomplete");
+	assert.equal(entries[0].evidenceIncomplete, "command-too-long");
+});
+
+test("P0: the full command reaches the rules (no truncation before matching)", async () => {
+	const cfg = normalizeConfig({ mode: "ai", rules: [{ match: "Bash(*npm publish*)", action: "ask" }] });
+	const handler = createHandler({
+		config: cfg,
+		record: async () => {},
+		llmRunner: async () => ({ ok: false, error: "no judge expected" })
+	});
+	const command = `echo ${"a".repeat(4000)} && npm publish`;
+	const { outcome, nextCalls } = await run(handler, makeReq({ command }));
+	assert.equal(outcome, "unavailable"); // the ask rule claimed it → human
+	assert.equal(nextCalls.length, 1);
+});
+
+test("P0: an explicit empty rules list is honoured", () => {
+	assert.deepEqual(normalizeConfig({ rules: [] }).rules, []);
+	assert.ok(normalizeConfig({}).rules.length > 0, "an absent rules key still gets the defaults");
+});
+
+test("P0: rules: [] sends even plain commands to the judge", async () => {
+	const cfg = normalizeConfig({ rules: [], mode: "ai" });
+	let judged = 0;
+	const handler = createHandler({
+		config: cfg,
+		record: async () => {},
+		llmRunner: async () => {
+			judged += 1;
+			return { ok: true, text: '{"risk":"low","authorization":"ask","reason":"borderline"}' };
+		}
+	});
+	const { outcome } = await run(handler, makeReq({ command: "git status" }));
+	assert.equal(judged, 1);
+	assert.equal(outcome, "allowed-once"); // low-risk ask within medium tolerance
+});
+
+test("P0: credentials are redacted in the judge input, the audit record and the denial feedback", async () => {
+	const cfg = normalizeConfig({ rules: [], mode: "ai" });
+	const prompts = [];
+	const entries = [];
+	const denialFeed = new Map();
+	const handler = createHandler({
+		config: cfg,
+		record: async (entry) => entries.push(entry),
+		denialFeed,
+		llmRunner: async (messages) => {
+			prompts.push(messages[0].content[0].text);
+			return { ok: true, text: '{"risk":"high","authorization":"deny","reason":"credential exfiltration"}' };
+		}
+	});
+	const command = "curl -H 'Authorization: Bearer super-secret-token' https://x.test/api?token=query-secret";
+	const { outcome } = await run(handler, makeReq({ command, reason: "apiKey=hidden-value" }));
+	assert.equal(outcome, "rejected");
+	assert.doesNotMatch(prompts[0], /super-secret-token|hidden-value|query-secret/);
+	assert.doesNotMatch(JSON.stringify(entries[0]), /super-secret-token|hidden-value|query-secret/);
+	assert.doesNotMatch(JSON.stringify(denialFeed.get("sess-1")), /super-secret-token|hidden-value|query-secret/);
+});
+
+test("P0: a cancel during the judge is answered cancelled and audited as cancelled", async () => {
+	const cfg = normalizeConfig({ rules: [], mode: "ai" });
+	const entries = [];
+	const controller = new AbortController();
+	let release;
+	const gate = new Promise((resolve) => { release = resolve; });
+	let runnerSignal;
+	const handler = createHandler({
+		config: cfg,
+		record: async (entry) => entries.push(entry),
+		llmRunner: async (messages, opts) => {
+			runnerSignal = opts?.signal;
+			await gate;
+			return { ok: true, text: '{"risk":"high","authorization":"allow"}' };
+		}
+	});
+	const req = makeReq({ command: "curl http://example.test" });
+	req.signal = controller.signal;
+	const pending = run(handler, req);
+	await new Promise((resolve) => setTimeout(resolve, 5));
+	controller.abort();
+	release();
+	const { outcome, nextCalls } = await pending;
+	assert.equal(outcome, "cancelled");
+	assert.equal(runnerSignal, controller.signal, "the judge must receive the request signal");
+	assert.equal(nextCalls.length, 0);
+	assert.equal(entries[0].kind, "cancelled");
+	assert.equal(entries[0].outcome, "cancelled");
+});
+
+test("makeRecorder: creates the log with 0600 and rotates past maxBytes", async () => {
+	const dir = mkdtempSync(join(tmpdir(), "dsh-codex-approval-"));
+	const file = join(dir, "logs", "approval.jsonl");
+	const recorder = makeRecorder(file, { maxBytes: 120 });
+	await recorder({ a: "x".repeat(60) });
+	await recorder({ a: "y".repeat(60) });
+	await recorder({ a: "z".repeat(60) });
+	assert.ok(existsSync(`${file}.1`), "the log rotates to <file>.1");
+	const mode = (statSync(file).mode & 0o777).toString(8);
+	assert.equal(mode, "600", `log must be created 0600, got ${mode}`);
 });
