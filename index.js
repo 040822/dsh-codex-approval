@@ -27,8 +27,8 @@
  *   apart and the judge's `authorization` is checked against the hard rules.
  */
 
-import { appendFile, realpath } from "node:fs/promises";
-import { mkdirSync, renameSync, statSync, unlinkSync } from "node:fs";
+import { appendFile, readFile, realpath } from "node:fs/promises";
+import { existsSync, mkdirSync, renameSync, statSync, unlinkSync } from "node:fs";
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { join, dirname, isAbsolute, relative, resolve } from "node:path";
@@ -186,12 +186,134 @@ const TOLERANCES = ["low", "medium", "high"];
 /** Upper bound on the ordered judge-fallback chain (the primary is not counted). */
 const MAX_FALLBACKS = 4;
 
+/**
+ * 把字段标成 live（可热编辑）。
+ *
+ * 语义（实测自 `@deepseek-ai/schemastery` 与 `cordis-plugin-loader`）：
+ *  1. 只有带 `meta.volatile` 的字段才进设置表单——`dsh-settings` 的
+ *     `volatileForm` 在整个 schema 找不到 volatile 字段时会直接跳过该 entry；
+ *  2. 只有带 `meta.volatile` 的字段能被**不重载插件**地改：loader 的
+ *     `equalExceptVolatile` 把 volatile 字段一律视为相等，于是纯 volatile
+ *     改动走 `_commitVolatile()` → `updateVolatile()` 把新快照原地写进引用；
+ *  3. 已解析 config 里这类字段是 cosmokit 的**引用对象**
+ *     `{ get(), [Symbol.for("cosmokit.volatile.write")] }`——不是值。
+ *
+ * `.volatile()` 只有 0.2.0 的 schemastery 有，0.1.x 上调用会抛
+ * `schema.volatile is not a function`，所以按可用性调用。在 0.1.x 上它退化成
+ * 普通字段：没有引用、没有热更新，行为与改动前完全一致。
+ */
+const live = (schema) => (typeof schema?.volatile === "function" ? schema.volatile() : schema);
+
+/**
+ * cosmokit 的 volatile 引用协议标记。用 `Symbol.for` 注册，所以跨 ESM/CJS
+ * 副本也能识别，不依赖是否 import 到同一个 cosmokit 实例。
+ */
+const VOLATILE_WRITE = Symbol.for("cosmokit.volatile.write");
+
+/** 判定一个已解析的 config 值是不是 volatile 引用（而不是普通值）。
+ * 引用被 `Object.freeze` 冻住、只有一个函数属性 `get` 和一个 symbol 属性，
+ * 所以 `JSON.stringify(ref)` 得到 `{}`——它看起来像空对象，但值一直都在，
+ * 任何「值检查」都必须先 `.get()` 摊平再判断。 */
+function isVolatileRef(value) {
+	return typeof value === "object" && value !== null && VOLATILE_WRITE in value;
+}
+
+/**
+ * 把已解析 Config 里的 volatile 引用摊平成**当时的**快照值。
+ *
+ * 引用是「稳定引用、可变快照」：loader 在只改 volatile 字段时会原地写入新
+ * 快照而不重载插件。所以摊平结果只对一次操作有效，长期持有会看到过期值——
+ * 需要实时读的地方用 `installLiveGetters`，不要用本函数的结果做长期缓存。
+ */
+export function materializeConfig(value) {
+	if (isVolatileRef(value)) return materializeConfig(value.get());
+	if (Array.isArray(value)) return value.map(materializeConfig);
+	if (value !== null && typeof value === "object") {
+		return Object.fromEntries(Object.entries(value).map(([key, child]) => [key, materializeConfig(child)]));
+	}
+	return value;
+}
+
+/**
+ * entry Config 里标了 volatile 的顶层字段 → 运行配置里的实际位置。
+ *
+ * 设置表单编辑的是前者（顶层），插件读的是后者（`cfg.ai.*`），两者由
+ * `installLiveGetters` 接起来。`sessionOverrides` 不入此表：它是 mode 命令
+ * 写入状态的镜像，`makeModeStore` 启动时即复制进内存 Map，引用语义不适用。
+ */
+const LIVE_FIELDS = [
+	["provider", ["ai", "provider"]],
+	["model", ["ai", "model"]],
+	["fallbacks", ["ai", "fallbacks"]],
+	["riskTolerance", ["ai", "riskTolerance"]],
+	["failOpen", ["ai", "failOpen"]],
+	["timeoutMs", ["ai", "timeoutMs"]],
+	["maxTokens", ["ai", "maxTokens"]],
+	["mode3OnAsk", ["mode3OnAsk"]],
+	["denyFeedback", ["denyFeedback"]]
+];
+
+/**
+ * 把 `cfg` 上的 live 字段接成 getter：读取时实时从 volatile 引用取快照。
+ *
+ * 全部读取点（`createHandler` 的 `cfg.x`、`makeLlmRunner` 的 `getConfig()`、
+ * `makeDenialInjector` / `makeGetLocale` 的 `current.x`）都是「每次访问才读」，
+ * 所以装 getter 后**一行读点都不用改**，设置页改动即刻生效。
+ *
+ * **判据只有一条：引用值是不是 `undefined`。** 这依赖 `Config` 的设计约定——
+ * 标量 volatile 字段不带默认值（`undefined` = patch 里没写过），数组字段带默认值
+ * （default 数组 = 没写过，`[]` = 用户显式清空）。
+ *
+ * 之前两版在这里放过更复杂的判据，都被审查打回：
+ *   - 「引用值等于 schema 默认值就回落到静态值」→ 用户改回默认值不生效，
+ *     用户以为收紧了、运行期仍按旧值放宽审批；
+ *   - 「查 patch 里显式写过的键集合」→ `_commitVolatile()` 在所有引用快照都相等时
+ *     不发事件，缓存会过期；且拿不到来源时按「全部显式」降级会让 schema 默认值
+ *     覆盖旧嵌套 `ai.*`，同样是静默放宽。
+ * 数据自身可区分之后，这些推断连同它们的时序依赖一起消失了。
+ *
+ * @param cfg - 已 normalize 的运行配置（会被就地改写）
+ * @param source - `apply()` 收到的原始 userConfig（volatile 字段是引用）
+ * @returns 同一个 cfg 对象
+ */
+export function installLiveGetters(cfg, source, baseline = undefined) {
+	for (const [refKey, path] of LIVE_FIELDS) {
+		const ref = source?.[refKey];
+		if (!isVolatileRef(ref)) continue; // 0.1.x 或字段未声明：保持静态值
+		const leafKey = path[path.length - 1];
+		const host = path.slice(0, -1).reduce((node, key) => node?.[key], cfg);
+		if (host === null || typeof host !== "object") continue;
+		// 兜底值取自**基线装配**（只含旧嵌套 `ai.*` 与内置默认，不含顶层显式值）：
+		//   - 用 `cfg` 上装配期的静态值不行——那可能正是启动时从 patch 读到的旧配置，
+		//     用户删掉字段后「恢复」它等于撤销用户的删除；
+		//   - 用内置默认值也不行——那会把装配期从 nested `ai.*` 修正出来的值打回去
+		//     （实测 `Config({ ai: { riskTolerance: "low" } })` 又被兜回 `medium`）。
+		const fallbackHost = baseline === undefined
+			? host
+			: path.slice(0, -1).reduce((node, key) => node?.[key], baseline);
+		const fallback = fallbackHost?.[leafKey] ?? host[leafKey];
+		Object.defineProperty(host, leafKey, {
+			enumerable: true,
+			configurable: true,
+			get() {
+				const liveValue = materializeConfig(ref.get());
+				// 用 `??` 而不是只判 `undefined`：schemastery 对**无 default 且非 required**
+				// 的字段会接受 `null`（实测 `Config({ timeoutMs: null }).timeoutMs.get()`
+				// 就是 `null`），只判 undefined 会让运行值变成 null —— `timeoutMs: null`
+				// 会让模型调用在发出请求前抛错，进而触发放行。
+				return liveValue ?? fallback;
+			}
+		});
+	}
+	return cfg;
+}
+
 /** User-editable model and policy settings, separate from per-session mode overrides. */
 export const CONFIG_SETTINGS_NAMESPACE = "dsh-codex-approval-config";
 export const CONFIG_SETTINGS_SCHEMA = z.object({
 	provider: z.string().default(DEFAULT_CONFIG.ai.provider),
 	model: z.string().default(DEFAULT_CONFIG.ai.model),
-	fallbacks: z.array(z.object({ provider: z.string(), model: z.string() })).default(DEFAULT_CONFIG.ai.fallbacks),
+	fallbacks: z.array(z.object({ provider: z.string().min(1), model: z.string().min(1) })).max(MAX_FALLBACKS).default(DEFAULT_CONFIG.ai.fallbacks),
 	riskTolerance: z.union(TOLERANCES).default(DEFAULT_CONFIG.ai.riskTolerance),
 	failOpen: z.union(ACTIONS).default(DEFAULT_CONFIG.ai.failOpen),
 	mode3OnAsk: z.union(["deny", "allow"]).default(DEFAULT_CONFIG.mode3OnAsk),
@@ -199,6 +321,59 @@ export const CONFIG_SETTINGS_SCHEMA = z.object({
 	maxTokens: z.number().step(1).min(1).default(DEFAULT_CONFIG.ai.maxTokens),
 	denyFeedback: z.boolean().default(DEFAULT_CONFIG.denyFeedback)
 });
+
+/**
+ * Cordis plugin Config —— 0.2.0 起插件的可编辑设置由本导出派生为设置表单。
+ *
+ * 设计原则：**运行期只认「值是否存在」，不做任何来源推断。**
+ *
+ * 前五轮审查打回的所有 major 几乎都出在推断上——先按「值是否等于默认值」判、再按
+ * 「patch 里的显式键集合」判：前者让「改回默认值」失效，后者受 `_commitVolatile()`
+ * 不发事件的影响而缓存过期、且拿不到来源时的降级方向会静默放宽审批。
+ *
+ * **标量一律不带 `.default()`**：默认值一旦注入，顶层字段就「恒有值」，
+ * `applyConfigSettings` 里读旧嵌套 `ai.*` 的 `pick()` 分支便永远轮不到（实测
+ * `Config({ ai: { riskTolerance: "low" } })` 的顶层值直接是 `medium`），旧配置里更
+ * 严格的策略会被静默放宽。`undefined` 才是「没配过」的唯一可靠表达。两个代价各有对应：
+ *  - `null` 不被回填 → 由 getter 的 `liveValue ?? fallback` 兜底；
+ *  - 表单没有初始值可显示 → 由客户端 `primaryProvider` / `primaryModel` 兜底。
+ *
+ * **数组保留 default**：schemastery 对**无默认值的 array** 会返回 `[]` 而不是
+ * `undefined`，那样「用户显式清空 `[]`」与「没配过」就分不开了。已知限制：顶层数组的
+ * default 目前仍会遮住旧嵌套 `ai.fallbacks`（见 README「六之五」的已知限制一节）。
+ *
+ * 运行期字段（enabled/mode/locale/fallback）保持普通字段 + 默认值：它们不进设置
+ * 表单，改动它们会让 loader 走普通更新路径（重载插件），这正是期望行为。
+ */
+export const Config = z.object({
+	enabled: z.boolean().default(DEFAULT_CONFIG.enabled),
+	mode: z.union(MODES).default(DEFAULT_CONFIG.mode),
+	locale: z.union(["auto", "zh", "en"]).default(DEFAULT_CONFIG.locale),
+	fallback: z.union(ACTIONS).default(DEFAULT_CONFIG.fallback),
+	// **标量一律不带 `.default()`**：默认值一旦注入，顶层字段就「恒有值」，
+	// `pick()` 里的旧嵌套 `ai.*` 分支便永远轮不到（实测 `Config({ ai: { riskTolerance: "low" } })`
+	// 的顶层引用值直接是 `medium`），于是旧配置里更严格的策略被静默放宽。
+	// `undefined` 是「没配过」的唯一可靠表达；默认值由装配期的 `??` 与 getter 兜底。
+	provider: live(z.string()),
+	model: live(z.string()),
+	fallbacks: live(z.array(z.object({
+		provider: z.string().min(1),
+		model: z.string().min(1)
+	})).max(MAX_FALLBACKS).default(DEFAULT_CONFIG.ai.fallbacks)),
+	riskTolerance: live(z.union(TOLERANCES)),
+	failOpen: live(z.union(ACTIONS)),
+	mode3OnAsk: live(z.union(["deny", "allow"])),
+	timeoutMs: live(z.number().step(1).min(1)),
+	maxTokens: live(z.number().step(1).min(1)),
+	denyFeedback: live(z.boolean()),
+	sessionOverrides: live(z.dict(z.union(MODES)).default({}))
+});
+
+/** 判定运行时的 settings 服务是不是 0.2.0 的 SettingsForms。两版服务都叫 settings
+ * 且都有 register，只能靠方法集差集区分（0.2.0 独有 importLegacyDocument）。 */
+function usesEntryConfigSettings(settings) {
+	return typeof settings?.importLegacyDocument === "function";
+}
 
 function assertConfig(cfg) {
 	if (typeof cfg !== "object" || cfg === null) throw new TypeError("dsh-codex-approval: config must be an object");
@@ -269,21 +444,53 @@ export function normalizeConfig(userConfig) {
 	return cfg;
 }
 
-/** Project the user-editable settings namespace onto a full plugin config. */
+/**
+ * Project the user-editable settings namespace onto a full plugin config.
+ *
+ * 判据只有一条 `??`：`undefined` 表示「patch 里没写过这个字段」。这能成立，是因为
+ * `Config` 里标量 volatile 字段不带默认值、数组字段的默认值本身承载「未配置」语义
+ * —— 见 `Config` 上方的设计说明。
+ *
+ * 之前这里要推断「顶层值 vs 旧嵌套 `ai.*` 谁优先」，因为 schema 注入的默认值让
+ * 「顶层有值」不再等于「用户配过」；现在数据自身可区分，推断连同它的两个 helper
+ * (`sameAsDefault` / `pickConfigured`) 一起删掉了。
+ */
 export function applyConfigSettings(baseConfig, settings) {
+	// 只让**有值**的字段覆盖基线。`undefined` 表示「patch 里没写过这个字段」，
+	// 直接 spread（`{ ...baseConfig, ...settings }`）会用它覆盖掉默认值——这正是
+	// 装配期最容易踩的坑：`assertConfig` 会在 `mode3OnAsk` 变成 undefined 时直接拒绝。
+	const merged = { ...baseConfig };
+	for (const [key, value] of Object.entries(settings ?? {})) {
+		if (value !== void 0) merged[key] = value;
+	}
+	const baseAi = baseConfig.ai ?? {};
+	// 顶层字段的读取顺序：**顶层 → 旧嵌套 `ai.*` → 内置默认**。
+	//
+	// 第二级是给尚未迁移的旧配置留的退路：把可编辑字段从 `ai.*` 搬到顶层时，
+	// 只搬了「写」，漏了「读」，于是 profile patch 里若还留着 `ai.riskTolerance: low`
+	// 会被静默忽略、退回默认的 `medium` —— 又是一次放宽审批的静默变更。
+	// 这里只是**回退读取**，不是原先那种来源推断：没有默认值参与，`undefined`
+	// 就是「没写过」，三级都缺才用内置默认。
+	const pick = (key, fallback) => settings?.[key] ?? settings?.ai?.[key] ?? fallback;
 	return normalizeConfig({
-		...baseConfig,
-		mode3OnAsk: settings?.mode3OnAsk ?? baseConfig.mode3OnAsk,
-		denyFeedback: settings?.denyFeedback ?? baseConfig.denyFeedback,
+		...merged,
+		mode3OnAsk: pick("mode3OnAsk", baseConfig.mode3OnAsk),
+		denyFeedback: pick("denyFeedback", baseConfig.denyFeedback),
 		ai: {
-			...baseConfig.ai,
-			provider: settings?.provider ?? baseConfig.ai.provider,
-			model: settings?.model ?? baseConfig.ai.model,
-			fallbacks: settings?.fallbacks ?? baseConfig.ai.fallbacks,
-			riskTolerance: settings?.riskTolerance ?? baseConfig.ai.riskTolerance,
-			failOpen: settings?.failOpen ?? baseConfig.ai.failOpen,
-			timeoutMs: settings?.timeoutMs ?? baseConfig.ai.timeoutMs,
-			maxTokens: settings?.maxTokens ?? baseConfig.ai.maxTokens
+			...baseAi,
+			// **先完整合并调用方传来的 `ai`**（含没有搬到顶层的那些字段：`enabled`、
+			// `maxPromptChars`、`maxJudgeCommandChars`、`denyFeedbackMax`、`transcript`…）。
+			// 只展开 `baseAi` 会把它们全丢掉：patch 里 `ai.enabled: false` 会变成默认的
+			// `true`（**AI 被静默重新启用**），`maxJudgeCommandChars: 200` 会变成 8000
+			// （证据长度限制放宽 40 倍，超长命令不再走「证据不足」分支）。
+			...(settings?.ai ?? {}),
+			provider: pick("provider", baseAi.provider),
+			model: pick("model", baseAi.model),
+			fallbacks: pick("fallbacks", baseAi.fallbacks),
+			riskTolerance: pick("riskTolerance", baseAi.riskTolerance),
+			failOpen: pick("failOpen", baseAi.failOpen),
+			timeoutMs: pick("timeoutMs", baseAi.timeoutMs),
+			maxTokens: pick("maxTokens", baseAi.maxTokens)
 		}
 	});
 }
@@ -762,11 +969,25 @@ export function makeRecorder(logFile, { maxBytes = 0 } = {}) {
  * memory only (survives nothing) otherwise. All writes go through `replace`
  * so the whole `sessionOverrides` map stays authoritative in one place.
  */
-export function makeModeStore(ctx, logger) {
+export function makeModeStore(ctx, logger, entryOverrides = {}) {
 	const memory = new Map();
+	// 本地刚写入、但还没从持久层确认的**意图**：sessionId -> { mode, intent, epoch }。
+	// 这些条目不能被远端快照覆盖或删除——用户在 /approval-mode 之后已经被告知
+	// 「已切换」，若紧接着一次无关的 volatile 同步把远端旧快照盖上来，他的 manual
+	// 就被静默撤销、继续自动放行。
+	//
+	// 用「意图 + 代次」而不是一个布尔集合，是因为布尔表达不了四件事：同键被旧快照
+	// 覆盖、被删掉、连续写入时先成功的那次提前解除保护、以及 clear() 表达不了「我要
+	// 删除」。代次保证只有**最新一次**写入才解除保护。
+	const pending = new Map();
+	let epochSeq = 0;
+	// 0.2.0：sessionOverrides 由 entry Config 承载，启动值取自 apply 收到的 userConfig。
+	for (const [key, value] of Object.entries(entryOverrides ?? {})) memory.set(key, value);
 	let settings = null;
 	ctx.inject(["settings"], (sctx) => {
 		settings = sctx.settings;
+		// 0.2.0 的 SettingsForms 走 entry config，不再读写旧命名空间。
+		if (usesEntryConfigSettings(sctx.settings)) return;
 		try {
 			sctx.settings.register("dsh-codex-approval", z.object({
 				sessionOverrides: z.dict(z.union(MODES)).default({})
@@ -782,10 +1003,30 @@ export function makeModeStore(ctx, logger) {
 	});
 	const persist = async () => {
 		if (settings === null) return "memory-only";
+		const next = {};
+		for (const [key, value] of memory) next[key] = value;
+		// 记下提交时的代次：整表提交成功意味着**本次快照里所有键**都已在持久层落地，
+		// 它们的待确认意图可以一并解除（只要期间没有更新的写入）。少了这一步，被
+		// 顺带持久化的键会永久保留保护标记，之后远端真的删除它时内存却仍留着。
+		const submitted = new Map();
+		for (const key of Object.keys(next)) submitted.set(key, pending.get(key)?.epoch);
 		try {
-			const next = {};
-			for (const [key, value] of memory) next[key] = value;
-			await settings.replace("dsh-codex-approval", { sessionOverrides: next });
+			// 0.2.0 的 SettingsForms.replace 是**整份重置**语义：它先把该 namespace 的
+			// 全部 live 字段还原再填入传参。只传 sessionOverrides 会把同一个 entry 上的
+			// provider/model/riskTolerance 等一起冲回默认值——用户执行一次 /approval-mode
+			// 就会丢掉刚在设置页配好的模型与风险策略。必须改用 mutate 精确定位到
+			// sessionOverrides 这一个路径（mutate → write 只改 ops 指定的 path）。
+			if (usesEntryConfigSettings(settings)) {
+				const row = settings.describe().find((candidate) => candidate.ns === name);
+				if (row === undefined) return "memory-only";
+				await settings.mutate(name, [{ op: "set", path: ["sessionOverrides"], value: next }], row.revision);
+			} else {
+				await settings.replace("dsh-codex-approval", { sessionOverrides: next });
+			}
+			for (const [key, epoch] of submitted) {
+				const entry = pending.get(key);
+				if (entry !== undefined && entry.epoch === epoch) pending.delete(key);
+			}
 			return "persisted";
 		} catch {
 			return "memory-only";
@@ -799,11 +1040,73 @@ export function makeModeStore(ctx, logger) {
 		async set(sessionId, mode) {
 			if (sessionId === undefined || sessionId === null) return "memory-only";
 			memory.set(sessionId, mode);
-			return persist();
+			// 写入**即刻**登记意图，而不是等 persist 结束：并发时另一次写入触发的同步
+			// 可能发生在本条确认之前，那时它若还没登记就会被删掉。
+			const entry = { mode, intent: "set", epoch: ++epochSeq };
+			pending.set(sessionId, entry);
+			const outcome = await persist();
+			// 只有仍是该键**最新**一次写入时才解除：连续两次 set 时，先成功的那次
+			// 不能把后一次的保护区清掉。
+			if (outcome === "persisted" && pending.get(sessionId) === entry) pending.delete(sessionId);
+			return outcome;
 		},
 		async clear(sessionId) {
-			if (sessionId !== undefined && sessionId !== null) memory.delete(sessionId);
-			return persist();
+			if (sessionId === undefined || sessionId === null) return "memory-only";
+			memory.delete(sessionId);
+			// 删除同样是一个需要保护的意图：否则较早提交的旧快照会把该会话重新加回来。
+			const entry = { mode: undefined, intent: "delete", epoch: ++epochSeq };
+			pending.set(sessionId, entry);
+			const outcome = await persist();
+			if (outcome === "persisted" && pending.get(sessionId) === entry) pending.delete(sessionId);
+			return outcome;
+		},
+		/**
+		 * 外部改动了 `sessionOverrides`（volatile 热更新、框架迁移旧 settings、
+		 * 另一处写入）时把新值同步进内存 Map。
+		 *
+		 * 该字段刻意不在 `LIVE_FIELDS` 里——它的语义是「mode 命令写入状态的镜像」，
+		 * 不适合挂 getter。但正因如此，它不会自动跟随引用变化：少了这一步，外部把
+		 * 某个会话改成 `manual` 之后 store 仍返回旧值，审批会继续按自动模式放行。
+		 * @returns 是否有条目发生变化（调用方可据此决定是否记审计）
+		 */
+		syncOverrides(next) {
+			if (next === null || typeof next !== "object" || Array.isArray(next)) return false;
+			let changed = false;
+			// volatile 引用承载的是**完整快照**，不是增量补丁：新快照里消失的键
+			// 代表该会话的 override 被删除了，必须一并从 Map 移除。少了这一步，
+			// 「全局模式 manual + 该会话曾设 ai-auto」在删除 override 之后仍会
+			// 自动放行，而且下一次 persist() 序列化整张 Map 时会把删掉的条目写回去。
+			// 1) 按远端快照同步，但跳过**有未确认意图**的键（本地写入优先于远端旧快照）
+			for (const key of [...memory.keys()]) {
+				if (!Object.hasOwn(next, key) && !pending.has(key)) {
+					memory.delete(key);
+					changed = true;
+				}
+			}
+			for (const [key, value] of Object.entries(next)) {
+				if (pending.has(key)) continue;
+				if (memory.get(key) !== value) {
+					memory.set(key, value);
+					changed = true;
+				}
+			}
+			// 2) 再把未确认的本地意图覆盖回去：set 恢复成本地值，delete 保持删除
+			for (const [key, entry] of pending) {
+				if (entry.intent === "set") {
+					if (memory.get(key) !== entry.mode) {
+						memory.set(key, entry.mode);
+						changed = true;
+					}
+				} else if (memory.has(key)) {
+					memory.delete(key);
+					changed = true;
+				}
+			}
+			return changed;
+		},
+		/** 当前覆盖表的浅拷贝，仅供审计记录使用。 */
+		snapshot() {
+			return Object.fromEntries(memory);
 		}
 	};
 }
@@ -954,10 +1257,76 @@ export function installConfigSettings({ settings, base, onValue, record, logger 
 	}
 }
 
+/**
+ * 升级路径：报告仍留在旧 settings 文档里的 `dsh-codex-approval-config`。
+ *
+ * 0.2.0 的 `importLegacyDocument` 按 **section 名**映射 entry，而它的映射表
+ * （`LEGACY_SECTION_ENTRIES`）里没有本插件的命名空间，所以旧设置页写下的
+ * provider/model/riskTolerance/fallbacks 不会被自动搬进新 entry —— 它们只会
+ * 留在 `$DSH_HOME/settings.yaml.imported` 里，插件侧也读不到（`settings.get(ns)`
+ * 在 0.2.0 只按 entry id 查）。结果是「升级后模型与风险策略静默消失」。
+ *
+ * 插件不该替用户改 profile 文档，所以这里做**可发现**：检测到就把原文片段打出来
+ * 并写一条审计记录，照着它把值填进 `cordis.patch.yml` 的 `- id: dsh-codex-approval`
+ * → `config:` 即可。
+ *
+ * 只做文本切段、不解析 YAML：不引入依赖，也不会因为文档里别处的语法问题翻车。
+ * @returns 旧配置的原文片段，没有则 undefined
+ */
+export async function findLegacySettings(home = process.env.DSH_HOME ?? join(homedir(), ".dsh")) {
+	// **两个文件名都要查**。框架（dsh-settings）是先 `loader.await()`、再
+	// `importLegacyDocument()`，导入完才把 `settings.yaml` 重命名成
+	// `settings.yaml.imported`。首次升级那一刻，磁盘上只有 `settings.yaml`
+	// ——只盯 `.imported` 会让「最需要告警的那一次」恰好漏发。
+	for (const name of ["settings.yaml", "settings.yaml.imported"]) {
+		const found = await readLegacySection(join(home, name));
+		if (found !== undefined) return found;
+	}
+	return undefined;
+}
+
+/** Read one settings document and cut out this plugin's legacy section. */
+async function readLegacySection(file) {
+	if (!existsSync(file)) return undefined;
+	let text;
+	try {
+		text = await readFile(file, "utf8");
+	} catch {
+		return undefined;
+	}
+	const lines = text.split("\n");
+	const start = lines.findIndex((line) => new RegExp(`^${CONFIG_SETTINGS_NAMESPACE}\\s*:`).test(line));
+	if (start === -1) return undefined;
+	const segment = [lines[start]];
+	for (let index = start + 1; index < lines.length; index += 1) {
+		// 缩进行属于这一节；遇到下一个顶层键就收工。
+		if (/^\S/.test(lines[index])) break;
+		segment.push(lines[index]);
+	}
+	return { file, segment: segment.join("\n") };
+}
+
 /** Cordis plugin entry: register the answerer when approval is composed. */
 export async function apply(ctx, userConfig) {
-	let cfg = normalizeConfig(userConfig);
-	const store = makeModeStore(ctx, ctx.logger);
+	// 0.2.0 的 entry Config 里，标了 volatile 的字段在已解析 config 中是 cosmokit 的
+	// **引用对象**，不是值。直接当值用会在 assertConfig 处炸掉——报错文本里的
+	// `got {}` 就是这个引用被 JSON.stringify 的结果，值其实一直都在引用里。
+	// 因此：先摊平快照做校验与默认值兜底，再把 volatile 字段接成 getter，让设置页
+	// 的改动经 loader 的 `updateVolatile` 原地生效（引用身份不变、值更新、插件不重载）。
+	const source = userConfig ?? {};
+	const provided = materializeConfig(source);
+	// 基线用**未被污染的** DEFAULT_CONFIG：`{ ...DEFAULT_CONFIG, ...provided }` 会让
+	// provided 里的 undefined 覆盖掉默认值，而 undefined 正是「这个字段没配过」的
+	// 表达。合并由 applyConfigSettings 内部按「只让有值的字段覆盖」完成。
+	// 基线装配：**只喂旧嵌套 `ai.*`**（不含任何顶层显式值），得到「这些字段都没配过」
+	// 时应当采用的值。getter 在引用值缺失/null 时回落到它——这样既不会在用户删掉
+	// 字段后「恢复」启动时的旧值，也不会把装配期从 nested 修正出来的值打回内置默认。
+	const baseline = normalizeConfig(applyConfigSettings(
+		DEFAULT_CONFIG,
+		provided?.ai === undefined ? {} : { ai: provided.ai }
+	));
+	let cfg = installLiveGetters(normalizeConfig(applyConfigSettings(DEFAULT_CONFIG, provided)), source, baseline);
+	const store = makeModeStore(ctx, ctx.logger, cfg.sessionOverrides);
 	const denialFeed = new Map();
 	const denialHistory = new Map();
 	const getConfig = () => cfg;
@@ -974,7 +1343,66 @@ export async function apply(ctx, userConfig) {
 		getCwd: (agent) => agent?.session?.policy?.workspaceRoot ?? agent?.cwd
 	});
 	ctx.on("approval/request", handler);
+	// volatile 热更新审计：设置页改配置走 loader 的 `updateVolatile` 原地写快照，
+	// 插件不重载。这条记录读到的若是新值，就证明 live 链路真的跑通了。
+	ctx.on("loader/volatile-update", (paths) => {
+		const changed = Array.isArray(paths)
+			? paths.map((path) => (Array.isArray(path) ? path.join(".") : String(path)))
+			: [];
+		// 只有 sessionOverrides **自己**变了才同步覆盖表。
+		//
+		// 原来在任何 volatile 更新（比如只改了 provider）时都用快照覆盖内存 Map，
+		// 这会撤销本地写入：用户刚下的 `/approval-mode manual` 若 persist 失败、
+		// 只留在内存里，紧接着一次无关的配置改动就会把它冲回旧值——人工审批模式
+		// 被静默撤销，而用户以为它已经生效。
+		let synced = false;
+		if (changed.includes("sessionOverrides")) {
+			const overridesRef = source?.sessionOverrides;
+			if (isVolatileRef(overridesRef)) synced = store.syncOverrides(materializeConfig(overridesRef.get()));
+		}
+		void record({
+			ts: new Date().toISOString(),
+			event: "config-live-update",
+			sessionId: "boot",
+			paths: changed,
+			sessionOverridesSynced: synced,
+			overrides: store.snapshot ? store.snapshot() : {},
+			mode3OnAsk: cfg.mode3OnAsk,
+			judge: `${cfg.ai.provider}/${cfg.ai.model}`,
+			tolerance: cfg.ai.riskTolerance,
+			timeoutMs: cfg.ai.timeoutMs,
+			maxTokens: cfg.ai.maxTokens,
+			denyFeedback: cfg.denyFeedback
+		});
+	});
 	ctx.inject(["settings"], (settingsCtx) => {
+		// 0.2.0：可编辑设置由 entry Config 派生，值经上面的 userConfig 直接生效。
+		if (usesEntryConfigSettings(settingsCtx.settings)) {
+			// 旧命名空间不会被框架自动搬进 entry config（见 findLegacySettings 注释）。
+			// 检测到就告警 + 留审计，避免「升级后模型与风险策略静默消失」。
+			void findLegacySettings()
+				.then((found) => {
+					if (found === undefined) return;
+					// 措辞刻意只说「发现备份、请核对」，不断言「尚未迁移」：用户把值搬进
+					// entry config 之后 `.imported` 备份会长期留着，若每次都断言未迁移，
+					// 就会指导用户反复覆盖已经正确的当前配置。
+					ctx.logger?.warn?.(
+						"[dsh-codex-approval] 发现旧设置备份：%s（%s）。0.2.0 不会自动把它搬进 entry config。若当前配置已是最新，忽略本条；如需核对，请对照 cordis.patch.yml 的 `- id: dsh-codex-approval` → `config:`：\n%s",
+						found.file, CONFIG_SETTINGS_NAMESPACE, found.segment
+					);
+					void record({
+						ts: new Date().toISOString(),
+						event: "legacy-settings-backup-found",
+						sessionId: "boot",
+						file: found.file,
+						namespace: CONFIG_SETTINGS_NAMESPACE,
+						segment: found.segment
+					});
+				})
+				.catch(() => {});
+			void record({ ts: new Date().toISOString(), event: "config-settings", sessionId: "boot", ok: true, namespace: CONFIG_SETTINGS_NAMESPACE, applies: "live", scope: "entry-config" });
+			return;
+		}
 		installConfigSettings({
 			settings: settingsCtx.settings,
 			base: {
@@ -989,7 +1417,8 @@ export async function apply(ctx, userConfig) {
 				denyFeedback: cfg.denyFeedback
 			},
 			onValue: (settingsValue) => {
-				cfg = applyConfigSettings(cfg, settingsValue);
+				// 0.1.x 的 namespace 值就是实际生效值，`??` 直接覆盖即可。
+				cfg = installLiveGetters(applyConfigSettings(cfg, settingsValue), source);
 				handler.updateConfig(cfg);
 			},
 			record,

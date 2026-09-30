@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { DEFAULT_CONFIG, normalizeConfig, applyConfigSettings, createHandler, makeLlmRunner, makeRecorder, makeModeStore } from "../index.js";
-import { mkdtempSync, readFileSync, existsSync, statSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync, existsSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -453,7 +453,10 @@ test("apply: registers the approval/request listener and self-proves", async () 
 		logger: { info: () => {}, warn: () => {} }
 	};
 	await apply(ctx, { logFile });
-	assert.deepEqual(Object.keys(listeners), ["approval/request", "agent/pre-step"]);
+	// `loader/volatile-update` 是 0.2.0 的 volatile 热更新回调：设置页改动经
+	// `updateVolatile` 原地写快照后触发它，用来同步 sessionOverrides 并留审计。
+	assert.deepEqual(Object.keys(listeners), ["approval/request", "loader/volatile-update", "agent/pre-step"]);
+	assert.equal(typeof listeners["loader/volatile-update"], "function");
 	// the plugin-loaded self-proof record is written
 	const lines = readFileSync(logFile, "utf8").trim().split("\n");
 	assert.equal(JSON.parse(lines[0]).event, "plugin-loaded");
@@ -1002,4 +1005,295 @@ test("makeRecorder: creates the log with 0600 and rotates past maxBytes", async 
 	assert.ok(existsSync(`${file}.1`), "the log rotates to <file>.1");
 	const mode = (statSync(file).mode & 0o777).toString(8);
 	assert.equal(mode, "600", `log must be created 0600, got ${mode}`);
+});
+
+// ---------- 0.2.0 entry-config 的 settings 写路径（F2/F3/F8 回归） ----------
+
+/** 0.2.0 的 SettingsForms 形状：靠 `importLegacyDocument` 与旧服务区分。 */
+function entrySettingsSpy({ revision = 7 } = {}) {
+	const calls = [];
+	return {
+		calls,
+		settings: {
+			importLegacyDocument: () => {},
+			describe: () => [{ ns: "dsh-codex-approval", revision }],
+			mutate: async (ns, ops, expected) => { calls.push({ kind: "mutate", ns, ops, expected }) },
+			replace: async (ns, section) => { calls.push({ kind: "replace", ns, section }) }
+		}
+	};
+}
+
+test("makeModeStore: 0.2.0 只写 sessionOverrides 一条路径，绝不用整份 replace", async () => {
+	const { settings, calls } = entrySettingsSpy({ revision: 7 });
+	const store = makeModeStore({ inject: (_services, callback) => callback({ settings }) }, undefined, {});
+	await store.set("session-a", "ai-auto");
+	assert.equal(calls.length, 1, "exactly one settings write");
+	// replace() 是整份重置语义：只传 sessionOverrides 会把同一个 namespace 上的
+	// provider / model / riskTolerance 一起冲回默认值（用户执行一次 /approval-mode
+	// 就丢掉刚配好的模型与风险策略）。
+	assert.equal(calls[0].kind, "mutate");
+	assert.deepEqual(calls[0].ops, [{ op: "set", path: ["sessionOverrides"], value: { "session-a": "ai-auto" } }]);
+	assert.equal(calls[0].expected, 7, "revision 取自 describe()，避免并发覆盖");
+});
+
+test("makeModeStore: describe() 里没有本 entry 时退回 memory-only，不误写", async () => {
+	const calls = [];
+	const settings = {
+		importLegacyDocument: () => {},
+		describe: () => [{ ns: "some-other-plugin", revision: 1 }],
+		mutate: async (...args) => { calls.push(args) },
+		replace: async (...args) => { calls.push(args) }
+	};
+	const store = makeModeStore({ inject: (_services, callback) => callback({ settings }) }, undefined, {});
+	assert.equal(await store.set("session-c", "ai"), "memory-only");
+	assert.equal(calls.length, 0, "定位不到 entry 时不写任何东西");
+});
+
+test("makeModeStore: 0.1.x 仍走原 namespace 的 replace", async () => {
+	const calls = [];
+	const settings = {
+		// 没有 importLegacyDocument → 判为 0.1.x 的服务形状
+		register: () => ({ get: () => ({ sessionOverrides: {} }), watch: () => {} }),
+		get: () => ({ sessionOverrides: {} }),
+		replace: async (ns, section) => { calls.push({ ns, section }) }
+	};
+	const store = makeModeStore({ inject: (_services, callback) => callback({ settings }) }, undefined, {});
+	await store.set("session-b", "manual");
+	assert.equal(calls.length, 1);
+	assert.equal(calls[0].ns, "dsh-codex-approval");
+	assert.deepEqual(calls[0].section, { sessionOverrides: { "session-b": "manual" } });
+});
+
+test("makeModeStore: syncOverrides 跟随外部 volatile 更新（含删除）", () => {
+	const store = makeModeStore({ inject: () => {} }, undefined, { "session-d": "manual" });
+	assert.equal(store.snapshot()["session-d"], "manual");
+	assert.equal(store.syncOverrides({ "session-d": "ai-auto", "session-e": "ai" }), true);
+	// 外部把它改成 ai-auto 之后 store 必须跟上，否则会继续按 manual 放行审批。
+	assert.equal(store.snapshot()["session-d"], "ai-auto");
+	assert.equal(store.snapshot()["session-e"], "ai");
+	// volatile 引用承载的是**完整快照**：新快照里没有 session-e，那是一次删除。
+	// 若按增量补丁处理，全局 manual + 该会话曾设 ai-auto 的部署会在删除后继续放行。
+	assert.equal(store.syncOverrides({ "session-d": "ai-auto" }), true, "遗漏的键代表删除，必须生效");
+	assert.equal(store.snapshot()["session-e"], undefined, "被删掉的 override 不能留在 Map 里");
+	assert.equal(store.syncOverrides({ "session-d": "ai-auto" }), false, "快照与当前完全一致才算没变化");
+	// 整表清空同样是删除
+	assert.equal(store.syncOverrides({}), true);
+	assert.deepEqual(store.snapshot(), {});
+	assert.equal(store.syncOverrides({}), false);
+	assert.equal(store.syncOverrides(undefined), false, "非对象输入安全返回");
+});
+
+test("Config schema: fallbacks 的上限与非空约束在热更新路径同样生效", async () => {
+	const { Config } = await import("../index.js");
+	// 纯 volatile 热更新不经过 assertConfig，所以这些约束必须在 schema 层拦下，
+	// 否则用户能写进 5 项、运行期一路接受，直到下次重启插件加载失败。
+	assert.throws(() => Config({ fallbacks: new Array(5).fill({ provider: "p", model: "m" }) }), /length <= 4|at most/);
+	assert.throws(() => Config({ fallbacks: [{ provider: "", model: "m" }] }), /length >= 1|non-?empty/);
+	assert.throws(() => Config({ fallbacks: [{ provider: "p", model: "" }] }), /length >= 1|non-?empty/);
+	assert.doesNotThrow(() => Config({ fallbacks: [{ provider: "p", model: "m" }] }));
+	assert.doesNotThrow(() => Config({ fallbacks: [] }), "清空兜底候选是合法配置");
+});
+
+test("legacy settings: 检测 settings.yaml.imported 里未迁移的旧 namespace", async () => {
+	const { findLegacySettings } = await import("../index.js");
+	const home = mkdtempSync(join(tmpdir(), "dsh-legacy-"));
+	assert.equal(await findLegacySettings(home), undefined, "文件不存在时返回 undefined");
+	writeFileSync(join(home, "settings.yaml.imported"), [
+		"locale:",
+		"  preference: zh",
+		"dsh-codex-approval-config:",
+		"  provider: cpa-wx301",
+		"  riskTolerance: low",
+		"other-namespace:",
+		"  a: 1",
+		""
+	].join("\n"));
+	const found = await findLegacySettings(home);
+	assert.ok(found !== undefined, "旧 namespace 存在时被检出");
+	assert.match(found.segment, /dsh-codex-approval-config:/);
+	assert.match(found.segment, /riskTolerance: low/);
+	assert.doesNotMatch(found.segment, /other-namespace/, "只取本节，不越界");
+});
+
+test("legacy settings: 首次升级时文件还没被重命名，也要查到 settings.yaml", async () => {
+	const { findLegacySettings } = await import("../index.js");
+	const home = mkdtempSync(join(tmpdir(), "dsh-legacy-first-"));
+	// 框架是先等待 loader、再导入、最后才把 settings.yaml 改名成 .imported。
+	// 首次升级的那一刻磁盘上只有 settings.yaml，只盯 .imported 会漏掉最关键的一次。
+	writeFileSync(join(home, "settings.yaml"), "dsh-codex-approval-config:\n  riskTolerance: low\n");
+	const found = await findLegacySettings(home);
+	assert.ok(found !== undefined, "未重命名的 settings.yaml 同样要被检出");
+	assert.match(found.file, /settings\.yaml$/);
+	assert.match(found.segment, /riskTolerance: low/);
+});
+
+// ---------- 配置往返：靠数据自身区分「没配过」与「配成了某个值」（F1 回归） ----------
+
+/** 通过共享 symbol 直接写 volatile 引用，等价于 loader 的 updateVolatile()。 */
+const VOLATILE_WRITE = Symbol.for("cosmokit.volatile.write");
+const writeRef = (ref, next) => ref[VOLATILE_WRITE](next);
+
+/**
+ * 平面探测：`.volatile()` 只有 0.2.0 的 schemastery（3.18.4+）才有。
+ * 0.1.x 上 `live()` 退化成普通 schema，字段解析成**值**而不是 cosmokit 引用，
+ * 「引用稳定、快照可原地改写」这套语义根本不存在，所以依赖它的断言只在
+ * volatile 平面成立；两平面值行为一致的部分照旧全跑。
+ */
+const HAS_VOLATILE =
+	typeof (await import("@deepseek-ai/schemastery")).default?.string?.().volatile === "function";
+const NO_VOLATILE_REASON = "0.1.x 的 schemastery 无 .volatile()，字段是值而非引用，无原地改写语义";
+const VOLATILE_ONLY = HAS_VOLATILE ? false : NO_VOLATILE_REASON;
+
+/** 取引用的快照值；普通平面上字段本来就是值，原样返回。 */
+const readRef = (value) => (typeof value?.get === "function" ? value.get() : value);
+
+/** 复现 apply() 的装配路径，拿到带 getter 的运行配置。 */
+async function buildCfg(raw) {
+	const { Config, DEFAULT_CONFIG, normalizeConfig, applyConfigSettings, installLiveGetters, materializeConfig } =
+		await import("../index.js");
+	const source = Config(raw);
+	const provided = materializeConfig(source);
+	const baseline = normalizeConfig(applyConfigSettings(
+		DEFAULT_CONFIG,
+		provided?.ai === undefined ? {} : { ai: provided.ai }
+	));
+	return {
+		source,
+		cfg: installLiveGetters(
+			normalizeConfig(applyConfigSettings(DEFAULT_CONFIG, provided)), source, baseline)
+	};
+}
+
+test("配置往返：改回默认值、删除字段都按预期生效", { skip: VOLATILE_ONLY }, async () => {
+	const { Config } = await import("../index.js");
+	const { source, cfg } = await buildCfg({ riskTolerance: "high", failOpen: "allow" });
+	assert.equal(cfg.ai.riskTolerance, "high");
+	assert.equal(cfg.ai.failOpen, "allow");
+
+	// 改回默认值 —— 这正是「值等于默认就回落到启动值」那种方案翻车的场景：
+	// 用户以为收紧了，运行期却仍按 high 放宽审批。
+	const back = Config({ riskTolerance: "medium", failOpen: "ask" });
+	writeRef(source.riskTolerance, back.riskTolerance.get());
+	writeRef(source.failOpen, back.failOpen.get());
+	assert.equal(cfg.ai.riskTolerance, "medium", "改回默认值必须生效");
+	assert.equal(cfg.ai.failOpen, "ask", "改回默认值必须生效");
+});
+
+test("配置往返：删除字段后回落到内置兜底，而不是恢复启动时的值", { skip: VOLATILE_ONLY }, async () => {
+	const { Config, DEFAULT_CONFIG } = await import("../index.js");
+	const { source, cfg } = await buildCfg({ riskTolerance: "high" });
+	assert.equal(cfg.ai.riskTolerance, "high");
+	const empty = Config({});
+	writeRef(source.riskTolerance, empty.riskTolerance.get());
+	assert.equal(cfg.ai.riskTolerance, DEFAULT_CONFIG.ai.riskTolerance,
+		"删掉字段后应回到内置兜底；恢复成启动时的 high 等于撤销用户的删除");
+});
+
+test("配置往返：fallbacks 的「清空」与「没配过」可区分", { skip: VOLATILE_ONLY }, async () => {
+	const { Config, DEFAULT_CONFIG } = await import("../index.js");
+	const cleared = await buildCfg({ fallbacks: [] });
+	assert.equal(cleared.cfg.ai.fallbacks.length, 0, "显式清空必须生效，不能被默认兜底候选顶回");
+
+	const restored = Config({ fallbacks: DEFAULT_CONFIG.ai.fallbacks });
+	writeRef(cleared.source.fallbacks, restored.fallbacks.get());
+	assert.deepEqual(cleared.cfg.ai.fallbacks, DEFAULT_CONFIG.ai.fallbacks);
+
+	const bare = await buildCfg({});
+	assert.deepEqual(bare.cfg.ai.fallbacks, DEFAULT_CONFIG.ai.fallbacks, "没配过时用默认兜底候选");
+});
+
+test("Config: 标量未配置是 undefined；null 原样保留（由装配期与 getter 兜底）", async () => {
+	const { Config, DEFAULT_CONFIG } = await import("../index.js");
+	// 标量**刻意不带 default**：一旦注入，顶层字段就「恒有值」，`pick()` 里读旧嵌套
+	// `ai.*` 的分支永远轮不到，旧配置里更严格的策略会被静默放宽。
+	assert.equal(readRef(Config({}).riskTolerance), undefined);
+	assert.equal(readRef(Config({ riskTolerance: "low" }).riskTolerance), "low");
+	// null 由 schemastery 原样保留，运行期靠 getter 的 `??` 兜底（不是靠 schema 回填）
+	assert.equal(readRef(Config({ timeoutMs: null }).timeoutMs), null);
+	assert.equal(readRef(Config({ denyFeedback: false }).denyFeedback), false);
+	// 数组相反：保留 default，否则「显式清空 []」与「没配过」分不开
+	assert.deepEqual(readRef(Config({}).fallbacks), DEFAULT_CONFIG.ai.fallbacks);
+	assert.deepEqual(readRef(Config({ fallbacks: [] }).fallbacks), []);
+});
+
+test("applyConfigSettings: 0.1.x 的 namespace 更新直接按实际值覆盖", async () => {
+	const { DEFAULT_CONFIG, applyConfigSettings, normalizeConfig } = await import("../index.js");
+	const base = normalizeConfig({ ...DEFAULT_CONFIG, ai: { ...DEFAULT_CONFIG.ai, riskTolerance: "high" } });
+	assert.equal(applyConfigSettings(base, { riskTolerance: "medium" }).ai.riskTolerance, "medium",
+		"0.1.x 下改回默认值必须生效");
+	assert.equal(applyConfigSettings(base, {}).ai.riskTolerance, "high", "没传的字段保持原值");
+});
+
+test("makeModeStore: 本地未确认的覆盖不会被远端同步删掉（并发保护）", async () => {
+	const { makeModeStore } = await import("../index.js");
+	const mk = (mutate) => {
+		const settings = {
+			importLegacyDocument: () => {},
+			describe: () => [{ ns: "dsh-codex-approval", revision: 1 }],
+			mutate,
+			replace: async () => {}
+		};
+		return makeModeStore({ inject: (_services, callback) => callback({ settings }) }, undefined, {});
+	};
+
+	// 持久化失败（revision 冲突）：manual 只存在于内存
+	const failing = mk(async () => { throw new Error("conflict") });
+	assert.equal(await failing.set("sess-A", "manual"), "memory-only");
+	// 紧接着一次无关的 volatile 同步带来一份不含 sess-A 的远端快照
+	assert.equal(failing.syncOverrides({ other: "ai" }), true);
+	assert.equal(failing.snapshot()["sess-A"], "manual",
+		"远端快照里没有 sess-A 不等于用户不要它——删掉它会让刚被告知「已切换」的 manual 静默失效");
+
+	// 持久化成功：本地与远端一致，此时远端快照里没有该键就是真的删除
+	const ok = mk(async () => {});
+	assert.equal(await ok.set("sess-B", "manual"), "persisted");
+	ok.syncOverrides({ other: "ai" });
+	assert.equal(ok.snapshot()["sess-B"], undefined, "已确认持久化后，远端删除应当生效");
+});
+
+test("makeModeStore: 未确认写入在四种并发情形下都不丢保护", async () => {
+	const { makeModeStore } = await import("../index.js");
+	let failing = false;
+	const settings = {
+		importLegacyDocument: () => {},
+		describe: () => [{ ns: "dsh-codex-approval", revision: 1 }],
+		mutate: async () => { if (failing) throw new Error("revision conflict") },
+		replace: async () => {}
+	};
+	const newStore = () => makeModeStore({ inject: (_services, callback) => callback({ settings }) }, undefined, {});
+
+	// 1) 同键被旧快照覆盖：本地 manual 还没确认，远端快照里没有它
+	failing = true;
+	const a = newStore();
+	await a.set("A", "manual");
+	assert.equal(a.snapshot()["A"], "manual");
+	a.syncOverrides({ other: "ai" });
+	assert.equal(a.snapshot()["A"], "manual", "本地未确认的 manual 不能被远端旧快照覆盖或删除");
+
+	// 2) 连续两次写入：先成功的那次不能解除后一次的保护
+	failing = false;
+	const b = newStore();
+	await b.set("B", "ai");
+	failing = true;
+	await b.set("B", "manual");
+	b.syncOverrides({ B: "ai" });
+	assert.equal(b.snapshot()["B"], "manual", "最新的本地写入必须优先于远端旧值");
+
+	// 3) clear **提交失败**时，删除意图要保护它不被旧快照复活
+	//（提交成功的话持久层已经没有该键，之后快照里再出现它说明是别人重新加的，
+	//  那是远端权威，应当生效——见第 4 条）
+	failing = true;
+	const c = newStore();
+	await c.set("C", "ai-auto");
+	await c.clear("C");
+	c.syncOverrides({ C: "ai-auto" });
+	assert.equal(c.snapshot()["C"], undefined, "clear 提交失败后，旧快照不能把该会话复活");
+
+	// 4) 已确认的写入不受保护，远端删除应当生效
+	failing = false;
+	const d = newStore();
+	await d.set("D", "manual");
+	assert.equal(d.snapshot()["D"], "manual");
+	d.syncOverrides({});
+	assert.equal(d.snapshot()["D"], undefined, "已确认持久化后，远端删除要生效");
 });

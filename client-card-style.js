@@ -16,6 +16,7 @@
 export const CARD_STYLE_ID = "dsh-codex-approval/card.css";
 
 export const CARD_CSS = `
+.dsh-ca-sectionList{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:12px}
 .dsh-ca-card{border:.5px solid var(--dsw-alias-border-l4);background:var(--dsw-alias-bg-layer-3);border-radius:16px;list-style:none;transition:border-color .16s,background .16s}
 .dsh-ca-card:hover{border-color:var(--dsw-alias-label-dimmed)}
 .dsh-ca-cardOpen{background:var(--dsw-alias-bg-layer-2);border-color:var(--dsw-alias-label-dimmed)}

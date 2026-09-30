@@ -1,13 +1,46 @@
 import React, { useEffect, useMemo, useState } from 'react'
 import type { SettingsScope } from '@deepseek-ai/dsh-client-ui-settings/client'
-import {
-  IconChevronDownOutline14,
-  IconChevronUpOutline14,
-  IconPlusOutline16,
-  IconTrashOutline16,
-  Switch,
-  Tag,
-} from '@deepseek-ai/dsh-client-ui-primitives'
+import * as Primitives from '@deepseek-ai/dsh-client-ui-primitives'
+
+/**
+ * 图标/基础件的可用性解析。
+ *
+ * UI 基础件的命名在两版之间改过：0.1.x 的图标带尺寸数字后缀
+ * (`IconChevronDown`)，0.2.0 起去掉数字后缀、改用 Medium/Regular
+ * 变体名 (`IconChevronDownOutline` / `...OutlineMedium`)。静态命名导入在另一版
+ * 上拿到的是 undefined，而 JSX 里出现 undefined 组件会直接把整个 slot 条目
+ * 打崩 (React error #130)，连设置页那一栏都点不开——所以这里按可用性取。
+ */
+/**
+ * 所有候选都缺失时的安全替身。
+ *
+ * 渲染 `undefined` 组件会把整个 slot 条目打崩（React error #130），连设置页那一栏
+ * 都点不开——比少一个箭头严重得多。因此 pickPrimitive 永不返回 undefined：
+ * 拿不到就退化成什么都不渲染的组件，布局与交互都不受影响。
+ */
+const Blank = (_props: any): any => null
+const pickPrimitive = (...names: string[]): any =>
+  names.map((n) => (Primitives as any)[n]).find((v) => v !== undefined) ?? Blank
+// 候选必须覆盖两版**实际导出**的名字，缺一个就会在那一版上落到 undefined：
+//   0.1.x：IconChevronDownOutline14 / IconChevronUpOutline14 /
+//          IconPlusOutline16 / IconTrashOutline16（带尺寸数字后缀）
+//   0.2.0：IconChevronDownOutline / ...OutlineRegular（无数字、带变体名）
+const IconChevronDown = pickPrimitive(
+  'IconChevronDown', 'IconChevronDownOutline', 'IconChevronDownOutline14', 'IconChevronDownOutlineRegular')
+const IconChevronUp = pickPrimitive(
+  'IconChevronUp', 'IconChevronUpOutline', 'IconChevronUpOutline14', 'IconChevronUpOutlineRegular')
+const IconPlus = pickPrimitive(
+  'IconPlus', 'IconPlusOutline', 'IconPlusOutline16', 'IconPlusOutlineRegular')
+const IconTrash = pickPrimitive(
+  'IconTrash', 'IconTrashOutline', 'IconTrashOutline16', 'IconTrashOutlineRegular')
+// 这两个同样不能是 undefined（它们直接进 JSX）。缺失时退化成等价的语义替身：
+// Tag → 普通 span；Switch → 原生 checkbox（保持可交互，不要变成不可点的死开关）。
+const Switch = (Primitives as any).Switch ?? ((props: any): any => (
+  <input type="checkbox" className={props.className} checked={Boolean(props.checked)} disabled={props.disabled}
+    aria-label={props.label} onChange={(event: any) => props.onChange?.(event.target.checked)} />
+))
+const Tag = (Primitives as any).Tag ?? ((props: any): any => <span className={props.className}>{props.children}</span>)
+
 import {
   MAX_FALLBACKS,
   buildChainSummary,
@@ -132,17 +165,26 @@ export function DshCodexApprovalCard({ settingsScope, loadModelCatalog }: Props)
   }, [loadModelCatalog])
 
   const value = { ...(snapshot.value ?? {}), ...draft } as Record<string, any>
+  // 未配置主模型时的**展示兜底**。
+  //
+  // 服务端 `Config` 的标量字段刻意不带 `.default()`（否则默认值注入会让顶层「恒有值」，
+  // 旧嵌套 `ai.*` 就永远读不到、更严格的旧策略被静默放宽），所以表单投影里
+  // `provider`/`model` 可能是 undefined。展示层需要一个等价的内置默认，否则主模型会显示
+  // 成空白、调用顺序里只剩兜底候选，还会误报「该 provider 当前不可路由」。
+  // 只用于展示，**不要写进草稿**。服务端 `DEFAULT_CONFIG.ai` 的这两个值改动时这里要同步。
+  const primaryProvider = value.provider ?? 'cpa-wx301'
+  const primaryModel = value.model ?? 'command/deepseek/deepseek-v4.1-flash'
   const options = useMemo(() => buildModelOptions(catalog, fallbackModels), [catalog])
   const chain = useMemo(() => readChain(draft.fallbacks ?? value.fallbacks), [draft.fallbacks, value.fallbacks])
-  const chainError = validateChain(chain, { provider: value.provider, model: value.model })
+  const chainError = validateChain(chain, { provider: primaryProvider, model: primaryModel })
   const dirty = Object.keys(draft).length > 0
   const writable = snapshot.writable !== false
   const disabled = !writable || saving
-  const primaryFailure = catalog?.failures?.find((item) => item.id === value.provider)
+  const primaryFailure = catalog?.failures?.find((item) => item.id === primaryProvider)
   const primaryRoutable = catalog?.routableProviders === undefined
     ? true
-    : catalog.routableProviders.includes(String(value.provider ?? ''))
-  const judgeOrder = buildChainSummary({ provider: value.provider, model: value.model }, chain)
+    : catalog.routableProviders.includes(String(primaryProvider))
+  const judgeOrder = buildChainSummary({ provider: primaryProvider, model: primaryModel }, chain)
 
   const setField = (field: string, next: unknown) => setDraft((current) => ({ ...current, [field]: next }))
   const setChain = (next: ChainEntry[]) => setField('fallbacks', next)
@@ -171,7 +213,17 @@ export function DshCodexApprovalCard({ settingsScope, loadModelCatalog }: Props)
     setSaving(true)
     try {
       const ops = Object.entries(draft).map(([path, next]) => ({ op: 'set', path: [path], value: next }))
-      if (ops.length > 0) await settingsScope.mutate(ops as any, snapshot.revision)
+      if (ops.length > 0) {
+        // 0.2.0 的 ConfigForm.mutate 返回 boolean：revision 冲突、schema 拒绝等
+        // 情况下它恢复读取并返回 false，而不是抛异常——原来的代码忽略返回值，
+        // 于是照样清空草稿、显示「已保存」，用户在不知情下丢掉编辑。
+        // 只认显式 false，这样旧版（返回 void）的契约也仍然正确。
+        const written = await settingsScope.mutate(ops as any, snapshot.revision)
+        if (written === false) {
+          setMessage('保存被拒绝：配置可能已被其他地方的修改覆盖，请收起后重新打开本栏再试')
+          return
+        }
+      }
       setDraft({})
       setMessage('已保存')
     } catch (error) {
@@ -202,7 +254,7 @@ export function DshCodexApprovalCard({ settingsScope, loadModelCatalog }: Props)
           </span>
         </span>
         {dirty ? <Tag tone="neutral" className="dsh-ca-pending">未保存</Tag> : null}
-        <IconChevronDownOutline14 className={open ? 'dsh-ca-chevron dsh-ca-chevronOpen' : 'dsh-ca-chevron'} />
+        <IconChevronDown className={open ? 'dsh-ca-chevron dsh-ca-chevronOpen' : 'dsh-ca-chevron'} />
       </button>
       {open ? (
         <div className="dsh-ca-body">
@@ -212,8 +264,8 @@ export function DshCodexApprovalCard({ settingsScope, loadModelCatalog }: Props)
           <Field label="主模型">
             <ModelSelect
               options={options}
-              provider={value.provider}
-              model={value.model}
+              provider={primaryProvider}
+              model={primaryModel}
               disabled={disabled}
               onChange={(provider, model) => {
                 setField('provider', provider)
@@ -247,22 +299,22 @@ export function DshCodexApprovalCard({ settingsScope, loadModelCatalog }: Props)
                   {failure !== undefined ? <span className="dsh-ca-rowUnavailable">不可用</span> : null}
                   <button type="button" className="dsh-ca-iconButton" title="上移" aria-label="上移"
                     disabled={disabled || index === 0} onClick={() => moveChain(index, -1)}>
-                    <IconChevronUpOutline14 />
+                    <IconChevronUp />
                   </button>
                   <button type="button" className="dsh-ca-iconButton" title="下移" aria-label="下移"
                     disabled={disabled || index === chain.length - 1} onClick={() => moveChain(index, 1)}>
-                    <IconChevronDownOutline14 />
+                    <IconChevronDown />
                   </button>
                   <button type="button" className="dsh-ca-iconButton" title="删除" aria-label="删除"
                     disabled={disabled} onClick={() => setChain(chain.filter((_, i) => i !== index))}>
-                    <IconTrashOutline16 />
+                    <IconTrash />
                   </button>
                 </div>
               )
             })}
             <div className="dsh-ca-row">
               <button type="button" className="dsh-ca-ghostButton" disabled={disabled || chain.length >= MAX_FALLBACKS} onClick={addChain}>
-                <IconPlusOutline16 /> 添加兜底候选
+                <IconPlus /> 添加兜底候选
               </button>
             </div>
             {chainError !== '' ? <p className="dsh-ca-invalid">{chainError}</p> : null}
@@ -317,4 +369,35 @@ export function DshCodexApprovalCard({ settingsScope, loadModelCatalog }: Props)
       ) : null}
     </li>
   )
+}
+
+/**
+ * 设置页独立一栏（`settings.section`）的容器。
+ *
+ * 卡片的根元素是 `<li>`（原设计挂在插件卡片的 `<ul>` 列表里）。`settings.section`
+ * 的面板本身不是列表容器，所以要自己包一层 `<ul>`——核心的宠物栏目是同样的形状：
+ * section 组件渲染 `<ul>`，卡片作为 `<li>` 落在其中。
+ *
+ * 表单由 index.ts 的 `inject` 以 `settingsScope` 这个 prop 名传入（两版设置服务
+ * 返回的形状一致），卡片本身不区分版本。
+ */
+export function makeCodexApprovalSection(form: any, loadModelCatalog: any) {
+  return function CodexApprovalSection() {
+    return (
+      <ul className="dsh-ca-sectionList">
+        {form === undefined ? (
+          <li className="dsh-ca-card">
+            <div className="dsh-ca-header">
+              <span className="dsh-ca-headText">
+                <span className="dsh-ca-name">Codex 审批</span>
+                <span className="dsh-ca-description">配置表单不可用：未解析到设置服务。</span>
+              </span>
+            </div>
+          </li>
+        ) : (
+          <DshCodexApprovalCard settingsScope={form} loadModelCatalog={loadModelCatalog} />
+        )}
+      </ul>
+    )
+  }
 }

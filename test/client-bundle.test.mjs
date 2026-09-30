@@ -4,6 +4,8 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
+import { resolveModelCatalogLoader } from "../client-remote.js";
+
 /**
  * Loads the shipped browser bundle (lib/client.js) in a fake module loader and
  * renders the card with a minimal React stand-in, so a broken artifact or a
@@ -16,11 +18,17 @@ import { dirname, join } from "node:path";
 const packageRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
 const bundleSource = readFileSync(join(packageRoot, "lib", "client.js"), "utf8");
 
+/**
+ * The most recently created React stand-in, so the tree walkers below can
+ * isolate the hook state a component consumes while being inspected.
+ */
+let probeReact = null;
+
 /** Minimal React stand-in: element construction, hooks, and effects that run. */
 function makeReact() {
 	let hooks = [];
 	let cursor = 0;
-	return {
+	probeReact = {
 		createElement: (type, props, ...children) => ({
 			type,
 			props: { ...(props ?? {}), ...(children.length === 0 ? {} : { children: children.length === 1 ? children[0] : children }) }
@@ -28,6 +36,12 @@ function makeReact() {
 		Fragment: Symbol.for("react.fragment"),
 		__reset: () => { hooks = []; cursor = 0 },
 		__rewind: () => { cursor = 0 },
+		// 遍历（collectText/collectElements）展开函数组件时，会二次调用组件函数。
+		// 没有快照/恢复的话，那次调用会**再消耗一组 hooks 槽位**，真实的渲染读到的
+		// 就是另一组——表现为「点击标题展不开」。真实 React 里每个组件有自己的
+		// hooks 单元，所以这里按「遍历产生的状态一律回滚」来对齐这个语义。
+		__snapshot: () => ({ cursor, length: hooks.length }),
+		__restore: (snap) => { cursor = snap.cursor; hooks.length = snap.length },
 		useState: (initial) => {
 			const index = cursor++;
 			if (!(index in hooks)) hooks[index] = typeof initial === "function" ? initial() : initial;
@@ -52,6 +66,18 @@ function makeReact() {
 			}
 		}
 	};
+	return probeReact;
+}
+
+/** Run `inspect` with the hook cursor isolated, then roll back whatever it consumed. */
+function isolatedInspect(inspect) {
+	if (probeReact === null) return inspect();
+	const snapshot = probeReact.__snapshot();
+	try {
+		return inspect();
+	} finally {
+		probeReact.__restore(snapshot);
+	}
 }
 
 /** Stand-in for @deepseek-ai/dsh-client-ui-primitives (a shell static-table module). */
@@ -99,7 +125,7 @@ function collectText(node, out = []) {
 	if (node === null || node === undefined || typeof node === "boolean") return out;
 	if (typeof node === "string" || typeof node === "number") { out.push(String(node)); return out }
 	if (Array.isArray(node)) { for (const child of node) collectText(child, out); return out }
-	if (typeof node.type === "function") return collectText(node.type(node.props), out);
+	if (typeof node.type === "function") return isolatedInspect(() => collectText(node.type(node.props), out));
 	collectText(node.props?.children, out);
 	return out;
 }
@@ -107,7 +133,7 @@ function collectText(node, out = []) {
 function collectElements(node, out = []) {
 	if (node === null || node === undefined || typeof node !== "object") return out;
 	if (Array.isArray(node)) { for (const child of node) collectElements(child, out); return out }
-	if (typeof node.type === "function") return collectElements(node.type(node.props), out);
+	if (typeof node.type === "function") return isolatedInspect(() => collectElements(node.type(node.props), out));
 	out.push(node);
 	collectElements(node.props?.children, out);
 	return out;
@@ -134,24 +160,38 @@ function makeScope(value) {
 	};
 }
 
-/** Drive the real apply(): capture the card component and its slot props. */
+/**
+ * Drive the real apply(): capture the card component and its slot props.
+ *
+ * The fake ctx must supply `get(name, strict)` because the plugin resolves the
+ * settings service by probing (`settingsScope` on 0.1.x / `configForms` on
+ * 0.2.0) rather than declaring either in `inject` — declaring one would leave
+ * the other version's fiber pending forever.
+ */
 function mountCard(mod, { value, modelCatalog = null }) {
 	const scope = makeScope(value);
 	let component;
 	let slotProps;
-	mod.apply({
-		inject: (_services, callback) => {
-			callback({
-				settingsScope: { bind: () => scope },
-				...modelCatalog === null ? {} : { "remote.session": { modelCatalog } },
-				slots: {
-					inject: (_slot, factory) => factory(),
-					register: (spec, card) => { component = card; slotProps = spec.inject() }
-				}
-			});
+	const services = {
+		settingsScope: { bind: () => scope },
+		...modelCatalog === null ? {} : { "remote.session": { modelCatalog } },
+		slots: {
+			inject: (_slot, factory) => factory(),
+			register: (spec, card) => { component = card; slotProps = spec.inject() }
 		}
-	});
-	return { scope, component, slotProps };
+	};
+	const ctx = {
+		get: (name) => services[name],
+		logger: { warn: () => {} },
+		locale: { register: () => {}, bind: () => () => "dsh-codex-approval" },
+		effect: (fn) => { fn(); },
+		inject: (_services, callback) => { callback(services) }
+	};
+	mod.apply(ctx);
+	// Built exactly the way the plugin builds it, so the catalog assertions run
+	// against the same loader the card would receive in the browser.
+	const loadModelCatalog = modelCatalog === null ? undefined : resolveModelCatalogLoader(services);
+	return { scope, component, slotProps, loadModelCatalog };
 }
 
 /** Render once (collapsed), click the header, re-render expanded. */
@@ -188,47 +228,79 @@ function toleranceSelect(tree) {
 test("bundle: loads, exports inject and registers the settings card", () => {
 	const react = makeReact();
 	const mod = loadBundle(react);
-	assert.deepEqual(mod.inject, ["locale", "settingsScope", "slots", "remote", "remote.session"]);
+	// 设置服务只能**探测**、不能声明：0.1.x 有 settingsScope、0.2.0 有 configForms，
+	// 两个都写进 inject 必有一版永远 pending，所以 inject 里两个都不出现。
+	assert.deepEqual(mod.inject, ["locale", "slots", "remote", "remote.session"]);
 	assert.equal(typeof mod.apply, "function");
 
 	let registered;
+	let registeredSlot;
 	let services;
+	let boundNamespace;
+	const injections = [];
 	mod.apply({
+		get: (name) => name === "settingsScope"
+			? { bind: (binding) => { boundNamespace = binding?.namespace; return makeScope({}) } }
+			: undefined,
+		logger: { warn: () => {} },
+		locale: { register: () => {}, bind: () => () => "dsh-codex-approval" },
+		effect: (fn) => { fn(); },
 		inject: (injected, callback) => {
+			injections.push(injected);
+			// 只有主 fiber 会注册；另两条是等待 settings 服务的分支。
+			if (!injected.includes("slots")) return;
 			services = injected;
 			callback({
-				settingsScope: { bind: (binding) => { assert.deepEqual(binding, { namespace: "dsh-codex-approval-config" }); return makeScope({}) } },
-				slots: { inject: (slot, factory) => { assert.equal(slot, "settings.plugin.item"); factory() }, register: (spec) => { registered = spec } }
+				slots: {
+					inject: (slot, factory) => { registeredSlot = slot; factory() },
+					register: (spec) => { registered = spec }
+				}
 			});
 		}
 	});
-	assert.deepEqual(services, ["slots", "settingsScope", "locale", "remote", "remote.session"]);
-	assert.equal(registered.name, "settings.plugin.item");
-	assert.equal(registered.key, "dsh-codex-approval-config");
+	assert.deepEqual(services, ["slots", "locale", "remote", "remote.session"]);
+	assert.equal(registeredSlot, "settings.section");
+	assert.equal(registered.name, "settings.section");
+	assert.equal(registered.id, "dsh-codex-approval");
 	assert.equal(registered.locale, "dsh-codex-approval");
-	assert.equal(typeof registered.inject().settingsScope.mutate, "function");
+	// 卡片从闭包拿表单与目录加载器，slot 注入声明是空的。
+	assert.deepEqual(registered.inject(), {});
+	// 0.1.x 的命名空间名仍然被探测到（另一版走 configForms）。
+	assert.equal(boundNamespace, "dsh-codex-approval-config");
+	// 两个候选服务各挂一条等待分支，服务迟到时还能补注册。
+	assert.ok(injections.some((list) => list.length === 1 && list[0] === "settingsScope"), "waits for settingsScope");
+	assert.ok(injections.some((list) => list.length === 1 && list[0] === "configForms"), "waits for configForms");
 });
 
 test("card: is a collapsed plugin card that expands into the full form", () => {
 	const react = makeReact();
 	const mod = loadBundle(react);
-	const { component, scope, slotProps } = mountCard(mod, { value: VALUE });
+	const { component, scope, slotProps, loadModelCatalog } = mountCard(mod, { value: VALUE });
 	assert.equal(typeof component, "function");
-	assert.deepEqual(Object.keys(slotProps).sort(), ["loadModelCatalog", "settingsScope"]);
+	// 表单与目录加载器都由注册闭包提供，slot 声明不再注入服务。
+	assert.deepEqual(slotProps, {});
 
 	react.__reset();
-	const collapsed = component({ settingsScope: scope, loadModelCatalog: slotProps.loadModelCatalog });
-	assert.equal(collapsed.type, "li", "cards render as <li> inside the section's <ul>");
-	assert.match(String(collapsed.props.className), /dsh-ca-card/);
+	const collapsed = component({ settingsScope: scope, loadModelCatalog });
+	// `settings.section` 的 owner 期望一个列表容器，卡片是其中的 `<li>`
+	// （与内置插件卡片同构）。
+	assert.equal(collapsed.type, "ul", "the section renders a list container");
+	assert.match(String(collapsed.props.className), /dsh-ca-sectionList/);
+	const collapsedCard = collectElements(collapsed)
+		.find((element) => String(element.props?.className ?? "").includes("dsh-ca-card"));
+	assert.ok(collapsedCard !== undefined, "the card renders inside the list");
+	assert.equal(collapsedCard.type, "li", "cards render as <li> inside the section's <ul>");
 	assert.equal(byClass(collapsed, "dsh-ca-header").length, 1);
 	assert.equal(byClass(collapsed, "dsh-ca-chevron").length, 1);
 	assert.equal(byClass(collapsed, "dsh-ca-body").length, 0, "the body is hidden while collapsed");
 	assert.match(collectText(collapsed).join(" | "), /审批模型/);
 	assert.doesNotMatch(collectText(collapsed).join(" | "), /风险容忍度/, "fields live in the expanded body");
 
-	const tree = expand(react, component, { settingsScope: scope, loadModelCatalog: slotProps.loadModelCatalog });
+	const tree = expand(react, component, { settingsScope: scope, loadModelCatalog });
 	const text = collectText(tree).join(" | ");
-	assert.match(String(tree.props.className), /dsh-ca-cardOpen/);
+	const openCard = collectElements(tree)
+		.find((element) => String(element.props?.className ?? "").includes("dsh-ca-card"));
+	assert.match(String(openCard?.props.className), /dsh-ca-cardOpen/);
 	assert.match(text, /主模型/);
 	assert.match(text, /兜底候选/);
 	assert.match(text, /添加兜底候选/);
@@ -248,8 +320,8 @@ test("card: is a collapsed plugin card that expands into the full form", () => {
 test("card: an edit marks the card unsaved and enables save", () => {
 	const react = makeReact();
 	const mod = loadBundle(react);
-	const { component, scope, slotProps } = mountCard(mod, { value: VALUE });
-	const props = { settingsScope: scope, loadModelCatalog: slotProps.loadModelCatalog };
+	const { component, scope, slotProps, loadModelCatalog } = mountCard(mod, { value: VALUE });
+	const props = { settingsScope: scope, loadModelCatalog: loadModelCatalog };
 	let tree = expand(react, component, props);
 
 	const tolerance = toleranceSelect(tree);
@@ -269,9 +341,9 @@ test("card: catalog options carry availability and the primary diagnostic shows"
 	const mod = loadBundle(react);
 	const healthy = async () => ({ ok: true, value: CATALOG });
 	const mounted = mountCard(mod, { value: { provider: "opencode-go", model: "deepseek-v4-flash", fallbacks: [] }, modelCatalog: healthy });
-	assert.equal(typeof mounted.slotProps.loadModelCatalog, "function", "the loader is bound on our own fiber");
+	assert.equal(typeof mounted.loadModelCatalog, "function", "the loader is bound on our own fiber");
 
-	const tree = await expandWithCatalog(react, mounted.component, { settingsScope: mounted.scope, loadModelCatalog: mounted.slotProps.loadModelCatalog });
+	const tree = await expandWithCatalog(react, mounted.component, { settingsScope: mounted.scope, loadModelCatalog: mounted.loadModelCatalog });
 	const elements = collectElements(tree);
 	assert.deepEqual(elements.filter((element) => element.type === "optgroup").map((element) => element.props.label), ["可用"]);
 	const options = elements.filter((element) => element.type === "option").map((element) => collectText(element.props.children).join(""));
@@ -288,7 +360,7 @@ test("card: a downgraded catalog sinks unavailable providers and flags a dead pr
 	const degraded = async () => ({ ok: true, value: { ...CATALOG, routableProviders: ["deepseek-official"] } });
 	const mounted = mountCard(mod, { value: { provider: "cpa-wx301", model: "command/deepseek/deepseek-v4.1-flash", fallbacks: [] }, modelCatalog: degraded });
 
-	const tree = await expandWithCatalog(react, mounted.component, { settingsScope: mounted.scope, loadModelCatalog: mounted.slotProps.loadModelCatalog });
+	const tree = await expandWithCatalog(react, mounted.component, { settingsScope: mounted.scope, loadModelCatalog: mounted.loadModelCatalog });
 	const elements = collectElements(tree);
 	assert.deepEqual(elements.filter((element) => element.type === "optgroup").map((element) => element.props.label), ["可用", "不可用（渠道失败或未路由）"]);
 	const options = elements.filter((element) => element.type === "option").map((element) => collectText(element.props.children).join(""));
@@ -300,8 +372,8 @@ test("card: risk-tolerance copy agrees with the judge's actual permissiveness", 
 	const { decideAuthorization } = await import("../judge.js");
 	const react = makeReact();
 	const mod = loadBundle(react);
-	const { component, scope, slotProps } = mountCard(mod, { value: VALUE });
-	const tree = expand(react, component, { settingsScope: scope, loadModelCatalog: slotProps.loadModelCatalog });
+	const { component, scope, slotProps, loadModelCatalog } = mountCard(mod, { value: VALUE });
+	const tree = expand(react, component, { settingsScope: scope, loadModelCatalog: loadModelCatalog });
 
 	// The risk-tolerance select is found by its option values, not its position.
 	const tolerance = toleranceSelect(tree);
