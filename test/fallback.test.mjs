@@ -18,6 +18,7 @@ function makeLlm(answerByModel, calls = []) {
 						return;
 					}
 					yield { type: "text-delta", text: result?.text ?? "" };
+					if (result?.noFinish === true) return;
 					yield { type: "finish", reason: { kind: "stop" } };
 				}
 			};
@@ -180,4 +181,163 @@ test("judgeWith: carries the answering model and attempt count into the verdict 
 	assert.equal(failed.ok, false);
 	assert.equal(failed.judgeAttempts, 2);
 	assert.deepEqual(failed.judgeTried, ["a/b", "c/d"]);
+});
+
+// --- regression: an unusable reply is a candidate failure, not a success ----
+// The audit log showed `kind=ai-error` / `rawOutput:""` entries with no
+// `judgeAttempts` while a configured fallback sat unused: a model that streamed
+// nothing was counted as a successful attempt, so the chain ended on an empty
+// string. These tests pin the corrected rule for both shapes — empty text and
+// text that carries no verdict.
+
+test("chain: an empty primary reply advances to the next candidate", async () => {
+	const calls = [];
+	const llm = makeLlm({
+		"cpa-wx301/command/deepseek/deepseek-v4.1-flash": { text: "" },
+		"deepseek-official/deepseek-flash": { text: VERDICT }
+	}, calls);
+	const runner = makeLlmRunner(llm, {
+		provider: "cpa-wx301",
+		model: "command/deepseek/deepseek-v4.1-flash",
+		fallbacks: [{ provider: "deepseek-official", model: "deepseek-flash" }],
+		timeoutMs: 1000,
+		maxTokens: 7
+	});
+	const result = await runner([]);
+	assert.equal(result.ok, true);
+	assert.equal(result.text, VERDICT);
+	assert.equal(result.judgeAttempts, 2);
+	assert.equal(result.judgeModel, "deepseek-official/deepseek-flash");
+	assert.equal(result.judgeFallbackFrom, "cpa-wx301/command/deepseek/deepseek-v4.1-flash");
+	assert.deepEqual(calls.map((call) => `${call.provider}/${call.model}`), [
+		"cpa-wx301/command/deepseek/deepseek-v4.1-flash",
+		"deepseek-official/deepseek-flash"
+	]);
+});
+
+test("chain: a reply with prose but no verdict also advances", async () => {
+	const calls = [];
+	const llm = makeLlm({
+		"cpa-wx301/command/deepseek/deepseek-v4.1-flash": { text: 'Sure — I checked it: {"note":"looks fine"}' },
+		"deepseek-official/deepseek-flash": { text: VERDICT }
+	}, calls);
+	const result = await makeLlmRunner(llm, {
+		provider: "cpa-wx301",
+		model: "command/deepseek/deepseek-v4.1-flash",
+		fallbacks: [{ provider: "deepseek-official", model: "deepseek-flash" }],
+		timeoutMs: 1000,
+		maxTokens: 7
+	})([]);
+	assert.equal(result.ok, true);
+	assert.equal(result.judgeModel, "deepseek-official/deepseek-flash");
+	assert.equal(result.judgeAttempts, 2);
+	assert.equal(calls.length, 2);
+});
+
+test("chain: whitespace-only replies count as empty and keep the chain moving", async () => {
+	const llm = makeLlm({
+		"cpa-wx301/m": { text: "  \n\t " },
+		"p2/m2": { text: VERDICT }
+	});
+	const result = await makeLlmRunner(llm, {
+		provider: "cpa-wx301",
+		model: "m",
+		fallbacks: [{ provider: "p2", model: "m2" }],
+		timeoutMs: 1000,
+		maxTokens: 7
+	})([]);
+	assert.equal(result.ok, true);
+	assert.equal(result.text, VERDICT);
+});
+
+test("chain: every candidate empty reports the primary failure as an empty reply", async () => {
+	const llm = makeLlm({
+		"cpa-wx301/m": { text: "", noFinish: true },
+		"p2/m2": { text: "" }
+	});
+	const result = await makeLlmRunner(llm, {
+		provider: "cpa-wx301",
+		model: "m",
+		fallbacks: [{ provider: "p2", model: "m2" }],
+		timeoutMs: 1000,
+		maxTokens: 7
+	})([]);
+	assert.equal(result.ok, false);
+	assert.equal(result.error, "unparseable judge output (empty reply)");
+	assert.equal(result.rawText, "");
+	assert.equal(result.textChars, 0);
+	// the primary's evidence is what gets reported, including how its stream ended
+	assert.equal(result.endedWithoutFinish, true);
+	assert.equal(result.judgeAttempts, 2);
+	assert.deepEqual(result.judgeTried, ["cpa-wx301/m", "p2/m2"]);
+});
+
+test("chain: a single candidate keeps the pre-fallback result shape (no chain fields)", async () => {
+	const llm = makeLlm({ "cpa-wx301/m": { text: "" } });
+	const result = await makeLlmRunner(llm, { provider: "cpa-wx301", model: "m", timeoutMs: 1000, maxTokens: 7 })([]);
+	assert.equal(result.ok, false);
+	assert.equal(result.error, "unparseable judge output (empty reply)");
+	assert.equal(result.rawText, "");
+	assert.equal(result.textChars, 0);
+	assert.equal(result.judgeAttempts, undefined);
+	assert.equal(result.judgeTried, undefined);
+	assert.equal(result.judgeModel, undefined);
+	assert.equal(result.judgeFallbackFrom, undefined);
+});
+
+test("chain: text without a verdict reports the no-verdict reason and its char count", async () => {
+	const llm = makeLlm({ "cpa-wx301/m": { text: "I will not answer" } });
+	const result = await makeLlmRunner(llm, { provider: "cpa-wx301", model: "m", timeoutMs: 1000, maxTokens: 7 })([]);
+	assert.equal(result.ok, false);
+	assert.equal(result.error, "unparseable judge output (no verdict)");
+	assert.equal(result.rawText, "I will not answer");
+	assert.equal(result.textChars, "I will not answer".length);
+	assert.equal(result.judgeAttempts, undefined);
+});
+
+test("chain: redacts credentials in the preserved raw output", async () => {
+	const llm = makeLlm({ "cpa-wx301/m": { text: "Authorization: Bearer sk-abcdefghijklmnop" } });
+	const result = await makeLlmRunner(llm, { provider: "cpa-wx301", model: "m", timeoutMs: 1000, maxTokens: 7 })([]);
+	assert.equal(result.ok, false);
+	assert.doesNotMatch(result.rawText, /sk-abcdefghijklmnop/);
+	assert.match(result.rawText, /\[REDACTED\]/);
+});
+
+test("judgeWith: an empty primary reply still yields the fallback verdict, never ai-error", async () => {
+	const llm = makeLlm({
+		"cpa-wx301/command/deepseek/deepseek-v4.1-flash": { text: "" },
+		"deepseek-official/deepseek-flash": { text: VERDICT }
+	});
+	const runner = makeLlmRunner(llm, {
+		provider: "cpa-wx301",
+		model: "command/deepseek/deepseek-v4.1-flash",
+		fallbacks: [{ provider: "deepseek-official", model: "deepseek-flash" }],
+		timeoutMs: 1000,
+		maxTokens: 7
+	});
+	const result = await judgeWith({ runner, input: { toolName: "bash", argsText: "ls", reason: "" } });
+	assert.equal(result.ok, true);
+	assert.equal(result.error, undefined);
+	assert.deepEqual(result.verdict, { risk: "low", authorization: "allow", reason: "read-only" });
+	assert.equal(result.judgeModel, "deepseek-official/deepseek-flash");
+	assert.equal(result.judgeFallbackFrom, "cpa-wx301/command/deepseek/deepseek-v4.1-flash");
+	assert.equal(result.judgeAttempts, 2);
+});
+
+test("judgeWith: every candidate empty fails with the empty-reply reason and every candidate listed", async () => {
+	const llm = makeLlm({ "cpa-wx301/m": { text: "" }, "p2/m2": { text: "" } });
+	const runner = makeLlmRunner(llm, {
+		provider: "cpa-wx301",
+		model: "m",
+		fallbacks: [{ provider: "p2", model: "m2" }],
+		timeoutMs: 1000,
+		maxTokens: 7
+	});
+	const result = await judgeWith({ runner, input: { toolName: "bash", argsText: "ls", reason: "" } });
+	assert.equal(result.ok, false);
+	assert.equal(result.error, "unparseable judge output (empty reply)");
+	assert.equal(result.rawText, "");
+	assert.equal(result.textChars, 0);
+	assert.equal(result.judgeAttempts, 2);
+	assert.deepEqual(result.judgeTried, ["cpa-wx301/m", "p2/m2"]);
 });

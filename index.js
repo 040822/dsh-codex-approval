@@ -36,7 +36,7 @@ import z from "@deepseek-ai/schemastery";
 
 import { classifyRequest, evaluateRules, ruleLabel } from "./rules.js";
 import { findToolCallArgs, argsPreview } from "./enrich.js";
-import { judgeWith, decideAuthorization } from "./judge.js";
+import { judgeWith, decideAuthorization, parseVerdict } from "./judge.js";
 import { buildTranscript } from "./transcript.js";
 import { MODES, parseMode, resolveMode, effectiveOnAsk } from "./modes.js";
 import { T, pickLocale, commandDescription, renderDenialNotice } from "./i18n.js";
@@ -543,13 +543,30 @@ function formatFailureError(kind, failure) {
 	return `${prefix}${code}${message}`;
 }
 
-/** One judge attempt against a single provider/model pair, bounded by timeout. */
+/**
+ * One judge attempt against a single provider/model pair, bounded by timeout.
+ *
+ * The stream can end in three distinct states, and the caller needs to tell
+ * them apart:
+ *   1. a `finish` chunk reporting `error`/`aborted` → `ok:false` + `finishKind`
+ *      + `failure` (the pre-existing transport-failure shape, unchanged);
+ *   2. the stream ends without any `finish` chunk — an `AbortSignal` cutoff or
+ *      a dropped connection — which is flagged `endedWithoutFinish` so an empty
+ *      reply can be told apart from "the provider answered with nothing";
+ *   3. a normal ending (`finish` with `stop`/`length`/…).
+ *
+ * States 2 and 3 both return `ok:true` with the collected text: whether that
+ * text is a *usable* verdict is decided by the chain (see makeLlmRunner), not
+ * here — an empty reply is a candidate failure, not a successful attempt.
+ * `textChars` is the diagnostic count of what actually arrived.
+ */
 async function attemptJudge(llm, candidate, { messages, signal, sessionId, timeoutMs, maxTokens }) {
 	const timeoutSignal = AbortSignal.timeout(timeoutMs);
 	const combined = signal !== undefined ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
 	try {
 		const prepared = await llm.prepareCall({ provider: candidate.provider, model: candidate.model, temperature: 0, maxTokens }, combined);
 		let text = "";
+		let sawFinish = false;
 		for await (const chunk of prepared.stream({
 			...prepared.config,
 			messages,
@@ -557,17 +574,25 @@ async function attemptJudge(llm, candidate, { messages, signal, sessionId, timeo
 			...sessionId === undefined ? {} : { sessionId }
 		})) {
 			if (chunk.type === "text-delta") text += chunk.text;
-			else if (chunk.type === "finish" && (chunk.reason?.kind === "error" || chunk.reason?.kind === "aborted")) {
-				const failure = normalizeFailure(chunk.reason);
-				return {
-					ok: false,
-					finishKind: chunk.reason.kind,
-					...failure === undefined ? {} : { failure },
-					error: formatFailureError(chunk.reason.kind, failure)
-				};
+			else if (chunk.type === "finish") {
+				if (chunk.reason?.kind === "error" || chunk.reason?.kind === "aborted") {
+					const failure = normalizeFailure(chunk.reason);
+					return {
+						ok: false,
+						finishKind: chunk.reason.kind,
+						...failure === undefined ? {} : { failure },
+						error: formatFailureError(chunk.reason.kind, failure)
+					};
+				}
+				sawFinish = true;
 			}
 		}
-		return { ok: true, text };
+		return {
+			ok: true,
+			text,
+			textChars: text.length,
+			...sawFinish ? {} : { endedWithoutFinish: true }
+		};
 	} catch (error) {
 		const message = boundedText(error?.message ?? String(error), FAILURE_MESSAGE_MAX_CHARS) ?? "LLM judge failed";
 		return { ok: false, error: message };
@@ -575,14 +600,43 @@ async function attemptJudge(llm, candidate, { messages, signal, sessionId, timeo
 }
 
 /**
+ * Turn a candidate's unusable reply into the chain-failure record. Two shapes
+ * are distinguished for the audit log: an empty/whitespace reply (the model
+ * emitted no text at all) and a reply that carried text with no parseable
+ * verdict. `textChars` and `endedWithoutFinish` are diagnostics only — the
+ * truncated, redacted `rawText` keeps the pre-existing handling.
+ */
+function unparseableFailure(result) {
+	const text = typeof result.text === "string" ? result.text : "";
+	return {
+		ok: false,
+		error: text.trim() === ""
+			? "unparseable judge output (empty reply)"
+			: "unparseable judge output (no verdict)",
+		rawText: redactSensitive(text).slice(0, 500),
+		textChars: text.length,
+		...result.endedWithoutFinish === true ? { endedWithoutFinish: true } : {}
+	};
+}
+
+/**
  * The ordered judge runner: the configured provider/model first, then every
  * `ai.fallbacks` entry, deduplicated by pair. One timeout-bounded attempt runs
  * per candidate and the chain advances on provider failure (auth, quota,
- * upstream 5xx, transport, timeout), so a retired subscription or a cooled-down
- * route degrades to the next judge instead of disabling the AI layer. The first
- * candidate that answers wins; when all candidates fail the primary's failure
- * is reported — it is the configured intent — annotated with how many were
- * tried. A single-candidate chain keeps the pre-fallback result shape exactly.
+ * upstream 5xx, transport, timeout) — a retired subscription or a cooled-down
+ * route degrades to the next judge instead of disabling the AI layer — and on
+ * an **unusable reply**: empty text, or text without a parseable verdict. That
+ * second case is not cosmetic: a model that streams nothing used to count as a
+ * *successful* attempt, which ended the chain on an empty string and left the
+ * configured fallbacks unspent (audited as `ai-error` with an empty
+ * `rawOutput`). A candidate only wins by returning a verdict `parseVerdict`
+ * accepts.
+ *
+ * When every candidate fails the primary's failure is reported — it is the
+ * configured intent — annotated with how many were tried. A single-candidate
+ * chain keeps the pre-fallback result shape exactly (no `judge*` fields), and
+ * a candidate is never retried: the judge sits on the approval critical path,
+ * where an extra model call is latency the user pays.
  */
 export function makeLlmRunner(llm, configOrGetter) {
 	const getConfig = typeof configOrGetter === "function" ? configOrGetter : () => configOrGetter;
@@ -603,7 +657,7 @@ export function makeLlmRunner(llm, configOrGetter) {
 			const candidate = chain[index];
 			tried.push(`${candidate.provider}/${candidate.model}`);
 			const result = await attemptJudge(llm, candidate, { messages, signal, sessionId, timeoutMs, maxTokens });
-			if (result.ok === true) {
+			if (result.ok === true && parseVerdict(result.text) !== null) {
 				// A chain that answered on its first candidate still records which
 				// model judged (audit value); a chain-less runner keeps the legacy
 				// result shape untouched.
@@ -618,7 +672,12 @@ export function makeLlmRunner(llm, configOrGetter) {
 					judgeModel: `${candidate.provider}/${candidate.model}`
 				};
 			}
-			if (primaryFailure === undefined) primaryFailure = result;
+			// Either a transport failure or a reply this candidate cannot be judged
+			// on: both mean "this candidate did not answer", so the chain advances.
+			// Only the primary's failure is kept (it is the configured intent).
+			if (primaryFailure === undefined) {
+				primaryFailure = result.ok === true ? unparseableFailure(result) : result;
+			}
 		}
 		const failed = primaryFailure ?? { ok: false, error: "judge cancelled before any attempt" };
 		if (tried.length <= 1) return failed;
@@ -829,6 +888,8 @@ export function createHandler({ config, record, llmRunner, getSessionMode, denia
 					...judged.finishKind !== void 0 ? { finishKind: judged.finishKind } : {},
 					...judged.failure !== void 0 ? { failure: judged.failure } : {},
 					...judged.rawText !== void 0 ? { rawOutput: judged.rawText } : {},
+					...judged.textChars !== void 0 ? { textChars: judged.textChars } : {},
+					...judged.endedWithoutFinish !== void 0 ? { endedWithoutFinish: judged.endedWithoutFinish } : {},
 					...judged.judgeAttempts !== void 0 ? { judgeAttempts: judged.judgeAttempts } : {},
 					...judged.judgeTried !== void 0 ? { judgeTried: judged.judgeTried } : {}
 				};

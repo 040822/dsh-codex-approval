@@ -55,6 +55,23 @@ approval/request 到达（toolName + callId + reason）
 
 `failure.message`、`failure.code` 和 `requestId` 有长度上限，并会脱敏 Bearer/API key/token/password/secret 以及 URL 敏感查询参数；不会把凭据原文写入审计日志或拒绝反馈。常见 code 的排查方向：`AUTH`（鉴权/密钥）、`RATE_LIMIT` 或 `QUOTA_EXCEEDED`（限流/额度）、`SERVER`（上游 5xx）、`TIMEOUT`（超时）、`TRANSPORT`（网络/连接/流中断）、`CONTEXT_WINDOW_EXCEEDED`（上下文超限）。这些字段只增强诊断，不改变 `failOpen`、`mode3OnAsk` 或人工审批策略。
 
+模型**没有任何可解析判定**时，`ai-error` 记录按原因区分两条 `error` 文案，并附诊断字段：
+
+| 字段 | 含义 |
+|---|---|
+| `error` | `unparseable judge output (empty reply)`：一个 text-delta 都没吐；`unparseable judge output (no verdict)`：有文本但没有唯一的 `{risk, authorization, reason}` 对象 |
+| `rawOutput` | 模型原文，脱敏后截断到 500 字符（空回复时为空串） |
+| `textChars` | 该候选实际收到的字符数（空回复为 `0`） |
+| `endedWithoutFinish` | `true` 表示流在**没有** `finish` 分片的情况下结束（`AbortSignal` 掐断或连接被丢），用来区分「provider 明确回了空」与「流被打断」 |
+
+例如一条空回复记录：
+
+```json
+{"kind":"ai-error","toolName":"pwsh","action":"ask","outcome":"pass","error":"unparseable judge output (empty reply)","rawOutput":"","textChars":0,"endedWithoutFinish":true,"judgeAttempts":2,"judgeTried":["cpa-wx301/…","deepseek-official/deepseek-flash"]}
+```
+
+`textChars` / `endedWithoutFinish` 只出现在 `ai-error` 记录里，同样只增强诊断。这类失败**也会推进候选链**（见下节）：只有链上所有候选都无法给出判定，才会留下 `ai-error`。
+
 ## Web 配置与模型可用性
 
 **卡片在哪**：Web UI → **设置 → 插件 → 插件配置**（英文 `Settings → Plugins → Plugin configuration`）。该标签页按 settings namespace 列出可配置插件，本插件的卡片由自身浏览器半边注册在 `settings.plugin.item` slot 上，key 为 `dsh-codex-approval-config`。看不到卡片时先确认 Host 已加载新代码并刷新页面（见下方构建与重启说明）。
@@ -67,9 +84,11 @@ approval/request 到达（toolName + callId + reason）
 
 配置变更通过 settings revision fence 保存，并在 Host 侧 live 更新运行时配置；正在进行的 judge 调用不会被中途替换。真实 provider failure 仍以审批日志中的脱敏 `failure.code/message` 为准；API key 不存入该 namespace。
 
-审判模型是一条**有序候选链**：先试 `provider`/`model`，失败（AUTH/额度/上游 5xx/连接/超时）再依次试 `fallbacks` 里的每一项，按 provider+model 去重。第一个给出回复的候选胜出；全部失败时按**主模型**的失败信息记 `ai-error`（它才是配置意图），并附带 `judgeAttempts`/`judgeTried`。走兜底时成功记录会带 `judgeModel`（实际作答的模型）、`judgeFallbackFrom`（被跳过的主模型）与 `judgeAttempts`。候选链也读同一个 settings namespace 的 `fallbacks` 字段（最多 4 项），修改同样 live 生效；调用方取消（`signal` 已 abort）时不会再花下一次调用。
+审判模型是一条**有序候选链**：先试 `provider`/`model`，失败（AUTH/额度/上游 5xx/连接/超时）再依次试 `fallbacks` 里的每一项，按 provider+model 去重。**一个候选只有给出可解析的判定才算答对**：空回复（一个 text-delta 都没吐）与"有文本但没有唯一判定对象"同样算该候选失败，链继续推进——它们曾被当成"成功的判定尝试"，于是配置好的 `fallbacks` 永远轮不到，审计里只留一条 `rawOutput` 为空的 `ai-error`。全部候选都失败时才按**主模型**的失败信息记 `ai-error`（它才是配置意图），并附带 `judgeAttempts`/`judgeTried`。走兜底时成功记录会带 `judgeModel`（实际作答的模型）、`judgeFallbackFrom`（被跳过的主模型）与 `judgeAttempts`。候选链也读同一个 settings namespace 的 `fallbacks` 字段（最多 4 项），修改同样 live 生效；调用方取消（`signal` 已 abort）时不会再花下一次调用；同一个候选**不重试**（判定在审批关键路径上，延迟敏感）。
 
-注意：链只在**provider 层失败**时推进。"模型答了但输出无法解析成 `{risk, authorization, reason}`" 仍按原逻辑走 `failOpen`，不会静默换模型。
+判定的"可解析"由 `judge.js` 的 `parseVerdict` 判定，与最终解析同一套规则——链不会因为"换个模型看法不同"而产出判定，唯一的门槛就是能否解析出唯一的 `{risk, authorization, reason}`。
+
+注意：链在**provider 层失败**与**候选没给出可解析判定**（空回复／无判定对象）时都会推进。"模型答了但输出无法解析成 `{risk, authorization, reason}`" 现在会先让 `fallbacks` 接住，全链都失败才走 `failOpen`。
 
 上游 `opencode-go` 订阅到期后，`cpa-wx301` 上的 `opencode/*` 模型同样因渠道 `auth_unavailable` 不可用；`ai.fallbacks` 因此默认选 DeepSeek 官方 API（`deepseek-official`，即 DSH 原生 `llm-deepseek` 适配器，走 `DEEPSEEK_API_KEY`），与主模型同属 DeepSeek V4.x 家族但路由独立。
 
@@ -221,7 +240,7 @@ dsh plugin --profile web add dsh-codex-approval
 
 开启 `transcript: "short"` 后追加 **Context 块**（紧凑会话骨架，≤`transcriptMaxChars` 字符）——两级窗口：短窗口（**最近** ≤3 条工具调用 + 各自按 callId 关联的结果状态行 → `[T]/[R]` 行）+ 长窗口（更早的真实用户消息意图线）+ 模式行 `[M]` + 最近拒绝 `[D]` + 工作区 `[W]`，**最近的用户消息作为意图锚点渲染在最后一行**（受预算保护）。`[R]` 只带成功/失败状态与失败文本（≤80 字符），**成功的 stdout 一律不喂给模型**（原始工具输出是间接注入面）；超长消息头尾保留 + 省略计数（`…〔省略 N 字符〕…`）；plugin 注入消息与流式 chunk 一律不进骨架。**默认 off。**
 
-**输出**：`{"risk":"low|medium|high","authorization":"allow|ask|deny","reason":"一句话"}`。解析策略：整串 JSON，或"恰好一个**判决形状**的平衡对象"（允许前后散文/代码围栏）；出现两个及以上裁决、或判决被包在别的对象里、或枚举非法 → 视为 AI 故障走 failOpen。**不接受"取第一个对象"**：模型先说 allow 再说 deny 时不会被解读成 allow。
+**输出**：`{"risk":"low|medium|high","authorization":"allow|ask|deny","reason":"一句话"}`。解析策略：整串 JSON，或"恰好一个**判决形状**的平衡对象"（允许前后散文/代码围栏）；出现两个及以上裁决、或判决被包在别的对象里、或枚举非法 → 该候选失败（继续候选链，全链失败才走 `failOpen`）。**不接受"取第一个对象"**：模型先说 allow 再说 deny 时不会被解读成 allow。
 
 ## 会话上下文（transcript，v0.4.0）
 
@@ -249,7 +268,7 @@ dsh plugin --profile web add dsh-codex-approval
 - **统一脱敏**：命令与 reason 在进入 AI prompt、审计日志、拒绝反馈前一律脱敏；插件新建的审计日志为 `0600` 并按 `logMaxBytes` 轮转（已存在的旧日志权限不会被自动改动）
 - 枚举校验只约束 AI 输出的**格式**，不能保证裁判不受提示注入影响——因此固定政策与不可信请求文本分开处理，且 `authorization` 仍要过规则层
 - AI 调用有超时上限（默认 15s，**每个候选各自计时**），失败默认交还人类（fail-open，不会静默全拒）
-- 审判候选链只在 provider 层失败时推进；候选全部失败才落到 `failOpen`
+- 审判候选链在 provider 层失败**或候选没给出可解析判定**（空回复／无判定对象）时都会推进；候选全部失败才落到 `failOpen`
 - 审批期间取消会传播给模型链（`signal`），取消的请求审计为 `cancelled`，不会留下过时的 `allowed-once`
 - 审批审计对（approval/asked + approval/decided）由 dsh 审批服务持久化，插件只追加自己的决策日志
 - `danger-full-access` 模式下沙箱不拒绝任何操作，审批请求不会发生，插件自然空闲

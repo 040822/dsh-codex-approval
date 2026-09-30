@@ -187,10 +187,17 @@ export function decideAuthorization(verdict, tolerance) {
  *   call so the provider can optimize prompt caching (e.g. OpenCode Go's
  *   `x-opencode-session` header).
  * @returns { ok: true, verdict, judgeModel?, judgeFallbackFrom?, judgeAttempts? }
- *   | { ok: false, error, finishKind?, failure?, judgeAttempts?, judgeTried? }
+ *   | { ok: false, error, finishKind?, failure?, rawText?, textChars?,
+ *       endedWithoutFinish?, judgeAttempts?, judgeTried? }
  *   The `judge*` fields are present only when the runner used a fallback chain
  *   (see makeLlmRunner): they name the model that answered and how many
  *   candidates were tried, so the audit log shows a degraded judge.
+ *
+ *   An unusable reply is a failure, never a verdict: `parseVerdict` returning
+ *   null is reported as `unparseable judge output (empty reply)` for an empty
+ *   stream and `(no verdict)` when text arrived without a verdict object. The
+ *   runner (the chain) already applies that rule per candidate, so this branch
+ *   is the guard for a runner that answers with raw model text.
  */
 export async function judgeWith({ runner, input, signal, allowAsk = true, sessionId }) {
 	const messages = buildJudgeMessages(input, { allowAsk });
@@ -206,16 +213,24 @@ export async function judgeWith({ runner, input, signal, allowAsk = true, sessio
 			error: result?.error ?? "judge runner failed",
 			...result?.finishKind === undefined ? {} : { finishKind: result.finishKind },
 			...result?.failure === undefined ? {} : { failure: result.failure },
+			...result?.rawText === undefined ? {} : { rawText: result.rawText },
+			...result?.textChars === undefined ? {} : { textChars: result.textChars },
+			...result?.endedWithoutFinish === undefined ? {} : { endedWithoutFinish: result.endedWithoutFinish },
 			...result?.judgeAttempts === undefined ? {} : { judgeAttempts: result.judgeAttempts },
 			...result?.judgeTried === undefined ? {} : { judgeTried: result.judgeTried }
 		};
 	}
-	const verdict = parseVerdict(result.text);
+	const text = typeof result.text === "string" ? result.text : "";
+	const verdict = parseVerdict(text);
 	if (verdict === null) {
 		return {
 			ok: false,
-			error: "unparseable judge output",
-			rawText: redactSensitive(result.text).slice(0, 500),
+			error: text.trim() === ""
+				? "unparseable judge output (empty reply)"
+				: "unparseable judge output (no verdict)",
+			rawText: redactSensitive(text).slice(0, 500),
+			textChars: text.length,
+			...result.endedWithoutFinish === undefined ? {} : { endedWithoutFinish: result.endedWithoutFinish },
 			...result.judgeModel === undefined ? {} : { judgeModel: result.judgeModel }
 		};
 	}

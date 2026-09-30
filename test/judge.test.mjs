@@ -128,7 +128,46 @@ test("judgeWith: unparseable output fails with ok:false", async () => {
 	const runner = async () => ({ ok: true, text: "I refuse to answer" });
 	const result = await judgeWith({ runner, input: { toolName: "bash", argsText: "ls", reason: "" } });
 	assert.equal(result.ok, false);
-	assert.equal(result.error, "unparseable judge output");
+	assert.equal(result.error, "unparseable judge output (no verdict)");
+	assert.equal(result.rawText, "I refuse to answer");
+	assert.equal(result.textChars, "I refuse to answer".length);
+});
+
+test("judgeWith: an empty reply fails as an empty reply, not as a bare parse error", async () => {
+	const runner = async () => ({ ok: true, text: "" });
+	const result = await judgeWith({ runner, input: { toolName: "bash", argsText: "ls", reason: "" } });
+	assert.equal(result.ok, false);
+	assert.equal(result.error, "unparseable judge output (empty reply)");
+	assert.equal(result.rawText, "");
+	assert.equal(result.textChars, 0);
+});
+
+test("judgeWith: a whitespace-only reply is an empty reply too", async () => {
+	const runner = async () => ({ ok: true, text: " \n " });
+	const result = await judgeWith({ runner, input: { toolName: "bash", argsText: "ls", reason: "" } });
+	assert.equal(result.ok, false);
+	assert.equal(result.error, "unparseable judge output (empty reply)");
+	assert.equal(result.textChars, 3);
+});
+
+test("judgeWith: candidate diagnostics are carried through the failure path", async () => {
+	const runner = async () => ({
+		ok: false,
+		error: "unparseable judge output (empty reply)",
+		rawText: "",
+		textChars: 0,
+		endedWithoutFinish: true,
+		judgeAttempts: 2,
+		judgeTried: ["a/b", "c/d"]
+	});
+	const result = await judgeWith({ runner, input: { toolName: "bash", argsText: "ls", reason: "" } });
+	assert.equal(result.ok, false);
+	assert.equal(result.error, "unparseable judge output (empty reply)");
+	assert.equal(result.rawText, "");
+	assert.equal(result.textChars, 0);
+	assert.equal(result.endedWithoutFinish, true);
+	assert.equal(result.judgeAttempts, 2);
+	assert.deepEqual(result.judgeTried, ["a/b", "c/d"]);
 });
 
 test("buildJudgeMessages: allowAsk=false forbids ask in the prompt", () => {

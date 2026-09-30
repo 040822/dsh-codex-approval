@@ -35,6 +35,35 @@ async function run(handler, req) {
 	return { outcome, nextCalls };
 }
 
+/** A reply that parses into a verdict — the only shape the judge chain accepts. */
+const VERDICT_TEXT = '{"risk":"low","authorization":"allow","reason":"read-only"}';
+
+/**
+ * A stub `ctx.llm` answering per `provider/model`, recording every call.
+ * `{ text }` streams that text and a normal `finish`; `{ text, noFinish: true }`
+ * ends the stream without any finish chunk (an AbortSignal cutoff or a dropped
+ * connection); `{ error }` reports a provider failure.
+ */
+function makeStubLlm(answerByModel, calls = []) {
+	return {
+		async prepareCall(config) {
+			calls.push(config);
+			const answer = answerByModel[`${config.provider}/${config.model}`] ?? {};
+			return {
+				config,
+				stream: async function* () {
+					if (answer.error !== undefined) {
+						yield { type: "finish", reason: { kind: "error", failure: answer.error } };
+						return;
+					}
+					yield { type: "text-delta", text: answer.text ?? "" };
+					if (answer.noFinish !== true) yield { type: "finish", reason: { kind: "stop" } };
+				}
+			};
+		}
+	};
+}
+
 test("normalizeConfig: defaults are valid and complete", () => {
 	const cfg = normalizeConfig({});
 	assert.equal(cfg.enabled, true);
@@ -124,7 +153,7 @@ test("makeLlmRunner: sends the prepared config and messages to the DSH LLM API",
 				stream: async function* ({ messages, signal }) {
 					assert.equal(messages[0].content[0].text, "judge");
 					assert.ok(signal instanceof AbortSignal);
-					yield { type: "text-delta", text: "{\"risk\":\"low\"}" };
+					yield { type: "text-delta", text: VERDICT_TEXT };
 					yield { type: "finish", reason: { kind: "stop" } };
 				}
 			};
@@ -133,7 +162,9 @@ test("makeLlmRunner: sends the prepared config and messages to the DSH LLM API",
 	const runner = makeLlmRunner(llm, { provider: "p", model: "m", timeoutMs: 1000, maxTokens: 7 });
 	const result = await runner([{ role: "user", content: [{ type: "text", text: "judge" }] }]);
 	assert.equal(result.ok, true);
-	assert.equal(result.text, "{\"risk\":\"low\"}");
+	assert.equal(result.text, VERDICT_TEXT);
+	assert.equal(result.textChars, VERDICT_TEXT.length);
+	assert.equal(result.endedWithoutFinish, undefined);
 	assert.equal(calls.length, 1);
 	assert.deepEqual(calls[0].config, { provider: "p", model: "m", temperature: 0, maxTokens: 7 });
 	assert.ok(calls[0].signal instanceof AbortSignal);
@@ -1297,3 +1328,122 @@ test("makeModeStore: 未确认写入在四种并发情形下都不丢保护", as
 	d.syncOverrides({});
 	assert.equal(d.snapshot()["D"], undefined, "已确认持久化后，远端删除要生效");
 });
+
+// --- regression: an empty judge reply is never a successful attempt ---------
+// Absence of a parseable verdict means "this candidate did not answer", so the
+// chain must spend the next candidate instead of ending on an empty string.
+
+test("handler: an empty primary reply falls through to the fallback candidate", async () => {
+	const calls = [];
+	const llm = makeStubLlm({
+		"cpa-wx301/judge-model": { text: "" },
+		"deepseek-official/deepseek-flash": { text: VERDICT_TEXT }
+	}, calls);
+	const cfg = baseConfig({
+		rules: [],
+		ai: {
+			provider: "cpa-wx301",
+			model: "judge-model",
+			fallbacks: [{ provider: "deepseek-official", model: "deepseek-flash" }]
+		}
+	});
+	const entries = [];
+	const handler = createHandler({
+		config: cfg,
+		record: async (entry) => entries.push(entry),
+		llmRunner: makeLlmRunner(llm, () => cfg.ai)
+	});
+	const { outcome, nextCalls } = await run(handler, makeReq({ command: "something" }));
+	// The fallback's verdict (low risk + allow) decided the request — not failOpen.
+	assert.equal(outcome, "allowed-once");
+	assert.equal(nextCalls.length, 0);
+	assert.equal(entries[0].kind, "ai");
+	assert.equal(entries[0].judgeAttempts, 2);
+	assert.equal(entries[0].judgeFallbackFrom, "cpa-wx301/judge-model");
+	assert.equal(entries[0].judgeModel, "deepseek-official/deepseek-flash");
+	assert.deepEqual(calls.map((call) => `${call.provider}/${call.model}`), [
+		"cpa-wx301/judge-model",
+		"deepseek-official/deepseek-flash"
+	]);
+});
+
+test("handler: every candidate replying empty is one ai-error listing every candidate tried", async () => {
+	const llm = makeStubLlm({
+		"cpa-wx301/judge-model": { text: "" },
+		"deepseek-official/deepseek-flash": { text: "  \n " }
+	});
+	const cfg = baseConfig({
+		rules: [],
+		ai: {
+			provider: "cpa-wx301",
+			model: "judge-model",
+			fallbacks: [{ provider: "deepseek-official", model: "deepseek-flash" }],
+			failOpen: "deny"
+		}
+	});
+	const entries = [];
+	const handler = createHandler({
+		config: cfg,
+		record: async (entry) => entries.push(entry),
+		llmRunner: makeLlmRunner(llm, () => cfg.ai)
+	});
+	const { outcome, nextCalls } = await run(handler, makeReq({ command: "something" }));
+	assert.equal(outcome, "rejected");
+	assert.equal(nextCalls.length, 0);
+	assert.equal(entries[0].kind, "ai-error");
+	assert.equal(entries[0].error, "unparseable judge output (empty reply)");
+	assert.equal(entries[0].rawOutput, "");
+	assert.equal(entries[0].textChars, 0);
+	assert.notEqual(entries[0].endedWithoutFinish, true);
+	assert.equal(entries[0].judgeAttempts, 2);
+	assert.deepEqual(entries[0].judgeTried, [
+		"cpa-wx301/judge-model",
+		"deepseek-official/deepseek-flash"
+	]);
+});
+
+test("handler: a stream that ends without a finish chunk is flagged in the audit entry", async () => {
+	const llm = makeStubLlm({
+		"cpa-wx301/judge-model": { text: "", noFinish: true },
+		"deepseek-official/deepseek-flash": { text: "" }
+	});
+	const cfg = baseConfig({
+		rules: [],
+		ai: {
+			provider: "cpa-wx301",
+			model: "judge-model",
+			fallbacks: [{ provider: "deepseek-official", model: "deepseek-flash" }],
+			failOpen: "ask"
+		}
+	});
+	const entries = [];
+	const handler = createHandler({
+		config: cfg,
+		record: async (entry) => entries.push(entry),
+		llmRunner: makeLlmRunner(llm, () => cfg.ai)
+	});
+	const { outcome } = await run(handler, makeReq({ command: "something" }));
+	assert.equal(outcome, "unavailable");
+	assert.equal(entries[0].kind, "ai-error");
+	assert.equal(entries[0].error, "unparseable judge output (empty reply)");
+	assert.equal(entries[0].endedWithoutFinish, true);
+	assert.equal(entries[0].textChars, 0);
+});
+
+test("handler: text without a verdict is audited as no-verdict, with the original text kept", async () => {
+	const llm = makeStubLlm({ "cpa-wx301/judge-model": { text: 'I checked it: {"note":"fine"}' } });
+	const cfg = baseConfig({ rules: [], ai: { provider: "cpa-wx301", model: "judge-model", fallbacks: [], failOpen: "ask" } });
+	const entries = [];
+	const handler = createHandler({
+		config: cfg,
+		record: async (entry) => entries.push(entry),
+		llmRunner: makeLlmRunner(llm, () => cfg.ai)
+	});
+	const { outcome } = await run(handler, makeReq({ command: "something" }));
+	assert.equal(outcome, "unavailable");
+	assert.equal(entries[0].kind, "ai-error");
+	assert.equal(entries[0].error, "unparseable judge output (no verdict)");
+	assert.equal(entries[0].rawOutput, 'I checked it: {"note":"fine"}');
+	assert.equal(entries[0].textChars, 'I checked it: {"note":"fine"}'.length);
+});
+
