@@ -42,6 +42,8 @@ Client：
 - 修复 `slot entry crashed in settings.plugin.item`：显式声明点号服务 `remote.session`，并在自己的 fiber 上解析 `modelCatalog()`
 - 可复现的客户端 bundle 构建（`scripts/build-client.mjs`）
 
+> **版本号说明**：这次开发期 `package.json` 曾被写成 `0.5.4`（提交 `cd2b8d6` 的标题也照此记录）。发布时以维护者决定的 tag 为准，下一个提交把清单改回 `0.4.2`——所以这个提交的标题里的 `0.5.4` 是开发期编号，不是漏发的版本。本页一律以 tag 与 `package.json` 为准。
+
 ## v0.4.1 — 2026-09-08
 
 **修复：客户端 bundle 按 loader factory 形式构建。**
