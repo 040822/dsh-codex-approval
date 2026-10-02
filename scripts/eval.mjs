@@ -35,6 +35,8 @@ import { buildJudgeMessages, decidePolicy, parseVerdict } from "../judge.js";
 import { createHandler, normalizeConfig } from "../index.js";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+/** Distinguishes live reports by transcript mode, so two runs do not overwrite. */
+let liveSuffix = "";
 const CALL_ID = "eval-call";
 const SESSION_ID = "eval-session";
 
@@ -200,14 +202,25 @@ export function renderReport({ mode, meta, lines, table }) {
 function writeReport(mode, text) {
 	const dir = join(ROOT, "eval", "reports");
 	mkdirSync(dir, { recursive: true });
-	const file = join(dir, `${new Date().toISOString().slice(0, 10)}-${mode}.md`);
+	const suffix = mode === "live" ? (liveSuffix === "" ? "" : `-${liveSuffix}`) : "";
+	const file = join(dir, `${new Date().toISOString().slice(0, 10)}-${mode}${suffix}.md`);
 	writeFileSync(file, text);
 	return file;
 }
 
+/**
+ * Render a case's `userTurns` the way the plugin's compact transcript does
+ * (`[U] …`), so a live run can be measured with the same evidence a real
+ * approval would carry — or without it, which is the shipped default.
+ */
+export function contextForCase(c) {
+	const turns = Array.isArray(c.userTurns) ? c.userTurns.filter((t) => typeof t === "string" && t.trim() !== "") : [];
+	return turns.length === 0 ? undefined : turns.map((turn) => `[U] ${turn}`).join("\n");
+}
+
 /** One live judge call against an OpenAI-compatible endpoint. */
-async function callModel({ base, key, model, toolName, argsText, reason }, timeoutMs = 30_000) {
-	const messages = buildJudgeMessages({ toolName, argsText, reason, cwd: "/ws" });
+async function callModel({ base, key, model, toolName, argsText, reason, context }, timeoutMs = 30_000) {
+	const messages = buildJudgeMessages({ toolName, argsText, reason, cwd: "/ws", context });
 	const started = Date.now();
 	const response = await fetch(`${base.replace(/\/$/, "")}/chat/completions`, {
 		method: "POST",
@@ -224,7 +237,7 @@ async function callModel({ base, key, model, toolName, argsText, reason }, timeo
 	return { text, decidedMs: Date.now() - started, usage: body?.usage };
 }
 
-async function runLive({ base, key, model, repeat }) {
+async function runLive({ base, key, model, repeat, withTranscript }) {
 	const cases = readCases(join(ROOT, "eval", "cases", "model.jsonl"));
 	const rows = [];
 	for (const c of cases) {
@@ -234,8 +247,27 @@ async function runLive({ base, key, model, repeat }) {
 			let outcome = "judge-error";
 			let decidedMs;
 			let verdict;
+			let retried = false;
 			try {
-				const answer = await callModel({ base, key, model, toolName, argsText, reason: c.reason ?? "" });
+				// One retry: an upstream timeout is noise, not a measurement.
+				let answer;
+				for (let attempt = 0; attempt < 2; attempt += 1) {
+					try {
+						answer = await callModel({
+							base,
+							key,
+							model,
+							toolName,
+							argsText,
+							reason: c.reason ?? "",
+							context: withTranscript ? contextForCase(c) : undefined
+						});
+						break;
+					} catch (error) {
+						if (attempt === 1) throw error;
+						retried = true;
+					}
+				}
 				decidedMs = answer.decidedMs;
 				verdict = parseVerdict(answer.text);
 				if (verdict !== null) {
@@ -260,7 +292,8 @@ async function runLive({ base, key, model, repeat }) {
 				judgeAuthorization: verdict?.authorization,
 				userAuthorization: verdict?.userAuthorization,
 				outcome,
-				decidedMs
+				decidedMs,
+				...(retried ? { retried: true } : {})
 			});
 		}
 	}
@@ -275,10 +308,16 @@ async function runLive({ base, key, model, repeat }) {
 		`| p95 判定耗时 | ${metrics.p95Ms ?? "n/a"} ms |`,
 		`| 同案例结论不一致 | ${metrics.contradictory.length === 0 ? "无" : metrics.contradictory.join(", ")} |`
 	];
-	const details = rows.map((r) => `| ${r.id} | ${r.round} | ${r.risk ?? "-"} | ${r.judgeAuthorization ?? "-"} | ${r.userAuthorization ?? "-"} | ${r.outcome} | ${r.expected} |`);
+	const details = rows.map((r) => `| ${r.id} | ${r.round} | ${r.risk ?? "-"} | ${r.judgeAuthorization ?? "-"} | ${r.userAuthorization ?? "-"} | ${r.outcome}${r.retried === true ? "（重试过一次）" : ""} | ${r.expected} |`);
 	const text = renderReport({
 		mode: "live",
-		meta: [`模型：${model}`, `端点：${base}`, `重复：${repeat}`, "真值来自 eval/cases/model.jsonl（人工标注）"],
+		meta: [
+			`模型：${model}`,
+			`端点：${base}`,
+			`重复：${repeat}`,
+			`会话骨架：${withTranscript ? "on（案例的 userTurns 渲染成 [U] 行，等价 transcript: short）" : "off（出厂默认：模型看不到用户消息）"}`,
+			"真值来自 eval/cases/model.jsonl（人工标注）"
+		],
 		lines: ["## 汇总", "", ...table, "", "## 逐条", "", "| 案例 | 轮次 | risk | judge 意见 | 用户授权 | 结果 | 真值 |", "|---|---|---|---|---|---|---|", ...details],
 		table: []
 	});
@@ -343,7 +382,8 @@ async function main() {
 			process.exitCode = 2;
 			return;
 		}
-		const { metrics, file } = await runLive({ base, key, model, repeat });
+		liveSuffix = flag("--transcript") ? "transcript" : "no-transcript";
+		const { metrics, file } = await runLive({ base, key, model, repeat, withTranscript: flag("--transcript") });
 		console.log(`live: 危险放行 ${metrics.dangerousAllow}/${metrics.total}，误拒 ${metrics.needlessDeny}/${metrics.total} → ${file}`);
 		return;
 	}
@@ -351,7 +391,7 @@ async function main() {
 	console.log(`用法：
   node scripts/eval.mjs --policy                              离线策略回归（免费，CI 用）
   node scripts/eval.mjs --replay [~/.dsh/logs/approval.jsonl] 用真实判定记录回放当前策略
-  node scripts/eval.mjs --live --model <id> [--repeat N]      真实模型评测（需 EVAL_BASE_URL / EVAL_API_KEY）`);
+  node scripts/eval.mjs --live --model <id> [--repeat N] [--transcript]  真实模型评测（需 EVAL_BASE_URL / EVAL_API_KEY）`);
 }
 
 // Only run the CLI when this file IS the command; importing it (tests, other
