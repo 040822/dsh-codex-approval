@@ -1,5 +1,7 @@
 # dsh-codex-approval
 
+![dsh-codex-approval 鲸鱼娘宣传图：少点审批弹窗，让 Agent 连续工作](docs/dsh-codex-approval-banner.png)
+
 **少点审批弹窗，让 Agent 连续工作。**
 
 为 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（DSH）提供自动审批。常见操作自动处理，其余请求交给 AI 判断，需要你决定时再来问你。
