@@ -94,7 +94,8 @@ const NOTICE = {
 		failure: (kind, failure) => `评审调用失败：${kind ?? "unknown"}${failure?.code !== undefined ? `（${failure.code}）` : ""}${failure?.message !== undefined ? `：${failure.message}` : ""}`,
 		rationale: (text) => `评审理由：${text}`,
 		rationaleMissing: "未提供评审理由。",
-		directive: "不要通过变通手段或间接执行绕开该操作；请改用实质更安全的替代方案，或停下来询问用户。"
+		directive: "不要通过变通手段或间接执行绕开该操作；请改用实质更安全的替代方案，或停下来询问用户。",
+		restructure: "这个操作**不是不能做**，而是**这样提交无法审查**：请拆成若干条可验证的步骤重新提交——把下载与执行分开、把要执行的逻辑写进脚本文件并把脚本交给审查、把删除或清理的范围写到具体路径。重新提交的必须是实质更小、更容易验证的方案，不是同一条命令的改写。"
 	},
 	en: {
 		deniedByReviewer: (cmd) => `[auto-review] The previous action ${cmd} was denied by the automatic approval reviewer — this was NOT a user rejection.`,
@@ -104,7 +105,8 @@ const NOTICE = {
 		failure: (kind, failure) => `Review call failed: ${kind ?? "unknown"}${failure?.code !== undefined ? ` (${failure.code})` : ""}${failure?.message !== undefined ? `: ${failure.message}` : ""}`,
 		rationale: (text) => `Review rationale: ${text}`,
 		rationaleMissing: "No rationale was provided.",
-		directive: "Do not pursue this action via workaround or indirect execution. Continue with a materially safer alternative, or stop and ask the user."
+		directive: "Do not pursue this action via workaround or indirect execution. Continue with a materially safer alternative, or stop and ask the user.",
+		restructure: "This action is not forbidden — it cannot be REVIEWED as submitted. Re-submit it as separate verifiable steps: split fetching from executing, put the logic to run into a script file and hand the script over, and name the exact paths you intend to remove or clean. The re-submission must be materially smaller and easier to verify, not a rewording of the same command."
 	}
 };
 
@@ -142,7 +144,8 @@ function renderNoticeOne(record, t, locale) {
 export function renderDenialNotice(queue, locale) {
 	const t = NOTICE[locale] ?? NOTICE.en;
 	const body = queue.map((record) => renderNoticeOne(record, t, locale)).join("\n\n");
-	return `${body}\n${t.directive}`;
+	const directive = queue.some((record) => record.feedbackKind === "restructure") ? t.restructure : t.directive;
+	return `${body}\n${directive}`;
 }
 
 /**

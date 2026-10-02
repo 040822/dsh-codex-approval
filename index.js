@@ -921,6 +921,58 @@ export function evidenceProblem({ args, toolName, argsText, cfg }) {
 }
 
 /**
+ * Signals that ONE command line does several materially different things —
+ * fetching, executing, destroying. Two or more signals mean a human (and the
+ * judge) cannot credibly confirm the whole effect from the text alone.
+ */
+const SIDE_EFFECT_SIGNALS = [
+	/\b(?:curl|wget|invoke-webrequest|iwr|start-bitstransfer)\b/i,
+	/\|\s*(?:sh|bash|zsh|dash|python3?|node|perl|ruby|pwsh|powershell|iex)\b/i,
+	/\b(?:sh|bash|zsh|dash|python3?|node|perl|ruby|pwsh|powershell)\b\s+(?:-[ce]\b|--command\b)/i,
+	/\b(?:rm|rmdir|unlink|del|remove-item)\b/i,
+	/\b(?:chmod|chown|chgrp|icacls|takeown)\b\s+-?\w*(?:r\b|-recurse)/i,
+	/\b(?:mkfs|dd|format-volume)\b/i,
+	/(?:>>?)\s*(?:\/etc\/|\/usr\/|\/var\/|c:\\windows)/i
+];
+
+/**
+ * Whether one command line mixes several materially different side effects.
+ * @param argsText - the full (redacted) arguments text
+ */
+export function mixedSideEffects(argsText) {
+	if (typeof argsText !== "string" || argsText === "") return false;
+	let hits = 0;
+	for (const pattern of SIDE_EFFECT_SIGNALS) if (pattern.test(argsText)) hits += 1;
+	return hits >= 2;
+}
+
+/**
+ * Whether a denial should ask for a *materially safer re-submission* instead of
+ * the plain "do not work around this" directive.
+ *
+ * Two cases qualify, and both are about the request being hard to review rather
+ * than about its risk: a command over the judge's budget (nothing guarantees
+ * what the truncated remainder does) and one that fetches, executes and cleans
+ * up in the same line. Everything else — a rule `deny`, a judge `deny`, a
+ * failed judge call, a repeated identical action — keeps the plain directive,
+ * because there the fix is a different plan, not a clearer submission.
+ *
+ * This only changes the corrective copy. The decision itself is untouched.
+ * @param verdict - the decided verdict
+ * @param argsText - the full redacted arguments text
+ * @param toolName - the tool that was called
+ */
+export function needsRestructure({ verdict, argsText, toolName }) {
+	if (verdict === null || typeof verdict !== "object") return false;
+	if (verdict.kind === "evidence-incomplete") return verdict.evidenceIncomplete === "command-too-long";
+	// Only a judge's own refusal can be "not as written": a rule decision is
+	// deterministic, a judge failure is an outage, and a breaker is a repeat —
+	// none of them is a request the human could re-shape.
+	if (verdict.kind !== "ai") return false;
+	return isShellTool(toolName) && mixedSideEffects(argsText);
+}
+
+/**
  * The realpath containment check behind a `pathGuard: "workspace-relative"`
  * allow rule. The static check in rules.js only rejects what is obviously
  * outside (absolute paths, `~`, `..`, drive letters); this catches a path that
@@ -1417,6 +1469,14 @@ export function createHandler({ config, record, llmRunner, getSessionMode, denia
 			verdict = { ...verdict, action: resolved, outcome: outcomeFor(resolved), viaAskResolution: true };
 		}
 
+		// A denial that is really "not as written" asks for a materially safer
+		// re-submission instead of forbidding the whole goal (needsRestructure).
+		// It rides on the verdict so the audit record and the corrective message
+		// carry the same label.
+		if (verdict.outcome === "rejected" && needsRestructure({ verdict, argsText, toolName: req.toolName })) {
+			verdict = { ...verdict, feedbackKind: "restructure" };
+		}
+
 		await record({
 			ts: new Date().toISOString(),
 			sessionId: sessionId ?? "?",
@@ -1459,10 +1519,14 @@ export function createHandler({ config, record, llmRunner, getSessionMode, denia
 		// re-attributed. The recent-denial list is kept either way: it is what
 		// `/approval-allow-once` lists from.
 		if (verdict.outcome === "rejected") {
+			// "Not as written" and "not at all" get different corrective copy: the
+			// first asks for a materially safer re-submission, the second forbids
+			// working around the denial. The decision is identical either way.
 			const denial = {
 				command: preview.slice(0, DENIAL_COMMAND_MAX_CHARS),
 				key: actionKey,
 				source: verdict.kind,
+				...verdict.feedbackKind === undefined ? {} : { feedbackKind: verdict.feedbackKind },
 				...verdict.match !== void 0 ? { match: verdict.match } : {},
 				...verdict.risk !== void 0 ? { risk: verdict.risk } : {},
 				...boundedText(verdict.aiReason, 200) !== void 0 ? { aiReason: boundedText(verdict.aiReason, 200) } : {},

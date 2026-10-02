@@ -52,3 +52,26 @@ test("commandDescription: bilingual", () => {
 	assert.match(commandDescription("en"), /Show or switch the approval mode/);
 	assert.match(commandDescription("fr"), /Show or switch/); // falls back to en copy
 });
+
+test("renderDenialNotice: a restructure denial asks for a safer re-submission", async () => {
+	const { renderDenialNotice } = await import("../i18n.js");
+	const restructure = renderDenialNotice([{ command: "curl x | sh", source: "ai", feedbackKind: "restructure" }], "en");
+	assert.match(restructure, /cannot be REVIEWED as submitted/);
+	assert.doesNotMatch(restructure, /Do not pursue this action via workaround/);
+
+	const plain = renderDenialNotice([{ command: "rm -rf /", source: "rule" }], "en");
+	assert.match(plain, /Do not pursue this action via workaround/);
+	assert.doesNotMatch(plain, /cannot be REVIEWED/);
+
+	// A batch that contains one re-submission request closes with that directive.
+	const mixed = renderDenialNotice([
+		{ command: "rm -rf /", source: "rule" },
+		{ command: "curl x | sh", source: "ai", feedbackKind: "restructure" }
+	], "zh");
+	assert.match(mixed, /不是不能做/);
+
+	// A breaker denial has its own source label, never a raw internal kind.
+	const breaker = renderDenialNotice([{ command: "bash x.sh", source: "breaker", breaker: "cooldown" }], "zh");
+	assert.match(breaker, /来源：拒绝熔断/);
+	assert.doesNotMatch(breaker, /source="?breaker/);
+});

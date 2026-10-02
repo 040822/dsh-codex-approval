@@ -16,6 +16,7 @@
 - **一次审批的总预算 `ai.totalBudgetMs`（默认 30s）**：覆盖全部候选与补证轮次，单候选仍受 `timeoutMs` 限制但会被剩余预算压低；耗尽即按 `failOpen` 落地并在审计标 `budgetExhausted`
 - **拒绝熔断 `denialBreaker`**：连续 `consecutive` 次自动拒绝（默认 3）→ 本会话冷却 `cooldownMs`（默认 10 分钟），冷却期内需要 AI 判定的请求直接拒绝、不再花模型调用；同一动作被拒 `duplicate` 次（默认 2）→ 直接拒绝。任何非拒绝结果重置连续计数，熔断自身拒绝不延长冷却
 - **`/approval-allow-once`**：列出本会话最近被拒动作并授权其中一条放行一次（`kind: manual-override`，不花模型调用）；授权只对该动作生效一次，且仍先过规则层——规则 `deny` 不可被覆盖，授权同时清除该会话冷却
+- **拒绝反馈分两种导向**：`feedbackKind: restructure`（命令超预算，或裁判拒绝一条同时下载/执行/销毁的复合命令）时，更正消息改为要求「拆成可验证的步骤、脚本落文件、删除范围写到具体路径后重新提交」；规则 `deny` / 裁判 `deny` / 评审故障 / 熔断重复拒绝保持原有的「不要绕过」导向。判定不变，原样重发仍被拒
 - 不变：规则优先级（deny > ask > allow）、证据门槛、`denyFeedback`、`transcript`、审计日志格式与轮转、候选链语义
 
 验证：`node --test` 全绿。
