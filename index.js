@@ -338,6 +338,9 @@ export const DEFAULT_CONFIG = {
 
 const ACTIONS = ["allow", "ask", "deny"];
 const TOLERANCES = ["low", "medium", "high"];
+/** Extra wall-clock allowed past a candidate's own timeout before we stop waiting. */
+const HARD_TIMEOUT_GRACE_MS = 250;
+
 /** Evidence-fetch modes: single-round judge, or one bounded read round. */
 const EVIDENCE_FETCH = ["off", "read-file"];
 /** Upper bound on the ordered judge-fallback chain (the primary is not counted). */
@@ -553,6 +556,15 @@ function assertConfig(cfg) {
 	for (const rule of cfg.rules) {
 		if (rule === null || typeof rule !== "object") throw new TypeError("dsh-codex-approval: each rule must be an object");
 		if (!ACTIONS.includes(rule.action)) throw new TypeError(`dsh-codex-approval: rule action must be one of ${ACTIONS.join("/")}`);
+		// `hardAsk` means "this ask needs the human, and an unattended mode may not
+		// resolve it away". On an allow rule the marker would be silently ignored —
+		// and it would read as "a human confirmed this", the opposite of its
+		// meaning. Checked here so it covers BOTH rule shapes (structured
+		// `tool`/`pattern` rules return early below).
+		if (rule.hardAsk !== void 0 && typeof rule.hardAsk !== "boolean") throw new TypeError("dsh-codex-approval: rule.hardAsk must be a boolean");
+		if (rule.hardAsk === true && rule.action !== "ask") {
+			throw new TypeError("dsh-codex-approval: rule.hardAsk is only meaningful on an ask rule");
+		}
 		if (Array.isArray(rule.pattern) || typeof rule.tool === "string") {
 			// structured argv-prefix rule (Codex `prefix_rule` style)
 			if (typeof rule.tool !== "string" || rule.tool === "") throw new TypeError("dsh-codex-approval: a structured rule needs a non-empty tool");
@@ -569,13 +581,6 @@ function assertConfig(cfg) {
 				throw new TypeError("dsh-codex-approval: rule.configGuard must be \"git-clean\"");
 			}
 			continue;
-		}
-		if (rule.hardAsk !== void 0 && typeof rule.hardAsk !== "boolean") throw new TypeError("dsh-codex-approval: rule.hardAsk must be a boolean");
-		// `hardAsk` means "this ask needs the human, and an unattended mode may not
-		// resolve it away". On an allow rule the marker would be silently ignored —
-		// and it would read as "a human confirmed this", the opposite of its meaning.
-		if (rule.hardAsk === true && rule.action !== "ask") {
-			throw new TypeError("dsh-codex-approval: rule.hardAsk is only meaningful on an ask rule");
 		}
 		if (typeof rule.match !== "string" || rule.match === "") throw new TypeError("dsh-codex-approval: each rule needs a non-empty match");
 	}
@@ -774,6 +779,7 @@ function formatFailureError(kind, failure) {
 async function attemptJudge(llm, candidate, { messages, signal, sessionId, timeoutMs, maxTokens }) {
 	const timeoutSignal = AbortSignal.timeout(timeoutMs);
 	const combined = signal !== undefined ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
+	const run = (async () => {
 	try {
 		const prepared = await llm.prepareCall({ provider: candidate.provider, model: candidate.model, temperature: 0, maxTokens }, combined);
 		let text = "";
@@ -807,6 +813,27 @@ async function attemptJudge(llm, candidate, { messages, signal, sessionId, timeo
 	} catch (error) {
 		const message = boundedText(error?.message ?? String(error), FAILURE_MESSAGE_MAX_CHARS) ?? "LLM judge failed";
 		return { ok: false, error: message };
+	}
+	})();
+	// The abort signal only stops an adapter that honours it. A stream that ignores
+	// it would park the approval forever, so the attempt also races its own timer
+	// (with a small grace, so a normal abort wins the race and keeps its report).
+	let timer;
+	try {
+		return await Promise.race([
+			run,
+			new Promise((resolve) => {
+				timer = setTimeout(() => resolve({
+					ok: false,
+					error: `judge attempt did not finish within ${timeoutMs}ms`,
+					finishKind: "timeout",
+					hardTimeout: true
+				}), timeoutMs + HARD_TIMEOUT_GRACE_MS);
+				timer.unref?.();
+			})
+		]);
+	} finally {
+		clearTimeout(timer);
 	}
 }
 
@@ -1146,10 +1173,14 @@ export function actionKeyOf(toolName, argsText, facts) {
 	// The execution facts are part of the action's identity, not decoration: the
 	// same command in another directory, or under a wider sandbox mode, is a
 	// different action, and a human who approved one did not approve the other.
+	// Encoded as a JSON tuple, not spliced with a separator: a `workdir` value may
+	// itself contain whatever separator we picked, which would let a crafted
+	// directory (or an escalation string) produce the same key as another action
+	// and spend a grant the human gave for something else.
 	const parts = [];
 	if (typeof facts?.workdir === "string" && facts.workdir !== "") parts.push(`wd:${facts.workdir}`);
 	if (typeof facts?.escalationTo === "string" && facts.escalationTo !== "") parts.push(`esc:${facts.escalationTo}`);
-	return createHash("sha1").update(`${toolName}\u0000${parts.join("|")}\u0000${argsText}`).digest("hex").slice(0, 16);
+	return createHash("sha1").update(JSON.stringify([toolName, parts, argsText])).digest("hex").slice(0, 16);
 }
 
 /**

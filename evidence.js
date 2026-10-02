@@ -158,9 +158,10 @@ export async function fetchEvidence(needs, { root, base, maxBytes = 16_384, dead
 	}
 	let rootReal;
 	try {
-		rootReal = await resolvePath(root);
-	} catch {
-		for (const need of needs) refused.push({ path: need.path, reason: REFUSAL.unreadable });
+		rootReal = await withDeadline(resolvePath(root), remaining(), REFUSAL.timeout);
+	} catch (error) {
+		const reason = error?.evidenceReason ?? REFUSAL.unreadable;
+		for (const need of needs) refused.push({ path: need.path, reason });
 		return { files, refused };
 	}
 	const origin = typeof base === "string" && base !== "" ? base : root;
@@ -177,10 +178,12 @@ export async function fetchEvidence(needs, { root, base, maxBytes = 16_384, dead
 		}
 		let targetReal;
 		try {
-			targetReal = await resolvePath(resolve(origin, need.path));
-		} catch {
+			// Resolving and stat-ing can block too (a hung network mount, a slow
+			// symlink chain), so they share the approval's deadline with the read.
+			targetReal = await withDeadline(resolvePath(resolve(origin, need.path)), remaining(), REFUSAL.timeout);
+		} catch (error) {
 			// missing file, permission failure, symlink loop: all "cannot verify"
-			refused.push({ path: need.path, reason: REFUSAL.unreadable });
+			refused.push({ path: need.path, reason: error?.evidenceReason ?? REFUSAL.unreadable });
 			continue;
 		}
 		const rel = relative(rootReal, targetReal);
@@ -196,7 +199,7 @@ export async function fetchEvidence(needs, { root, base, maxBytes = 16_384, dead
 			continue;
 		}
 		try {
-			const info = await statFile(targetReal);
+			const info = await withDeadline(statFile(targetReal), remaining(), REFUSAL.timeout);
 			if (info === null || typeof info !== "object" || typeof info.isFile !== "function" || info.isFile() !== true) {
 				refused.push({ path: need.path, reason: REFUSAL.notAFile });
 				continue;
@@ -205,8 +208,8 @@ export async function fetchEvidence(needs, { root, base, maxBytes = 16_384, dead
 				refused.push({ path: need.path, reason: REFUSAL.tooLarge });
 				continue;
 			}
-		} catch {
-			refused.push({ path: need.path, reason: REFUSAL.unreadable });
+		} catch (error) {
+			refused.push({ path: need.path, reason: error?.evidenceReason ?? REFUSAL.unreadable });
 			continue;
 		}
 		let text;

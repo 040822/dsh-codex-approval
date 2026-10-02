@@ -2556,6 +2556,13 @@ test("normalizeConfig: hardAsk is only meaningful on an ask rule (finding 2)", (
 	assert.throws(() => normalizeConfig({ rules: [{ match: "Bash(git push*)", action: "allow", hardAsk: true }] }), /hardAsk/);
 	assert.throws(() => normalizeConfig({ rules: [{ match: "Bash(x)", action: "deny", hardAsk: true }] }), /hardAsk/);
 	assert.equal(normalizeConfig({ rules: [{ match: "Bash(x)", action: "ask", hardAsk: true }] }).rules[0].hardAsk, true);
+	// The structured `tool`/`pattern` shape returns early in assertConfig, so the
+	// check has to sit above that split — an allow red line was silently ignored
+	// on this path too.
+	assert.throws(() => normalizeConfig({ rules: [{ tool: "bash", pattern: ["git", "push"], action: "allow", hardAsk: true }] }), /hardAsk/);
+	assert.throws(() => normalizeConfig({ rules: [{ tool: "bash", pattern: ["rm", "-rf"], action: "deny", hardAsk: true }] }), /hardAsk/);
+	assert.throws(() => normalizeConfig({ rules: [{ tool: "bash", pattern: ["x"], action: "ask", hardAsk: "yes" }] }), /hardAsk/);
+	assert.equal(normalizeConfig({ rules: [{ tool: "bash", pattern: ["git", "push"], action: "ask", hardAsk: true }] }).rules[0].hardAsk, true);
 	assert.equal(normalizeConfig({ ai: { enforcedAskOnUnattended: "deny" } }).ai.enforcedAskOnUnattended, "deny");
 	assert.throws(() => normalizeConfig({ ai: { enforcedAskOnUnattended: "allow" } }), /enforcedAskOnUnattended/);
 });
@@ -2694,4 +2701,83 @@ test("makeLlmRunner: the budget caps a slow candidate and stops the chain after 
 	assert.equal(result.ok, false);
 	assert.equal(result.budgetExhausted, true);
 	assert.deepEqual(calls.map((c) => c.model), ["slow"], "no candidate may start after the budget is spent");
+});
+
+// ---------- 独立审核（codex, round 6）的闭环缺口回归 ----------
+
+test("actionKeyOf: a crafted workdir cannot collide with another action's key (N1)", async () => {
+	const { actionKeyOf } = await import("../index.js");
+	const crafted = actionKeyOf("bash", "npm run build", { workdir: "/a|esc:danger-full-access" });
+	const escalated = actionKeyOf("bash", "npm run build", { workdir: "/a", escalationTo: "danger-full-access" });
+	assert.notEqual(crafted, escalated, "the separator must not be forgeable from a value");
+	assert.notEqual(crafted, actionKeyOf("bash", "npm run build", { workdir: "/a|esc:danger-full-access|x" }));
+	// An empty fact is the same as an absent one.
+	assert.equal(actionKeyOf("bash", "x", { escalationTo: "a" }), actionKeyOf("bash", "x", { escalationTo: "a", workdir: "" }));
+});
+
+test("handler: a grant for one directory cannot be spent on another (N1)", async () => {
+	const { actionKeyOf } = await import("../index.js");
+	// A human approved the plain call in /ws.
+	const key = actionKeyOf("bash", "bash deploy.sh", { workdir: "" });
+	const cfg = baseConfig({ rules: [], denialBreaker: { consecutive: 0, duplicate: 0, cooldownMs: 0 } });
+	const breakerStore = new Map([["sess-1", { consecutive: 0, cooledUntil: 0, actions: new Map(), oneShot: new Map([[key, 1]]) }]]);
+	const records = [];
+	const handler = createHandler({
+		config: cfg,
+		record: async (entry) => { records.push(entry); },
+		llmRunner: async () => ({ ok: true, text: '{"risk":"high","authorization":"deny","reason":"no"}' }),
+		breakerStore
+	});
+	// The same command, but this call claims a workdir whose text forges a separator.
+	const forged = {
+		toolName: "bash",
+		callId: "forge-1",
+		reason: "",
+		agent: {
+			id: "a",
+			session: {
+				id: "sess-1",
+				snapshotEvents: () => [{ type: "assistant/message", data: { message: { content: [{ type: "tool-call", id: "forge-1", name: "bash", arguments: JSON.stringify({ command: "bash deploy.sh", workdir: "/ws|esc:" }) }] } } }]
+			}
+		}
+	};
+	assert.equal((await run(handler, forged)).outcome, "rejected");
+	assert.equal("manualOverride" in records.at(-1), false);
+});
+
+test("attemptJudge: an adapter that ignores the abort signal cannot park the approval (finding 5)", async () => {
+	const llm = {
+		async prepareCall(config) {
+			return {
+				config,
+				// Never yields and never returns: only the hard timeout can end this.
+				stream: async function* () { await new Promise(() => {}); }
+			};
+		}
+	};
+	const runner = makeLlmRunner(llm, { provider: "p", model: "m", timeoutMs: 40, maxTokens: 7 });
+	const started = Date.now();
+	const result = await runner([]);
+	const elapsed = Date.now() - started;
+	assert.equal(result.ok, false);
+	assert.ok(elapsed < 2000, `the attempt must not wait forever (took ${elapsed}ms)`);
+	assert.match(String(result.error), /did not finish within|timeout|abort/i);
+});
+
+test("fetchEvidence: a hung resolver is bounded by the approval deadline (finding 5)", async () => {
+	const { fetchEvidence } = await import("../evidence.js");
+	const never = () => new Promise(() => {});
+	const started = Date.now();
+	const { files, refused } = await fetchEvidence([{ path: "x.txt", why: "x" }], {
+		root: "/ws",
+		base: "/ws",
+		deadline: Date.now() + 40,
+		resolvePath: (path) => (path === "/ws" ? Promise.resolve("/ws") : never()),
+		readFile: async () => "x",
+		statFile: async () => ({ size: 1, isFile: () => true })
+	});
+	const elapsed = Date.now() - started;
+	assert.deepEqual(files, []);
+	assert.deepEqual(refused, [{ path: "x.txt", reason: "deadline-exceeded" }]);
+	assert.ok(elapsed < 2000, `the resolver must not hang the approval (took ${elapsed}ms)`);
 });
