@@ -320,11 +320,11 @@ export function decidePolicy(verdict, { tolerance = "medium" } = {}) {
  *   runner (the chain) already applies that rule per candidate, so this branch
  *   is the guard for a runner that answers with raw model text.
  */
-export async function judgeWith({ runner, input, signal, allowAsk = true, allowNeeds = true, sessionId }) {
+export async function judgeWith({ runner, input, signal, allowAsk = true, allowNeeds = true, sessionId, deadline }) {
 	const messages = buildJudgeMessages(input, { allowAsk, allowNeeds });
 	let result;
 	try {
-		result = await runner(messages, { signal, sessionId });
+		result = await runner(messages, { signal, sessionId, deadline });
 	} catch (error) {
 		return { ok: false, error: String(error?.message ?? error) };
 	}
@@ -338,7 +338,8 @@ export async function judgeWith({ runner, input, signal, allowAsk = true, allowN
 			...result?.textChars === undefined ? {} : { textChars: result.textChars },
 			...result?.endedWithoutFinish === undefined ? {} : { endedWithoutFinish: result.endedWithoutFinish },
 			...result?.judgeAttempts === undefined ? {} : { judgeAttempts: result.judgeAttempts },
-			...result?.judgeTried === undefined ? {} : { judgeTried: result.judgeTried }
+			...result?.judgeTried === undefined ? {} : { judgeTried: result.judgeTried },
+			...result?.budgetExhausted === undefined ? {} : { budgetExhausted: result.budgetExhausted }
 		};
 	}
 	const text = typeof result.text === "string" ? result.text : "";

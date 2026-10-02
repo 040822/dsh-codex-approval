@@ -61,6 +61,7 @@
 | `fallback` | `ask` | 无规则命中且 AI 关闭时：`ask` \| `deny` \| `allow` |
 | `denyFeedback` | `true` | 拒绝后向主 agent 注入归因更正消息 |
 | `denyFeedbackMax` | `3` | 每会话未注入拒绝队列上限（1–10，超限丢最旧） |
+| `denialBreaker` | `{consecutive:3, duplicate:2, cooldownMs:600000}` | 拒绝熔断（按会话）：连续 `consecutive` 次自动拒绝 → 冷却 `cooldownMs`；同一动作被拒 `duplicate` 次 → 直接拒绝且不再问模型。`0` 关闭对应项 |
 | `transcript` | `off` | `off` \| `short`：AI 审判是否带紧凑会话上下文 |
 | `transcriptMaxChars` | `4000` | 上下文骨架字符上限（100–16000） |
 | `logFile` | `~/.dsh/logs/approval.jsonl` | 决策审计日志路径 |
@@ -81,6 +82,7 @@
 | `maxTokens` | `512` | 判定输出上限（含 reasoning 余量） |
 | `failOpen` | `ask` | AI 层全部候选失败时的兜底：`ask` \| `deny` \| `allow` |
 | `hardAskOnUnattended` | `deny` | **红条**（发布、凭据）在 `ai-auto` 下的归宿：`deny` \| `ask`。红条不经过 `mode3OnAsk`，`allow` 不是合法值 |
+| `totalBudgetMs` | `30000` | **一次审批的总预算**：覆盖全部候选与补证轮次，单候选仍受 `timeoutMs` 限制但会被剩余预算压低（`0` 关闭） |
 | `evidenceFetch` | `read-file` | 裁判按需补证：`off` \| `read-file`（工作区内只读、最多 `evidenceMaxFiles` 个、每个 ≤ `evidenceMaxBytes`；拒凭据文件、二进制与越界路径） |
 | `evidenceMaxFiles` | `2` | 单次审批可读取的证据文件数（1–8） |
 | `evidenceMaxBytes` | `16384` | 单个证据文件的截断长度（256–512000），超长截断并标注 |
@@ -96,6 +98,13 @@
 - **发布**：npm / pnpm / yarn / bun 的 publish、npm unpublish、twine upload、cargo publish、docker push、gh release create、git push 共 10 组命令 → `ask` + `hardAsk: true`。bash 与 pwsh、裸命令与 `cd x && git push` 这类复合写法都命中
 
 `rules: []`（显式空数组）= **真的没有规则**，不再回落默认规则——想让每次审批都交给 AI 判定时用它。
+
+## 拒绝之后：熔断与一次性放行
+
+- **熔断**（`denialBreaker`）：连续被自动拒绝达到 `consecutive` 次，本会话进入冷却（默认 10 分钟）——冷却期内**需要 AI 判定**的请求直接拒绝，不再花钱问模型；规则命中的请求不受影响（只读命令照旧放行，规则 `deny` 照旧拒绝）。同一动作被拒 `duplicate` 次后也被直接拒绝。任何非拒绝结果（放行或交人工）会把连续计数清零；熔断自身的拒绝不会延长冷却。
+- **一次性放行**（`/approval-allow-once`）：`/approval-allow-once` 列出本会话最近被拒的动作（最近在前），`/approval-allow-once 2` 授权第 2 条放行**一次**。授权只对**那一个动作**（同一工具 + 同一命令文本）生效一次，且**仍会先过规则层**——规则 `deny` 不能被授权覆盖；授权同时清除该会话的冷却。授权记录写在内存里，重启后失效。
+
+这两个开关都只影响「要不要为这次判定花钱/要不要直接拒绝」，不会把任何拒绝变成放行依据之外的许可。
 
 ## 模型选型建议
 

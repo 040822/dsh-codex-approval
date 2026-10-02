@@ -67,13 +67,15 @@ const SOURCE_LABELS = {
 		rule: "确定性规则",
 		ai: "AI 评审",
 		"ai-error": "AI 评审故障兜底（failOpen）",
-		fallback: "兜底策略"
+		fallback: "兜底策略",
+		breaker: "拒绝熔断"
 	},
 	en: {
 		rule: "deterministic rule",
 		ai: "AI judge",
 		"ai-error": "AI judge failure fallback (failOpen)",
-		fallback: "fallback policy"
+		fallback: "fallback policy",
+		breaker: "rejection breaker"
 	}
 };
 
@@ -141,4 +143,85 @@ export function renderDenialNotice(queue, locale) {
 	const t = NOTICE[locale] ?? NOTICE.en;
 	const body = queue.map((record) => renderNoticeOne(record, t, locale)).join("\n\n");
 	return `${body}\n${t.directive}`;
+}
+
+/**
+ * `/approval-allow-once` copy: list the recent denials of this session and let
+ * the human approve exactly one of them for a single retry. The grant is a
+ * one-shot consumed by the next identical action, and the rule layer still runs
+ * first — a rule `deny` is never overridden by a human override either.
+ */
+const ALLOW_ONCE = {
+	zh: {
+		listHeader: "最近被自动审批拒绝的动作（最近在前）：",
+		listLine: (index, command, source, time) => `${index}. ${command}（来源：${source}${time === undefined ? "" : `，${time}`}）`,
+		listFooter: "用 /approval-allow-once <编号> 授权其中一条放行一次：仍会先过规则层（规则 deny 不可覆盖），且只对同一动作生效一次。",
+		empty: "本会话还没有被自动审批拒绝的动作。",
+		granted: (command) => `已授权一次：${command} —— 下一次相同动作会自动放行一次，之后需要重新授权。`,
+		unknown: (input) => `未知编号 "${input}"：先运行 /approval-allow-once 查看列表。`,
+		unknownCommand: "（未知命令）"
+	},
+	en: {
+		listHeader: "Recently denied actions (newest first):",
+		listLine: (index, command, source, time) => `${index}. ${command} (source: ${source}${time === undefined ? "" : `, ${time}`})`,
+		listFooter: "Run /approval-allow-once <number> to approve one for a single retry: the rule layer still runs first (a rule `deny` cannot be overridden), and the grant applies once to that exact action.",
+		empty: "No action has been denied by the automatic reviewer in this session yet.",
+		granted: (command) => `Approved once: ${command} — the next identical action runs without asking; after that the grant is spent.`,
+		unknown: (input) => `Unknown number "${input}" — run /approval-allow-once to see the list.`,
+		unknownCommand: "(unknown command)"
+	}
+};
+
+/** The `/approval-allow-once` command description for the given locale. */
+export function allowOnceCommandDescription(locale) {
+	return locale === "zh"
+		? "列出被自动审批拒绝的动作，并授权其中一条放行一次"
+		: "List denied actions and approve one for a single retry";
+}
+
+/** Local clock time for a denial record, or undefined when it has no timestamp. */
+function formatClock(ts, locale) {
+	if (typeof ts !== "number" || !Number.isFinite(ts)) return undefined;
+	try {
+		return new Date(ts).toLocaleTimeString(locale === "zh" ? "zh-CN" : "en-US", { hour12: false });
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * Render the allow-once list. The records arrive oldest-first (the denial ring
+ * buffer) and are listed newest-first, so number 1 is always the most recent
+ * denial the command would grant.
+ * @param list - denial records, oldest first
+ * @param locale - "zh" | "en"
+ */
+export function renderAllowOnceList(list, locale) {
+	const t = ALLOW_ONCE[locale] ?? ALLOW_ONCE.en;
+	const labels = SOURCE_LABELS[locale] ?? SOURCE_LABELS.en;
+	const lines = list.map((record, offset) => {
+		const command = record.command === undefined || record.command === ""
+			? t.unknownCommand
+			: `\`${record.command}\``;
+		const source = labels[record.source] ?? record.source;
+		return t.listLine(offset + 1, command, source, formatClock(record.ts, locale));
+	});
+	return [t.listHeader, ...lines, t.listFooter].join("\n");
+}
+
+/** "Nothing to approve yet" copy. */
+export function renderAllowOnceEmpty(locale) {
+	return (ALLOW_ONCE[locale] ?? ALLOW_ONCE.en).empty;
+}
+
+/** Confirmation after a grant. */
+export function renderAllowOnceGranted(command, locale) {
+	const t = ALLOW_ONCE[locale] ?? ALLOW_ONCE.en;
+	const shown = command === undefined || command === "" ? t.unknownCommand : `\`${command}\``;
+	return t.granted(shown);
+}
+
+/** "That number is not in the list" copy. */
+export function renderAllowOnceUnknown(input, locale) {
+	return (ALLOW_ONCE[locale] ?? ALLOW_ONCE.en).unknown(input);
 }

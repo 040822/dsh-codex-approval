@@ -13,6 +13,9 @@
 - **执行事实进判定与审计**：`workdir`（本条命令的实际目录）、`sandbox_permissions` + `justification`（本次请求的提权目标与理由）此前被 `argsPreview` 丢掉，现在随请求进入判定与审计；提权理由是 agent 自述，属不可信证据
 - **按需补证（`ai.evidenceFetch`，默认 `read-file`）**：裁判可请求读取工作区内至多 `evidenceMaxFiles`（默认 2）个文件，插件按白名单抓取（realpath 复核、拒凭据与二进制、超长截断）并**再审一次**；拒绝原因进审计（`evidenceRefused`）与第二轮提示。`off` 恢复单轮判定
 - **审计可解释性**：记录新增 `policy` / `userAuthorization` / `aiEvidence` / `aiUnknowns` / `cwd` / `workdir` / `escalation` / `evidenceFetched` / `evidenceRefused` / `evidenceRounds` / `hardAsk`
+- **一次审批的总预算 `ai.totalBudgetMs`（默认 30s）**：覆盖全部候选与补证轮次，单候选仍受 `timeoutMs` 限制但会被剩余预算压低；耗尽即按 `failOpen` 落地并在审计标 `budgetExhausted`
+- **拒绝熔断 `denialBreaker`**：连续 `consecutive` 次自动拒绝（默认 3）→ 本会话冷却 `cooldownMs`（默认 10 分钟），冷却期内需要 AI 判定的请求直接拒绝、不再花模型调用；同一动作被拒 `duplicate` 次（默认 2）→ 直接拒绝。任何非拒绝结果重置连续计数，熔断自身拒绝不延长冷却
+- **`/approval-allow-once`**：列出本会话最近被拒动作并授权其中一条放行一次（`kind: manual-override`，不花模型调用）；授权只对该动作生效一次，且仍先过规则层——规则 `deny` 不可被覆盖，授权同时清除该会话冷却
 - 不变：规则优先级（deny > ask > allow）、证据门槛、`denyFeedback`、`transcript`、审计日志格式与轮转、候选链语义
 
 验证：`node --test` 全绿。

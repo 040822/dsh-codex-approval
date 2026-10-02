@@ -40,7 +40,18 @@ import { judgeWith, decidePolicy, parseVerdict } from "./judge.js";
 import { parseNeeds, fetchEvidence } from "./evidence.js";
 import { buildTranscript } from "./transcript.js";
 import { MODES, parseMode, resolveMode, effectiveOnAsk } from "./modes.js";
-import { T, pickLocale, commandDescription, renderDenialNotice } from "./i18n.js";
+import {
+	T,
+	pickLocale,
+	commandDescription,
+	renderDenialNotice,
+	allowOnceCommandDescription,
+	renderAllowOnceEmpty,
+	renderAllowOnceGranted,
+	renderAllowOnceList,
+	renderAllowOnceUnknown
+} from "./i18n.js";
+import { createHash } from "node:crypto";
 import { redactSensitive, boundedText } from "./redact.js";
 import { isShellTool, positionalArgs } from "./shell-shape.js";
 
@@ -273,6 +284,11 @@ export const DEFAULT_CONFIG = {
 		// (publishing, credentials): "nobody could consent" is not consent, so
 		// the default is deny. Set to "ask" only if you want the prompt to block.
 		hardAskOnUnattended: "deny",
+		// One budget for the WHOLE approval, not per candidate: a chain of slow
+		// judges (and an evidence round) must not add up to minutes on the
+		// approval critical path. Each candidate still gets `timeoutMs`, capped
+		// by what is left. 0 disables the budget.
+		totalBudgetMs: 30_000,
 		// Read-only evidence fetch for the judge. "read-file" lets a verdict ask
 		// for at most `evidenceMaxFiles` workspace-local files (each bounded by
 		// `evidenceMaxBytes`) and be judged once more with them attached; "off"
@@ -292,6 +308,16 @@ export const DEFAULT_CONFIG = {
 	denyFeedback: true,
 	// Pending-denial queue cap per session: older entries are dropped first.
 	denyFeedbackMax: 3,
+	// Rejection circuit breaker, per session, plugin-originated denials only.
+	// A session that keeps getting denied stops paying for judge calls:
+	//   consecutive — plugin denials in a row that cool the session down (0 = off)
+	//   duplicate   — denials of the SAME action before it is refused outright (0 = off)
+	//   cooldownMs  — how long a tripped breaker refuses AI-judged requests
+	denialBreaker: {
+		consecutive: 3,
+		duplicate: 2,
+		cooldownMs: 600_000
+	},
 	// Compact session transcript for the AI judge: "off" (default) keeps the
 	// v0.3.0 zero-context input; "short" adds a bounded two-level window
 	// skeleton (see transcript.js) so the judge sees user intent and the
@@ -309,6 +335,8 @@ const ACTIONS = ["allow", "ask", "deny"];
 const TOLERANCES = ["low", "medium", "high"];
 /** Evidence-fetch modes: single-round judge, or one bounded read round. */
 const EVIDENCE_FETCH = ["off", "read-file"];
+/** Floor for a single judge attempt, so a nearly-spent budget cannot cut one off at 1ms. */
+const MIN_CANDIDATE_TIMEOUT_MS = 1000;
 /** Upper bound on the ordered judge-fallback chain (the primary is not counted). */
 const MAX_FALLBACKS = 4;
 
@@ -492,10 +520,16 @@ export const Config = z.object({
 	timeoutMs: live(z.number().step(1).min(1)),
 	maxTokens: live(z.number().step(1).min(1)),
 	hardAskOnUnattended: live(z.union(["deny", "ask"])),
+	totalBudgetMs: live(z.number().step(1).min(0)),
 	evidenceFetch: live(z.union(EVIDENCE_FETCH)),
 	evidenceMaxFiles: live(z.number().step(1).min(1)),
 	evidenceMaxBytes: live(z.number().step(1).min(256)),
 	denyFeedback: live(z.boolean()),
+	denialBreaker: live(z.object({
+		consecutive: z.number().step(1).min(0),
+		duplicate: z.number().step(1).min(0),
+		cooldownMs: z.number().step(1).min(0)
+	})),
 	sessionOverrides: live(z.dict(z.union(MODES)).default({}))
 });
 
@@ -543,6 +577,9 @@ function assertConfig(cfg) {
 		throw new TypeError("dsh-codex-approval: config.ai.maxJudgeCommandChars must be an integer in 200..200000");
 	}
 	if (!["deny", "ask"].includes(cfg.ai.hardAskOnUnattended)) throw new TypeError("dsh-codex-approval: config.ai.hardAskOnUnattended must be deny/ask");
+	if (!Number.isSafeInteger(cfg.ai.totalBudgetMs) || cfg.ai.totalBudgetMs < 0 || cfg.ai.totalBudgetMs > 600_000) {
+		throw new TypeError("dsh-codex-approval: config.ai.totalBudgetMs must be an integer in 0..600000");
+	}
 	if (!EVIDENCE_FETCH.includes(cfg.ai.evidenceFetch)) throw new TypeError(`dsh-codex-approval: config.ai.evidenceFetch must be one of ${EVIDENCE_FETCH.join("/")}`);
 	if (!Number.isSafeInteger(cfg.ai.evidenceMaxFiles) || cfg.ai.evidenceMaxFiles < 1 || cfg.ai.evidenceMaxFiles > 8) {
 		throw new TypeError("dsh-codex-approval: config.ai.evidenceMaxFiles must be an integer in 1..8");
@@ -558,6 +595,13 @@ function assertConfig(cfg) {
 	}
 	if (!ACTIONS.includes(cfg.fallback)) throw new TypeError("dsh-codex-approval: config.fallback must be allow/ask/deny");
 	if (typeof cfg.denyFeedback !== "boolean") throw new TypeError("dsh-codex-approval: config.denyFeedback must be a boolean");
+	if (typeof cfg.denialBreaker !== "object" || cfg.denialBreaker === null) throw new TypeError("dsh-codex-approval: config.denialBreaker must be an object");
+	for (const key of ["consecutive", "duplicate", "cooldownMs"]) {
+		const value = cfg.denialBreaker[key];
+		if (!Number.isSafeInteger(value) || value < 0 || value > 86_400_000) {
+			throw new TypeError(`dsh-codex-approval: config.denialBreaker.${key} must be an integer in 0..86400000`);
+		}
+	}
 	if (!Number.isSafeInteger(cfg.denyFeedbackMax) || cfg.denyFeedbackMax < 1 || cfg.denyFeedbackMax > 10) {
 		throw new TypeError("dsh-codex-approval: config.denyFeedbackMax must be an integer in 1..10");
 	}
@@ -613,10 +657,19 @@ export function applyConfigSettings(baseConfig, settings) {
 	// 这里只是**回退读取**，不是原先那种来源推断：没有默认值参与，`undefined`
 	// 就是「没写过」，三级都缺才用内置默认。
 	const pick = (key, fallback) => settings?.[key] ?? settings?.ai?.[key] ?? fallback;
+	// The breaker is the one nested object here, so it is picked key by key: the
+	// schema answers with `{}` (not `undefined`) for an object it never saw, and
+	// a partial object must not resurrect a default for the keys it does carry.
+	const pickBreaker = (key, fallback) => settings?.denialBreaker?.[key] ?? fallback;
 	return normalizeConfig({
 		...merged,
 		mode3OnAsk: pick("mode3OnAsk", baseConfig.mode3OnAsk),
 		denyFeedback: pick("denyFeedback", baseConfig.denyFeedback),
+		denialBreaker: {
+			consecutive: pickBreaker("consecutive", baseConfig.denialBreaker.consecutive),
+			duplicate: pickBreaker("duplicate", baseConfig.denialBreaker.duplicate),
+			cooldownMs: pickBreaker("cooldownMs", baseConfig.denialBreaker.cooldownMs)
+		},
 		ai: {
 			...baseAi,
 			// **先完整合并调用方传来的 `ai`**（含没有搬到顶层的那些字段：`enabled`、
@@ -633,6 +686,7 @@ export function applyConfigSettings(baseConfig, settings) {
 			timeoutMs: pick("timeoutMs", baseAi.timeoutMs),
 			maxTokens: pick("maxTokens", baseAi.maxTokens),
 			hardAskOnUnattended: pick("hardAskOnUnattended", baseAi.hardAskOnUnattended),
+			totalBudgetMs: pick("totalBudgetMs", baseAi.totalBudgetMs),
 			evidenceFetch: pick("evidenceFetch", baseAi.evidenceFetch),
 			evidenceMaxFiles: pick("evidenceMaxFiles", baseAi.evidenceMaxFiles),
 			evidenceMaxBytes: pick("evidenceMaxBytes", baseAi.evidenceMaxBytes)
@@ -785,7 +839,7 @@ function unparseableFailure(result) {
  */
 export function makeLlmRunner(llm, configOrGetter) {
 	const getConfig = typeof configOrGetter === "function" ? configOrGetter : () => configOrGetter;
-	return async (messages, { signal, sessionId } = {}) => {
+	return async (messages, { signal, sessionId, deadline } = {}) => {
 		const { provider, model, timeoutMs, maxTokens, fallbacks } = getConfig();
 		const chain = [{ provider, model }];
 		for (const entry of Array.isArray(fallbacks) ? fallbacks : []) {
@@ -796,12 +850,21 @@ export function makeLlmRunner(llm, configOrGetter) {
 		}
 		const tried = [];
 		let primaryFailure;
+		let budgetExhausted = false;
 		for (let index = 0; index < chain.length; index += 1) {
 			// A cancelled approval must not spend further judge calls.
 			if (signal?.aborted === true) break;
 			const candidate = chain[index];
+			// The whole approval shares one budget (`ai.totalBudgetMs`): the chain
+			// stops when it is spent, and each attempt is capped by what is left.
+			const left = deadline === undefined ? Number.POSITIVE_INFINITY : deadline - Date.now();
+			if (left <= 0) {
+				budgetExhausted = true;
+				break;
+			}
+			const candidateTimeout = left === Number.POSITIVE_INFINITY ? timeoutMs : Math.max(MIN_CANDIDATE_TIMEOUT_MS, Math.min(timeoutMs, left));
 			tried.push(`${candidate.provider}/${candidate.model}`);
-			const result = await attemptJudge(llm, candidate, { messages, signal, sessionId, timeoutMs, maxTokens });
+			const result = await attemptJudge(llm, candidate, { messages, signal, sessionId, timeoutMs: candidateTimeout, maxTokens });
 			if (result.ok === true && parseVerdict(result.text) !== null) {
 				// A chain that answered on its first candidate still records which
 				// model judged (audit value); a chain-less runner keeps the legacy
@@ -824,9 +887,13 @@ export function makeLlmRunner(llm, configOrGetter) {
 				primaryFailure = result.ok === true ? unparseableFailure(result) : result;
 			}
 		}
-		const failed = primaryFailure ?? { ok: false, error: "judge cancelled before any attempt" };
-		if (tried.length <= 1) return failed;
-		return { ...failed, judgeAttempts: tried.length, judgeTried: tried };
+		const failed = primaryFailure ?? {
+			ok: false,
+			error: budgetExhausted ? "judge budget exhausted before any attempt" : "judge cancelled before any attempt"
+		};
+		const withBudget = budgetExhausted ? { ...failed, budgetExhausted: true } : failed;
+		if (tried.length <= 1) return withBudget;
+		return { ...withBudget, judgeAttempts: tried.length, judgeTried: tried };
 	};
 }
 
@@ -1002,6 +1069,18 @@ export async function gitConfigGuard({ root, readFile: readConfig = readFile } =
 }
 
 /**
+ * Stable identity of one action, shared by the breaker's per-action counts and
+ * the one-shot human override (`/approval-allow-once`). Derived from the
+ * redacted full text, so two requests that would be decided identically share a
+ * key, and a credential's value never leaks into the key.
+ * @param toolName - the tool that was called
+ * @param argsText - the full redacted arguments text
+ */
+export function actionKeyOf(toolName, argsText) {
+	return createHash("sha1").update(`${toolName}\u0000${argsText}`).digest("hex").slice(0, 16);
+}
+
+/**
  * Create the approval/request handler with injected dependencies
  * (unit-testable without a cordis ctx).
  * @param deps - { config, record, llmRunner, getSessionMode, denialFeed, denialHistory, getCwd, resolvePath, readFile }
@@ -1010,27 +1089,50 @@ export async function gitConfigGuard({ root, readFile: readConfig = readFile } =
  *   omitted the handler creates its own (shared only if the caller passes it).
  *   `denialHistory` is an optional Map<sessionId, Array<DenialRecord>>
  *   accumulating the last few denials of each session for the transcript
- *   context ([D] lines) — created internally when omitted.
+ *   context ([D] lines) and for `/approval-allow-once` — created internally
+ *   when omitted.
+ *   `breakerStore` is an optional Map<sessionId, state> holding the rejection
+ *   breaker (consecutive run, per-action counts, cooldown) and the one-shot
+ *   human approvals; created internally when omitted.
  *   `getCwd` optionally returns the workspace path for the transcript [W] line
  *   and for the path-guard check; `resolvePath` overrides the realpath used by
  *   that check (tests inject a pure resolver); `readFile` overrides the config
  *   reader behind `configGuard` (tests inject a pure reader).
  * @returns async (req, next) => ApprovalOutcome
  */
-export function createHandler({ config, record, llmRunner, getSessionMode, denialFeed, denialHistory, getCwd, resolvePath, readFile: readConfigFile }) {
+export function createHandler({ config, record, llmRunner, getSessionMode, denialFeed, denialHistory, breakerStore, getCwd, resolvePath, readFile: readConfigFile }) {
 	let cfg = config;
 	const feed = denialFeed ?? new Map();
 	const history = denialHistory ?? new Map();
+	const breakers = breakerStore ?? new Map();
+	/**
+	 * Per-session breaker state: the consecutive-denial run, per-action denial
+	 * counts, an active cooldown, and the one-shot approvals a human granted
+	 * with `/approval-allow-once`.
+	 */
+	const breakerFor = (sessionId) => {
+		if (sessionId === undefined || sessionId === null) return null;
+		let state = breakers.get(sessionId);
+		if (state === undefined) {
+			state = { consecutive: 0, cooledUntil: 0, actions: new Map(), oneShot: new Map() };
+			breakers.set(sessionId, state);
+		}
+		return state;
+	};
+	/** The recent-denial ring buffer: the transcript's [D] lines and the allow-once list. */
+	const rememberDenial = (sessionId, denial) => {
+		if (sessionId === undefined || sessionId === null) return;
+		const queue = history.get(sessionId) ?? [];
+		queue.push(denial);
+		if (queue.length > 5) queue.shift();
+		history.set(sessionId, queue);
+	};
 	const stageDenial = (sessionId, denial) => {
 		if (sessionId === undefined || sessionId === null) return;
 		const queue = feed.get(sessionId) ?? [];
 		queue.push(denial);
 		if (queue.length > cfg.denyFeedbackMax) queue.shift();
 		feed.set(sessionId, queue);
-		const hq = history.get(sessionId) ?? [];
-		hq.push(denial);
-		if (hq.length > 5) hq.shift();
-		history.set(sessionId, hq);
 	};
 	const updateConfig = (nextConfig) => {
 		cfg = nextConfig;
@@ -1109,11 +1211,39 @@ export function createHandler({ config, record, llmRunner, getSessionMode, denia
 		let verdict;
 		let context = "";
 		let rule = null;
+		// Session-level gates, evaluated before any paid model call, and only when
+		// no rule matched (a rule's decision — including a `deny` — is never
+		// overridden by either):
+		//   - a one-shot human approval of THIS exact action, consumed here;
+		//   - a tripped rejection breaker, so a session that keeps getting denied
+		//     stops paying for judge calls it keeps losing.
+		const actionKey = actionKeyOf(req.toolName, argsText);
+		let gate = null;
 		if (evidenceIssue === null) {
 			rule = await resolveRule(matchReq, shapeInfo, {
 				path: { cwd, root: cwd, resolvePath },
 				config: { root: cwd }
 			});
+		}
+		if (evidenceIssue === null && rule === null) {
+			const breakerState = breakerFor(sessionId);
+			if (breakerState !== null) {
+				const granted = breakerState.oneShot.get(actionKey) ?? 0;
+				if (granted > 0) {
+					breakerState.oneShot.delete(actionKey);
+					gate = { kind: "manual-override", action: "allow", outcome: "allowed-once", manualOverride: true };
+				} else if (breakerState.cooledUntil > Date.now()) {
+					gate = {
+						kind: "breaker",
+						action: "deny",
+						outcome: "rejected",
+						breaker: "cooldown",
+						breakerUntil: new Date(breakerState.cooledUntil).toISOString()
+					};
+				} else if (cfg.denialBreaker.duplicate > 0 && (breakerState.actions.get(actionKey) ?? 0) >= cfg.denialBreaker.duplicate) {
+					gate = { kind: "breaker", action: "deny", outcome: "rejected", breaker: "duplicate-action" };
+				}
+			}
 		}
 		if (evidenceIssue !== null) {
 			// Incomplete evidence is never auto-approved, and the judge is not
@@ -1132,6 +1262,8 @@ export function createHandler({ config, record, llmRunner, getSessionMode, denia
 				match: ruleLabel(rule),
 				...rule.hardAsk === true ? { hardAsk: true } : {}
 			};
+		} else if (gate !== null) {
+			verdict = gate;
 		} else if (cfg.ai.enabled) {
 			context = cfg.transcript === "short"
 				? buildTranscript({
@@ -1146,6 +1278,9 @@ export function createHandler({ config, record, llmRunner, getSessionMode, denia
 				})
 				: "";
 			const judgeInput = { toolName: req.toolName, argsText, reason: reasonText, context, cwd, workdir: facts?.workdir, escalation };
+			// One budget for the whole approval: every candidate AND the evidence
+			// round share it, so a slow chain cannot stretch an approval to minutes.
+			const deadline = cfg.ai.totalBudgetMs > 0 ? started + cfg.ai.totalBudgetMs : undefined;
 			const judged = await judgeWith({
 				runner: llmRunner,
 				input: judgeInput,
@@ -1153,7 +1288,8 @@ export function createHandler({ config, record, llmRunner, getSessionMode, denia
 				// model calls (and fallbacks) after the approval was cancelled.
 				signal: req.signal,
 				allowAsk: mode !== "ai-auto",
-				sessionId
+				sessionId,
+				deadline
 			});
 			if (judged.ok) {
 				// The judge may name up to `evidenceMaxFiles` workspace-local files
@@ -1189,7 +1325,8 @@ export function createHandler({ config, record, llmRunner, getSessionMode, denia
 							signal: req.signal,
 							allowAsk: mode !== "ai-auto",
 							allowNeeds: false,
-							sessionId
+							sessionId,
+							deadline
 						});
 						if (second.ok) answered = second;
 						else evidenceRoundFailed = true;
@@ -1228,7 +1365,8 @@ export function createHandler({ config, record, llmRunner, getSessionMode, denia
 					...judged.textChars !== void 0 ? { textChars: judged.textChars } : {},
 					...judged.endedWithoutFinish !== void 0 ? { endedWithoutFinish: judged.endedWithoutFinish } : {},
 					...judged.judgeAttempts !== void 0 ? { judgeAttempts: judged.judgeAttempts } : {},
-					...judged.judgeTried !== void 0 ? { judgeTried: judged.judgeTried } : {}
+					...judged.judgeTried !== void 0 ? { judgeTried: judged.judgeTried } : {},
+					...judged.budgetExhausted === true ? { budgetExhausted: true } : {}
 				};
 			}
 		} else {
@@ -1298,13 +1436,32 @@ export function createHandler({ config, record, llmRunner, getSessionMode, denia
 			ms: Date.now() - started
 		});
 
+		// Breaker bookkeeping. Only decisions the plugin actually reached count —
+		// a breaker's own refusal must not extend its own cooldown, or a session
+		// could never recover. Any non-denial resets the run (Codex does the same).
+		const breakerState = breakerFor(sessionId);
+		if (breakerState !== null && verdict.kind !== "breaker") {
+			if (verdict.outcome === "rejected") {
+				breakerState.consecutive += 1;
+				breakerState.actions.set(actionKey, (breakerState.actions.get(actionKey) ?? 0) + 1);
+				if (cfg.denialBreaker.consecutive > 0 && breakerState.consecutive >= cfg.denialBreaker.consecutive) {
+					breakerState.cooledUntil = Date.now() + cfg.denialBreaker.cooldownMs;
+				}
+			} else {
+				breakerState.consecutive = 0;
+			}
+		}
+
 		// Stage plugin-originated denials for the pre-step feedback injector.
 		// Only denials the plugin itself produced are staged (rule / ai /
-		// ai-error-failOpen / fallback, incl. ai-auto's mode3 ask-resolution),
-		// so a human denial through the GUI answerer never gets re-attributed.
-		if (verdict.outcome === "rejected" && cfg.denyFeedback) {
-			stageDenial(sessionId, {
+		// ai-error-failOpen / fallback / breaker, incl. ai-auto's mode3
+		// ask-resolution), so a human denial through the GUI answerer never gets
+		// re-attributed. The recent-denial list is kept either way: it is what
+		// `/approval-allow-once` lists from.
+		if (verdict.outcome === "rejected") {
+			const denial = {
 				command: preview.slice(0, DENIAL_COMMAND_MAX_CHARS),
+				key: actionKey,
 				source: verdict.kind,
 				...verdict.match !== void 0 ? { match: verdict.match } : {},
 				...verdict.risk !== void 0 ? { risk: verdict.risk } : {},
@@ -1312,8 +1469,11 @@ export function createHandler({ config, record, llmRunner, getSessionMode, denia
 				...verdict.finishKind !== void 0 ? { finishKind: verdict.finishKind } : {},
 				...verdict.failure !== void 0 ? { failure: verdict.failure } : {},
 				...verdict.viaAskResolution === true ? { viaAsk: true } : {},
+				...verdict.breaker !== void 0 ? { breaker: verdict.breaker } : {},
 				ts: Date.now()
-			});
+			};
+			rememberDenial(sessionId, denial);
+			if (cfg.denyFeedback) stageDenial(sessionId, denial);
 		}
 
 		return verdict.outcome === "pass" ? next() : verdict.outcome;
@@ -1567,6 +1727,62 @@ export function registerModeCommand(ctx, cfg, store, getLocale) {
 }
 
 /**
+ * Register the `/approval-allow-once` command: the recovery path after a denial.
+ *
+ * It lists this session's recent denials (the same ring buffer the transcript
+ * and the feedback injector read) and grants ONE retry of the chosen action.
+ * The grant is deliberately narrow — it mirrors Codex's `/approve`:
+ *   - it applies to that exact action (the `actionKeyOf` hash), not to similar
+ *     future actions, and is consumed by the next matching request;
+ *   - the rule layer still runs first, so a rule `deny` cannot be re-enabled
+ *     through this command;
+ *   - granting it also clears the session's breaker cooldown: a human decision
+ *     is exactly what the breaker was waiting for.
+ *
+ * @param ctx - cordis context
+ * @param deps - { history, breakerStore, getLocale }
+ */
+export function registerAllowOnceCommand(ctx, { history, breakerStore, getLocale }) {
+	const readLocale = () => (getLocale ? getLocale() : "en");
+	ctx.inject(["commands"], (commandCtx) => {
+		commandCtx.commands.register({
+			name: "approval-allow-once",
+			description: allowOnceCommandDescription(getLocale ? getLocale() : "en"),
+			input: { hint: "[number]" },
+			handler: async ({ agent, rawInput }) => {
+				const locale = readLocale();
+				const sessionId = agent?.session?.id ?? agent?.id;
+				const list = sessionId === undefined || sessionId === null ? [] : history.get(sessionId) ?? [];
+				const newestFirst = list.slice().reverse();
+				const input = typeof rawInput === "string" ? rawInput.trim() : "";
+				if (input === "") {
+					return {
+						kind: "success",
+						text: newestFirst.length === 0 ? renderAllowOnceEmpty(locale) : renderAllowOnceList(newestFirst, locale)
+					};
+				}
+				const index = Number.parseInt(input, 10);
+				const denial = Number.isSafeInteger(index) && index >= 1 && index <= newestFirst.length
+					? newestFirst[index - 1]
+					: undefined;
+				if (denial === undefined || typeof denial.key !== "string" || denial.key === "") {
+					return { kind: "success", text: renderAllowOnceUnknown(input, locale) };
+				}
+				let state = breakerStore.get(sessionId);
+				if (state === undefined) {
+					state = { consecutive: 0, cooledUntil: 0, actions: new Map(), oneShot: new Map() };
+					breakerStore.set(sessionId, state);
+				}
+				state.oneShot.set(denial.key, (state.oneShot.get(denial.key) ?? 0) + 1);
+				state.consecutive = 0;
+				state.cooledUntil = 0;
+				return { kind: "success", text: renderAllowOnceGranted(denial.command, locale) };
+			}
+		});
+	});
+}
+
+/**
  * Build the `agent/pre-step` listener that feeds staged denials back to the
  * main agent as corrective context. When the previous step's escalation was
  * denied by this plugin, the sandbox layer reports it as "the user rejected"
@@ -1743,6 +1959,7 @@ export async function apply(ctx, userConfig) {
 	const store = makeModeStore(ctx, ctx.logger, cfg.sessionOverrides);
 	const denialFeed = new Map();
 	const denialHistory = new Map();
+	const breakerStore = new Map();
 	const getConfig = () => cfg;
 	const getLocale = makeGetLocale(cfg, ctx, getConfig);
 	const llmRunner = makeLlmRunner(ctx.llm, () => cfg.ai);
@@ -1754,6 +1971,7 @@ export async function apply(ctx, userConfig) {
 		getSessionMode: (sessionId) => store.get(sessionId),
 		denialFeed,
 		denialHistory,
+		breakerStore,
 		getCwd: (agent) => agent?.session?.policy?.workspaceRoot ?? agent?.cwd
 	});
 	ctx.on("approval/request", handler);
@@ -1828,7 +2046,10 @@ export async function apply(ctx, userConfig) {
 				mode3OnAsk: cfg.mode3OnAsk,
 				timeoutMs: cfg.ai.timeoutMs,
 				maxTokens: cfg.ai.maxTokens,
-				denyFeedback: cfg.denyFeedback
+				totalBudgetMs: cfg.ai.totalBudgetMs,
+				hardAskOnUnattended: cfg.ai.hardAskOnUnattended,
+				denyFeedback: cfg.denyFeedback,
+				denialBreaker: cfg.denialBreaker
 			},
 			onValue: (settingsValue) => {
 				// 0.1.x 的 namespace 值就是实际生效值，`??` 直接覆盖即可。
@@ -1844,6 +2065,7 @@ export async function apply(ctx, userConfig) {
 	ctx.on("agent/pre-step", makeDenialInjector({ getConfig, denialFeed, getLocale }));
 	// Command copy follows config.locale ("auto" → dsh locale preference)
 	registerModeCommand(ctx, cfg, store, getLocale);
+	registerAllowOnceCommand(ctx, { history: denialHistory, breakerStore, getLocale });
 	// Self-proving startup record: this line in the log after a restart proves
 	// the plugin loaded (decision records follow it). Awaited so a boot that
 	// cannot even write its own log fails loud instead of silently degrading.
@@ -1861,6 +2083,7 @@ export async function apply(ctx, userConfig) {
 		fallback: cfg.fallback,
 		denyFeedback: cfg.denyFeedback,
 		denyFeedbackMax: cfg.denyFeedbackMax,
+		denialBreaker: cfg.denialBreaker,
 		transcript: cfg.transcript,
 		transcriptMaxChars: cfg.transcriptMaxChars
 	});

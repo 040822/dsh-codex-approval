@@ -2224,3 +2224,196 @@ test("normalizeConfig: hardAskOnUnattended only accepts deny/ask", () => {
 	assert.throws(() => normalizeConfig({ ai: { evidenceFetch: "all" } }), /evidenceFetch/);
 	assert.throws(() => normalizeConfig({ rules: [{ match: "Bash(x)", action: "ask", hardAsk: "yes" }] }), /hardAsk/);
 });
+
+// ---------- 第 2 条：总预算 / 拒绝熔断 / 一次性人工放行 ----------
+
+test("makeLlmRunner: a spent budget stops the chain before any model call", async () => {
+	const calls = [];
+	const llm = makeStubLlm({ "p/m": { text: VERDICT_TEXT } }, calls);
+	const runner = makeLlmRunner(llm, { provider: "p", model: "m", timeoutMs: 1000, maxTokens: 7, fallbacks: [{ provider: "q", model: "n" }] });
+	const result = await runner([], { deadline: Date.now() - 1 });
+	assert.equal(result.ok, false);
+	assert.equal(result.budgetExhausted, true);
+	assert.match(result.error, /budget exhausted/);
+	assert.equal(calls.length, 0, "an exhausted budget must not reach the provider");
+});
+
+test("makeLlmRunner: a budget still in the future leaves the chain unchanged", async () => {
+	const llm = makeStubLlm({ "p/m": { text: VERDICT_TEXT } });
+	const runner = makeLlmRunner(llm, { provider: "p", model: "m", timeoutMs: 1000, maxTokens: 7 });
+	const result = await runner([], { deadline: Date.now() + 60_000 });
+	assert.equal(result.ok, true);
+	assert.equal(result.budgetExhausted, undefined);
+});
+
+test("handler: an exhausted judge budget is surfaced in the audit", async () => {
+	const cfg = baseConfig({ rules: [] });
+	const records = [];
+	const handler = createHandler({
+		config: cfg,
+		record: async (entry) => { records.push(entry); },
+		llmRunner: async () => ({ ok: false, error: "judge budget exhausted before any attempt", budgetExhausted: true })
+	});
+	const { outcome } = await run(handler, makeReq({ callId: "call-budget", command: "bash deploy.sh" }));
+	assert.equal(outcome, "unavailable"); // failOpen ask → next()
+	assert.equal(records.at(-1).budgetExhausted, true);
+});
+
+test("handler: the duplicate-action breaker refuses a repeatedly denied action without a model call", async () => {
+	const cfg = baseConfig({ rules: [], denialBreaker: { consecutive: 0, duplicate: 2, cooldownMs: 60_000 } });
+	const records = [];
+	const breakerStore = new Map();
+	let calls = 0;
+	const handler = createHandler({
+		config: cfg,
+		record: async (entry) => { records.push(entry); },
+		llmRunner: async () => { calls += 1; return { ok: true, text: '{"risk":"high","authorization":"deny","reason":"no"}' }; },
+		breakerStore
+	});
+	assert.equal((await run(handler, makeReq({ callId: "d1", command: "rm -rf /tmp/x" }))).outcome, "rejected");
+	assert.equal((await run(handler, makeReq({ callId: "d2", command: "rm -rf /tmp/x" }))).outcome, "rejected");
+	const third = await run(handler, makeReq({ callId: "d3", command: "rm -rf /tmp/x" }));
+	assert.equal(third.outcome, "rejected");
+	assert.equal(calls, 2, "the third request is refused by the breaker, not by the model");
+	assert.equal(records.at(-1).breaker, "duplicate-action");
+	// A different action is unaffected.
+	assert.equal((await run(handler, makeReq({ callId: "d4", command: "rm -rf /tmp/y" }))).outcome, "rejected");
+	assert.equal(calls, 3);
+});
+
+test("handler: consecutive denials cool the session down, and a breaker refusal never extends it", async () => {
+	const cfg = baseConfig({ rules: [], denialBreaker: { consecutive: 2, duplicate: 0, cooldownMs: 60_000 } });
+	const records = [];
+	const breakerStore = new Map();
+	let calls = 0;
+	const handler = createHandler({
+		config: cfg,
+		record: async (entry) => { records.push(entry); },
+		llmRunner: async () => { calls += 1; return { ok: true, text: '{"risk":"high","authorization":"deny","reason":"no"}' }; },
+		breakerStore
+	});
+	await run(handler, makeReq({ callId: "c1", command: "rm -rf /tmp/a" }));
+	await run(handler, makeReq({ callId: "c2", command: "rm -rf /tmp/b" }));
+	const afterTrip = calls;
+	const state = breakerStore.get("sess-1");
+	assert.ok(state.cooledUntil > Date.now(), "two denials in a row trip the breaker");
+	const cooledUntil = state.cooledUntil;
+	const third = await run(handler, makeReq({ callId: "c3", command: "rm -rf /tmp/c" }));
+	assert.equal(third.outcome, "rejected");
+	assert.equal(records.at(-1).breaker, "cooldown");
+	assert.equal(calls, afterTrip, "no judge call while cooled down");
+	assert.equal(state.cooledUntil, cooledUntil, "a breaker refusal must not extend its own cooldown");
+});
+
+test("handler: any non-denial resets the consecutive run", async () => {
+	const cfg = baseConfig({ rules: [], denialBreaker: { consecutive: 2, duplicate: 0, cooldownMs: 60_000 } });
+	const breakerStore = new Map();
+	let allow = false;
+	const handler = createHandler({
+		config: cfg,
+		record: async () => {},
+		llmRunner: async () => ({ ok: true, text: allow ? '{"risk":"low","authorization":"allow","reason":"ok"}' : '{"risk":"high","authorization":"deny","reason":"no"}' }),
+		breakerStore
+	});
+	await run(handler, makeReq({ callId: "r1", command: "rm -rf /tmp/a" }));
+	allow = true;
+	assert.equal((await run(handler, makeReq({ callId: "r2", command: "ls /tmp" }))).outcome, "allowed-once");
+	assert.equal(breakerStore.get("sess-1").consecutive, 0);
+	allow = false;
+	await run(handler, makeReq({ callId: "r3", command: "rm -rf /tmp/b" }));
+	assert.equal(breakerStore.get("sess-1").cooledUntil, 0, "one denial after a reset is not a run of two");
+});
+
+test("handler: an allow-once grant runs that exact action once, without a judge call", async () => {
+	const cfg = baseConfig({ rules: [], denialBreaker: { consecutive: 0, duplicate: 0, cooldownMs: 0 } });
+	const records = [];
+	const history = new Map();
+	const breakerStore = new Map();
+	let calls = 0;
+	const handler = createHandler({
+		config: cfg,
+		record: async (entry) => { records.push(entry); },
+		llmRunner: async () => { calls += 1; return { ok: true, text: '{"risk":"high","authorization":"deny","reason":"no"}' }; },
+		denialHistory: history,
+		breakerStore
+	});
+	assert.equal((await run(handler, makeReq({ callId: "g1", command: "bash deploy.sh" }))).outcome, "rejected");
+
+	const { registerAllowOnceCommand } = await import("../index.js");
+	let registered = null;
+	registerAllowOnceCommand({ inject: (deps, fn) => fn({ commands: { register: (def) => { registered = def; } } }) }, { history, breakerStore });
+	const listed = await registered.handler({ agent: { session: { id: "sess-1" } }, rawInput: "" });
+	assert.equal(listed.kind, "success");
+	assert.match(listed.text, /Recently denied actions/);
+	assert.match(listed.text, /bash deploy\.sh/);
+
+	const granted = await registered.handler({ agent: { session: { id: "sess-1" } }, rawInput: "1" });
+	assert.equal(granted.kind, "success");
+	assert.match(granted.text, /Approved once/);
+
+	const before = calls;
+	const allowed = await run(handler, makeReq({ callId: "g2", command: "bash deploy.sh" }));
+	assert.equal(allowed.outcome, "allowed-once");
+	assert.equal(calls, before, "a human override must not spend a judge call");
+	assert.equal(records.at(-1).manualOverride, true);
+	assert.equal(records.at(-1).kind, "manual-override");
+
+	// Spent: the next identical action goes back through the judge (which denies).
+	assert.equal((await run(handler, makeReq({ callId: "g3", command: "bash deploy.sh" }))).outcome, "rejected");
+	assert.equal(calls, before + 1);
+});
+
+test("handler: an allow-once grant cannot re-enable a rule denial", async () => {
+	const { actionKeyOf } = await import("../index.js");
+	const cfg = baseConfig({ rules: [{ match: "Bash(rm *)", action: "deny" }] });
+	const records = [];
+	const breakerStore = new Map();
+	let calls = 0;
+	const actionKey = actionKeyOf("bash", "rm -rf /tmp/x");
+	breakerStore.set("sess-1", { consecutive: 0, cooledUntil: 0, actions: new Map(), oneShot: new Map([[actionKey, 1]]) });
+	const handler = createHandler({
+		config: cfg,
+		record: async (entry) => { records.push(entry); },
+		llmRunner: async () => { calls += 1; return { ok: true, text: VERDICT_TEXT }; },
+		breakerStore
+	});
+	const { outcome } = await run(handler, makeReq({ callId: "rd1", command: "rm -rf /tmp/x" }));
+	assert.equal(outcome, "rejected");
+	assert.equal(calls, 0);
+	assert.equal(records.at(-1).kind, "rule");
+	assert.equal("manualOverride" in records.at(-1), false);
+	// The grant is untouched: it was never consumed.
+	assert.equal(breakerStore.get("sess-1").oneShot.get(actionKey), 1);
+});
+
+test("registerAllowOnceCommand: numbers, unknowns, empty history and zh copy", async () => {
+	const { registerAllowOnceCommand } = await import("../index.js");
+	const history = new Map([["s1", [
+		{ command: "old cmd", source: "rule", key: "k1", ts: 1 },
+		{ command: "new cmd", source: "breaker", key: "k2", ts: 2 }
+	]]]);
+	const breakerStore = new Map();
+	let registered = null;
+	registerAllowOnceCommand({ inject: (deps, fn) => fn({ commands: { register: (def) => { registered = def; } } }) }, { history, breakerStore, getLocale: () => "en" });
+	assert.match(registered.description, /approve one/);
+
+	const listed = await registered.handler({ agent: { session: { id: "s1" } }, rawInput: "" });
+	const lines = listed.text.split("\n");
+	assert.match(lines[1], /^1\. `new cmd` \(source: rejection breaker/);
+	assert.match(lines[2], /^2\. `old cmd` \(source: deterministic rule/);
+
+	assert.match((await registered.handler({ agent: { session: { id: "s1" } }, rawInput: "9" })).text, /Unknown number/);
+	assert.match((await registered.handler({ agent: { session: { id: "s1" } }, rawInput: "abc" })).text, /Unknown number/);
+	assert.match((await registered.handler({ agent: { session: { id: "other" } }, rawInput: "" })).text, /No action has been denied/);
+
+	// Granting writes the one-shot for that key.
+	await registered.handler({ agent: { session: { id: "s1" } }, rawInput: "1" });
+	assert.equal(breakerStore.get("s1").oneShot.get("k2"), 1);
+
+	let zh = null;
+	registerAllowOnceCommand({ inject: (deps, fn) => fn({ commands: { register: (def) => { zh = def; } } }) }, { history, breakerStore, getLocale: () => "zh" });
+	assert.match(zh.description, /授权其中一条/);
+	const zhList = await zh.handler({ agent: { session: { id: "s1" } }, rawInput: "" });
+	assert.match(zhList.text, /最近被自动审批拒绝的动作/);
+	assert.match(zhList.text, /来源：拒绝熔断/);
+});

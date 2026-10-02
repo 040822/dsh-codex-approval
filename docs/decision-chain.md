@@ -17,11 +17,15 @@ approval/request 到达（toolName + callId + reason）
 │     deny → 直接拒绝（AI 无权覆盖）│ allow → 静默放行 │ ask → 交人类
 │     标了 hardAsk 的 ask 是**红条**（发布、凭据）：ai-auto 下不走 mode3OnAsk，
 │     改由 ai.hardAskOnUnattended 决定（默认 deny）
-├─ 5. AI 审判层（规则未命中时）
+├─ 4b. 会话级闸门（仅在规则未命中、且证据完整时求值）
+│     一次性人工授权（/approval-allow-once）命中 → 直接放行一次（规则 deny 不可能到此）
+│     否则熔断冷却中 → 直接拒绝（breaker: cooldown）│ 同动作被拒达阈 → 拒绝（breaker: duplicate-action）
+├─ 5. AI 审判层（规则未命中且未被闸门拦截时）
 │     LLM 裁决 {risk, authorization, user_authorization, evidence, unknowns, reason}
 │     ——要求**单个**合法 JSON 对象，多裁决视为非法
 │     判定要求补证（needs）→ 插件按白名单只读抓取（默认最多 2 个文件）→ 带证据再审一次
 │     策略层 decidePolicy 把裁决映射成 allow / ask / deny（见下「策略层」）
+│     全部候选 + 补证轮次共享 ai.totalBudgetMs（默认 30s），耗尽即按 failOpen 落地
 │     主模型失败或未给出可解析判定 → 依次尝试 ai.fallbacks
 │     全部候选失败/超时/输出非法 → failOpen（默认 ask → 人类）
 └─ 6. 兜底：fallback（默认 ask → GUI 弹窗）
@@ -149,6 +153,19 @@ bash/pwsh 的 **allow 规则只在命令被 `shell-shape.js` 判定为 `simple`*
 
 > 候选链只在**候选未给出可解析判定**时推进，不会因为"换个模型看法不同"而产出判定。唯一的门槛就是能否解析出唯一的 `{risk, authorization, reason}`。
 
+## 拒绝之后：熔断与一次性人工放行
+
+自动拒绝本身是决策，不是死锁。两条恢复路径：
+
+| 机制 | 触发 | 行为 |
+|---|---|---|
+| `denialBreaker.duplicate` | 同一动作（`actionKeyOf` 的哈希：工具 + 已脱敏全文）被拒达阈值 | 该动作直接拒绝，不再问模型；别的动作不受影响 |
+| `denialBreaker.consecutive` | 连续自动拒绝达阈值 | 本会话冷却 `cooldownMs`：需要 AI 判定的请求直接拒绝（`breaker: cooldown`）；规则命中照旧 |
+| `/approval-allow-once <编号>` | 人工授权列表里的一条 | 该动作下一次直接放行（`kind: manual-override`，不花模型调用），用掉即失效；**仍先过规则层**，规则 `deny` 无法被它覆盖 |
+| 任何非拒绝结果 | 放行或交人工 | 连续计数清零；熔断自身的拒绝不延长冷却 |
+
+重置路径：冷却到期自动恢复；`/approval-allow-once` 授权时顺带清冷却；切换审批模式或用设置改配置不重置计数（计数只由决策结果驱动）。
+
 ## 会话上下文（transcript）
 
 `transcript: "off"`（默认）= 零上下文判定（仅命令本体）；`transcript: "short"` = AI 审判带紧凑上下文，可判断"用户明确要求的操作应放行"（意图优先）。
@@ -184,7 +201,7 @@ pwsh 的形状判定比 bash 更严格（`;` / `|` / `$()` / 反引号 / 数组�
 
 ## 审计记录格式
 
-决策记录为一行 JSON。除判定本身，还会带：`policy`（命中的策略分支）、`userAuthorization`、`aiEvidence` / `aiUnknowns`（裁判引用的证据与它承认没看到的点）、`cwd` / `workdir` / `escalation`（执行事实）、`evidenceFetched` / `evidenceRefused` / `evidenceRounds`（补证轮次与结果）、`hardAsk`（红条命中）。`ai-error` 记录在 LLM 流以 `finish.reason.kind = "error"` 或 `"aborted"` 结束时，保留安全裁剪后的 `finishKind` 与 `failure` 字段：
+决策记录为一行 JSON。熔断与授权相关字段：`kind: "breaker"` 附 `breaker`（`cooldown` / `duplicate-action`）与 `breakerUntil`；人工授权放行是 `kind: "manual-override"` 附 `manualOverride: true`；预算耗尽时 `ai-error` 带 `budgetExhausted: true`。除判定本身，还会带：`policy`（命中的策略分支）、`userAuthorization`、`aiEvidence` / `aiUnknowns`（裁判引用的证据与它承认没看到的点）、`cwd` / `workdir` / `escalation`（执行事实）、`evidenceFetched` / `evidenceRefused` / `evidenceRounds`（补证轮次与结果）、`hardAsk`（红条命中）。`ai-error` 记录在 LLM 流以 `finish.reason.kind = "error"` 或 `"aborted"` 结束时，保留安全裁剪后的 `finishKind` 与 `failure` 字段：
 
 ```json
 {"kind":"ai-error","finishKind":"error","failure":{"code":"TIMEOUT","message":"upstream request timed out"},"error":"judge stream finished with error [TIMEOUT]: upstream request timed out"}
