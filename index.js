@@ -1393,6 +1393,12 @@ export function createHandler({ config, record, llmRunner, getSessionMode, denia
 					// was auto-approved rather than only that it was.
 					policy: decision.rule,
 					risk: answered.verdict.risk,
+					// The judge's own opinion, kept next to the policy branch that
+					// used it: without it a past decision cannot be replayed under a
+					// new policy (scripts/eval.mjs --replay).
+					judgeAuthorization: answered.verdict.authorization,
+					// The tolerance in force, so the decision can be replayed later.
+					tolerance: cfg.ai.riskTolerance,
 					...answered.verdict.userAuthorization === undefined ? {} : { userAuthorization: answered.verdict.userAuthorization },
 					...answered.verdict.evidence === undefined ? {} : { aiEvidence: answered.verdict.evidence },
 					...answered.verdict.unknowns === undefined ? {} : { aiUnknowns: answered.verdict.unknowns },

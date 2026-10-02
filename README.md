@@ -73,6 +73,7 @@ dsh plugin --profile web add dsh-codex-approval
 | 编写规则、理解判断过程与日志 | [决策链与规则语法](docs/decision-chain.md) |
 | Web 设置与模型配置排查 | [Web 配置卡片](docs/client-card.md) |
 | 安全机制与已知限制 | [安全模型与边界](docs/security.md) |
+| 判定质量怎么衡量（评测三层、指标、门槛） | [评测与回归](docs/evaluation.md) |
 | 开发、构建与兼容性声明 | [开发说明](docs/development.md) |
 | 作者本地部署的特殊配置 | [本地部署环境说明](docs/dev-environment.md) |
 | 版本变化 | [更新日志](docs/changelog.md) |
