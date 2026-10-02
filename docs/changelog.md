@@ -20,6 +20,7 @@
 - **评测闭环 `eval/`**：24 条人工真值案例（覆盖复合命令、命令替换、间接执行、凭据外传、伪造授权、注入、超长、提权、类生产目标）+ `scripts/eval.mjs` 三层（`--policy` 离线策略回归按 CI 用；`--replay` 用真实审计记录重算落点；`--live` 调真实模型出误放行/误拒/交人工/p95）。审计新增 `judgeAuthorization` 与 `tolerance`，使历史判定可精确回放
 - **独立审核（codex, gpt-6.1-sol, medium）的六条 major 修复**：①策略强制人工（高风险无授权、超档放行）在 `ai-auto` 下不再被 `mode3OnAsk: allow` 放行，改由 `ai.enforcedAskOnUnattended`（默认拒绝）决定；②`hardAsk` 只能标在 `ask` 规则上，标到 `allow`/`deny` 上装配期报错（此前会被静默忽略并当作普通放行）；③补证对 **realpath 解析后**的路径再查一次凭据（此前指向 `.env` 的同工作区符号链接可绕过），凭据名单补 `auth.json`（任意位置）、`.codex-run/`、`.netrc`/`_netrc`、`.config/gh/`、`.docker/config.json`、`.kube/config`；④补证被拒的清单会进入第二轮提示（`Evidence unavailable`），且「只被拒、没取到」也会发起第二轮；⑤`ai.totalBudgetMs` 成为硬上限（去掉 1s 下限），补证读取共享同一截止并拒绝非常规文件（FIFO/设备）；⑥`/approval-allow-once` 的授权键绑定 `workdir` 与提权目标——同一命令换个目录或加提权不再消费授权
 - **第二轮独立审核的闭环修复**：①`hardAsk` 校验覆盖**结构化规则**（`tool`/`pattern` 形态此前绕过校验，标在 `allow` 上会被静默忽略并直接放行）；②`/approval-allow-once` 的授权键改为 JSON 元组编码——此前用分隔符拼接，构造 `workdir`（如 `/a|esc:danger-full-access`）可伪造出另一动作的键并**转移授权**；③`attemptJudge` 增加独立硬超时（候选超时 +250ms 宽限）：适配器不响应 `AbortSignal` 时不再无限挂住审批；④补证的 `realpath` 与 `stat` 和读取共享同一截止，`resolvePath` 卡住（网络挂载、慢符号链接链）同样被截止
+- **策略收紧（由真实模型基线驱动）**：新增 `ask-without-authorization` 分支——AI 判 `ask` 且风险 ≥ medium 且用户授权不是 strong 时交人工（`enforced`），不再因「风险在容忍度内」而放行。首轮 live 基线（`eval/reports/2026-10-02-live-*.md`）里 `curl … \| sh` 就是这样被自动放行的（模型自己判 medium + ask + weak）。容忍度现在只决定「风险 low 的 ask」与「用户明确要求过的 ask」的落点
 - 不变：规则优先级（deny > ask > allow）、证据门槛、`denyFeedback`、`transcript`、审计日志格式与轮转、候选链语义
 
 验证：`node --test` 全绿。

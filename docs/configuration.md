@@ -75,14 +75,14 @@
 | `provider` | `cpa-wx301` | 判定模型 provider |
 | `model` | `command/deepseek/deepseek-v4.1-flash` | 判定模型 id |
 | `fallbacks` | `[{deepseek-official, deepseek-flash}]` | 有序兜底候选，最多 4 项，按 provider+model 去重 |
-| `riskTolerance` | `medium` | **只决定 AI 判 `ask` 时的落点**：`风险 ≤ 容忍度 → 自动放行`。AI 判 `allow` 但超出档位、或高风险且无明确用户授权时，仍会交人工——它不是「自动放行上限」 |
+| `riskTolerance` | `medium` | 容忍度只决定「风险 low 的 ask」与「用户明确要求过的 ask」的落点：`风险 ≤ 容忍度 → 自动放行`。AI 判 `allow` 但超出档位、风险 high 且无明确用户授权、或 **AI 自己拿不准（ask）且风险 ≥ medium 又没人授权**，都会交人工——它不是「自动放行上限」 |
 | `maxPromptChars` | `2000` | 仅限审计日志 / UI 预览长度，**不参与决策** |
 | `maxJudgeCommandChars` | `8000` | 审判命令预算（200–200000）。超限按 `evidence-incomplete` 处理，不问 AI |
 | `timeoutMs` | `15000` | **每个候选各自计时**的超时 |
 | `maxTokens` | `512` | 判定输出上限（含 reasoning 余量） |
 | `failOpen` | `ask` | AI 层全部候选失败时的兜底：`ask` \| `deny` \| `allow` |
 | `hardAskOnUnattended` | `deny` | **红条**（发布、凭据）在 `ai-auto` 下的归宿：`deny` \| `ask`。红条不经过 `mode3OnAsk`，`allow` 不是合法值 |
-| `enforcedAskOnUnattended` | `deny` | **策略强制人工**（高风险且无明确用户授权、AI 放行但超出档位）在 `ai-auto` 下的归宿：`deny` \| `ask`。同样不经过 `mode3OnAsk`，`allow` 不是合法值 |
+| `enforcedAskOnUnattended` | `deny` | **策略强制人工**（风险 high 且无明确用户授权、AI 放行但超出档位、AI 拿不准且风险 ≥ medium 又没人授权）在 `ai-auto` 下的归宿：`deny` \| `ask`。同样不经过 `mode3OnAsk`，`allow` 不是合法值 |
 | `totalBudgetMs` | `30000` | **一次审批的总预算**：覆盖全部候选与补证轮次，单候选仍受 `timeoutMs` 限制但会被剩余预算压低（`0` 关闭） |
 | `evidenceFetch` | `read-file` | 裁判按需补证：`off` \| `read-file`（工作区内只读、最多 `evidenceMaxFiles` 个、每个 ≤ `evidenceMaxBytes`；拒凭据文件、二进制与越界路径） |
 | `evidenceMaxFiles` | `2` | 单次审批可读取的证据文件数（1–8） |

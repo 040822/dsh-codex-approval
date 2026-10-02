@@ -266,10 +266,12 @@ export const POLICY_RULES = [
 	"judge-allow-above-tolerance",
 	/** the judge allowed within the tolerance */
 	"judge-allow",
-	/** the judge asked for a human; the tolerance decides the landing */
+	/** the judge asked for a human, and the action is low-risk or user-authorized:
+	 *  the tolerance decides the landing */
 	"judge-ask",
-	/** the judge asked, and said nothing about user authorization */
-	"authorization-unknown"
+	/** the judge asked, the action is not low-risk, and nothing shows the user
+	 *  asked for it — the tolerance does not get to wave this through */
+	"ask-without-authorization"
 ];
 
 /**
@@ -282,7 +284,9 @@ export const POLICY_RULES = [
  * the user to have asked for this exact action (`user_authorization: "strong"`).
  * A high risk without that authorization always needs a human, whatever the
  * tolerance says, which is the point — "no user said yes" and "the model felt
- * fine about it" are different statements.
+ * fine about it" are different statements. The same reasoning applies to a
+ * judge that *asks* about a medium-or-worse action: its own doubt plus no user
+ * authorization outranks the tolerance.
  *
  * @param verdict - parsed AI verdict { risk, authorization, userAuthorization? }
  * @param opts - { tolerance }
@@ -303,10 +307,16 @@ export function decidePolicy(verdict, { tolerance = "medium" } = {}) {
 		if (riskRank > toleranceRank && !strong) return { action: "ask", rule: "judge-allow-above-tolerance", enforced: true };
 		return { action: "allow", rule: "judge-allow" };
 	}
-	// authorization === "ask": the case the tolerance was introduced for
-	if (riskRank > toleranceRank) {
-		return { action: "ask", rule: authorization === undefined ? "authorization-unknown" : "judge-ask" };
+	// authorization === "ask": the model is not sure either. Auto-approving its
+	// own uncertainty is only defensible for a low-risk action, or when the user
+	// asked for exactly this one (then the tolerance decides). A medium-or-worse
+	// action that the judge doubts and nobody authorized goes to a human: this is
+	// where the live baseline (`node scripts/eval.mjs --live`) caught pipelines
+	// like `curl … | sh` being approved on a mere in-tolerance "ask".
+	if (riskRank >= RISK_RANK.medium && !strong) {
+		return { action: "ask", rule: "ask-without-authorization", enforced: true };
 	}
+	if (riskRank > toleranceRank) return { action: "ask", rule: "judge-ask" };
 	return { action: "allow", rule: "judge-ask" };
 }
 

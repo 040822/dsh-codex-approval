@@ -107,20 +107,20 @@ bash/pwsh 的 **allow 规则只在命令被 `shell-shape.js` 判定为 `simple`*
 | `high-risk-insufficient-authorization` | 风险 high，且用户授权不是 strong | 交人工（**容忍度管不了它**） |
 | `judge-allow-above-tolerance` | 裁判判 allow，但风险高于容忍度、授权不是 strong | 交人工 |
 | `judge-allow` | 裁判判 allow，且在容忍度内（或授权 strong） | 放行 |
-| `judge-ask` | 裁判判 ask：风险 ≤ 容忍度 → 放行；否则交人工 | 两种落点（后者是「拿不准」，可被无人值守开关接管） |
-| `authorization-unknown` | 裁判判 ask、超出容忍度、且没给授权字段 | 交人工（审计能看出是"没给字段"） |
+| `ask-without-authorization` | 裁判判 ask、风险 ≥ medium、授权不是 strong | 交人工（`enforced`；**live 基线里 `curl … \| sh` 正是从这里被放行的**） |
+| `judge-ask` | 裁判判 ask，且风险 low 或授权 strong：在容忍度内 → 放行，否则交人工 | 两种落点 |
 
 三档容忍度在 `ai` 模式下的落点：
 
 | 容忍度 | 自动放行 | 交人工 |
 |---|---|---|
-| `low` | 裁判 allow 且风险 low；裁判 ask 且风险 low | 其余，含一切 high |
-| `medium`（默认） | 裁判 allow 且风险 ≤ medium（或授权 strong）；裁判 ask 且风险 ≤ medium | 高风险、超出档位的 allow |
-| `high` | 裁判 allow 且风险 ≤ high（或授权 strong）；裁判 ask 且风险 ≤ high | 高风险且无 strong 授权 |
+| `low` | 风险 low 的 allow；风险 low 的 ask | 其余，含一切 high |
+| `medium`（默认） | 风险 ≤ medium 的 allow（或授权 strong）；风险 low 的 ask（或授权 strong） | 高风险、超出档位的 allow、以及 ≥ medium 且没人授权的 ask |
+| `high` | 风险 ≤ high 的 allow（或授权 strong）；风险 low 的 ask（或授权 strong） | 高风险且无 strong 授权、≥ medium 且没人授权的 ask |
 
 容忍度**不是**「自动放行上限」：它决定裁判判 `ask` 时的落点，而裁判判 `allow` 时还要看风险档位与用户授权。
 
-前两条交人工的分支（`high-risk-insufficient-authorization`、`judge-allow-above-tolerance`）带 `enforced: true` 标记，含义是「用户没有授权」，不是「裁判拿不准」。`ai-auto` 下最终落到 `ask` 的动作按来源分三路，**都不能被 `mode3OnAsk: allow` 放行**：
+三条交人工的分支（`high-risk-insufficient-authorization`、`judge-allow-above-tolerance`、`ask-without-authorization`）带 `enforced: true` 标记，含义是「用户没有授权」，不是「裁判拿不准」。`ai-auto` 下最终落到 `ask` 的动作按来源分三路，**都不能被 `mode3OnAsk: allow` 放行**：
 
 | 来源 | 归宿 |
 |---|---|

@@ -2617,8 +2617,9 @@ test("handler: a read that outlives the budget is refused, not waited on (findin
 	assert.ok(elapsed < 3000, `the approval must not hang on a slow read (took ${elapsed}ms)`);
 	// The stub judge does not implement the budget, so the second round still
 	// answers; what this test pins is that a read that never returns is refused
-	// at the deadline instead of hanging the approval on it.
-	assert.equal(outcome, "allowed-once");
+	// at the deadline instead of hanging the approval on it. (The judge's answer
+	// is medium + ask with no authorization, which is an enforced human decision.)
+	assert.equal(outcome, "unavailable");
 	assert.deepEqual(records.at(-1).evidenceRefused, [{ path: "scripts/slow.sh", reason: "deadline-exceeded" }]);
 	assert.equal(records.at(-1).evidenceRounds, 2);
 	assert.deepEqual(records.at(-1).evidenceRefused, [{ path: "scripts/slow.sh", reason: "deadline-exceeded" }]);

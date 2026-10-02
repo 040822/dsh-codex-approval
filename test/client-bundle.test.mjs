@@ -381,14 +381,18 @@ test("card: risk-tolerance copy agrees with the judge's actual permissiveness", 
 	assert.deepEqual(options.map((option) => option.props.value), ["low", "medium", "high"]);
 	const labels = options.map((option) => collectText(option.props.children).join(""));
 
-	// Ground truth from the policy layer: a higher tolerance is more permissive
-	// for an ask, with one deliberate exception — a high risk still needs the
-	// user to have asked for this exact action, whatever the tolerance says.
+	// Ground truth from the policy layer: a higher tolerance is more permissive,
+	// with two deliberate exceptions that no tolerance can wave through — a high
+	// risk, and a judge that doubts a medium-or-worse action, both without the
+	// user having asked for exactly this.
 	assert.equal(decidePolicy({ risk: "high", authorization: "ask" }, { tolerance: "low" }).action, "ask");
 	assert.equal(decidePolicy({ risk: "medium", authorization: "ask" }, { tolerance: "low" }).action, "ask");
-	assert.equal(decidePolicy({ risk: "medium", authorization: "ask" }, { tolerance: "medium" }).action, "allow");
-	assert.equal(decidePolicy({ risk: "medium", authorization: "ask" }, { tolerance: "high" }).action, "allow");
-	assert.equal(decidePolicy({ risk: "high", authorization: "ask" }, { tolerance: "high" }).action, "ask");
+	assert.equal(decidePolicy({ risk: "medium", authorization: "ask" }, { tolerance: "high" }).action, "ask");
+	assert.equal(decidePolicy({ risk: "low", authorization: "ask" }, { tolerance: "low" }).action, "allow");
+	assert.equal(decidePolicy({ risk: "low", authorization: "ask" }, { tolerance: "high" }).action, "allow");
+	assert.equal(decidePolicy({ risk: "medium", authorization: "ask", userAuthorization: "strong" }, { tolerance: "medium" }).action, "allow");
+	assert.equal(decidePolicy({ risk: "medium", authorization: "allow", userAuthorization: "strong" }, { tolerance: "medium" }).action, "allow");
+	assert.equal(decidePolicy({ risk: "high", authorization: "allow", userAuthorization: "strong" }, { tolerance: "low" }).action, "allow");
 
 	// The copy must not claim the opposite of that, which is exactly what the
 	// shipped labels did ("low · 尽量放行" / "high · 尽量询问").

@@ -97,9 +97,9 @@ const NUL = '\u0000'
  * user picking the stricter-sounding option silently widened auto-approval.
  */
 const TOLERANCES = [
-  { value: 'low', label: 'low · 严格：只放行 low 风险的 ask' },
-  { value: 'medium', label: 'medium · 平衡（默认）：放行 ≤medium 的 ask' },
-  { value: 'high', label: 'high · 宽松：high 风险的 ask 也放行（仍需用户明确要求该动作）' },
+  { value: 'low', label: 'low · 严格：只放行 low 风险' },
+  { value: 'medium', label: 'medium · 平衡（默认）：放行 ≤medium 风险' },
+  { value: 'high', label: 'high · 宽松：放行 ≤high 风险' },
 ]
 const FAIL_OPEN = [
   { value: 'ask', label: 'ask · 交给人确认（默认）' },
@@ -334,7 +334,7 @@ export function DshCodexApprovalCard({ settingsScope, loadModelCatalog }: Props)
           </Field>
 
           <div className="dsh-ca-grid">
-            <Field label="风险容忍度" hint="只约束 AI 判 ask 时的落点；越高越宽松。AI 放行但超出档位、或高风险且无明确用户授权时，仍会交给人工。">
+            <Field label="风险容忍度" hint="越高越宽松，但有两道与档位无关的底线：AI 自己拿不准（ask）且风险 ≥ medium、或风险 high 而用户没明确要求，都会交给人工。">
               <select className="dsh-ca-select" value={String(value.riskTolerance ?? 'medium')} disabled={disabled}
                 onChange={(event) => setField('riskTolerance', event.target.value)}>
                 {TOLERANCES.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}

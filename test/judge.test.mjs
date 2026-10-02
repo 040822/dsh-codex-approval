@@ -100,13 +100,20 @@ const POLICY_CASES = [
 	{ name: "low-allow/low", verdict: { risk: "low", authorization: "allow" }, tolerance: "low", action: "allow", rule: "judge-allow" },
 	{ name: "low-allow/medium", verdict: { risk: "low", authorization: "allow" }, tolerance: "medium", action: "allow", rule: "judge-allow" },
 	{ name: "low-allow/high", verdict: { risk: "low", authorization: "allow" }, tolerance: "high", action: "allow", rule: "judge-allow" },
-	// judge ask: the landing zone the tolerance was introduced for
+	// a judge "ask" about a LOW-risk action: the tolerance decides, as always
 	{ name: "low-ask/low", verdict: { risk: "low", authorization: "ask" }, tolerance: "low", action: "allow", rule: "judge-ask" },
-	{ name: "medium-ask/medium", verdict: { risk: "medium", authorization: "ask" }, tolerance: "medium", action: "allow", rule: "judge-ask" },
-	{ name: "medium-ask/high", verdict: { risk: "medium", authorization: "ask" }, tolerance: "high", action: "allow", rule: "judge-ask" },
-	// judge ask above the tolerance, with and without an authorization field
-	{ name: "medium-ask-unknown/low", verdict: { risk: "medium", authorization: "ask" }, tolerance: "low", action: "ask", rule: "authorization-unknown" },
-	{ name: "medium-ask-none/low", verdict: { risk: "medium", authorization: "ask", userAuthorization: "none" }, tolerance: "low", action: "ask", rule: "judge-ask" },
+	{ name: "low-ask/medium", verdict: { risk: "low", authorization: "ask" }, tolerance: "medium", action: "allow", rule: "judge-ask" },
+	{ name: "low-ask/high", verdict: { risk: "low", authorization: "ask" }, tolerance: "high", action: "allow", rule: "judge-ask" },
+	// ... but a judge that doubts a medium-or-worse action nobody authorized does
+	// not get waved through, whatever the tolerance says
+	{ name: "medium-ask-none/low", verdict: { risk: "medium", authorization: "ask", userAuthorization: "none" }, tolerance: "low", action: "ask", rule: "ask-without-authorization" },
+	{ name: "medium-ask-none/medium", verdict: { risk: "medium", authorization: "ask", userAuthorization: "none" }, tolerance: "medium", action: "ask", rule: "ask-without-authorization" },
+	{ name: "medium-ask-none/high", verdict: { risk: "medium", authorization: "ask", userAuthorization: "none" }, tolerance: "high", action: "ask", rule: "ask-without-authorization" },
+	{ name: "medium-ask-unknown/low", verdict: { risk: "medium", authorization: "ask" }, tolerance: "low", action: "ask", rule: "ask-without-authorization" },
+	{ name: "medium-ask-weak/high", verdict: { risk: "medium", authorization: "ask", userAuthorization: "weak" }, tolerance: "high", action: "ask", rule: "ask-without-authorization" },
+	// ... unless the user asked for exactly this action, and then the tolerance is back
+	{ name: "medium-ask-strong/medium", verdict: { risk: "medium", authorization: "ask", userAuthorization: "strong" }, tolerance: "medium", action: "allow", rule: "judge-ask" },
+	{ name: "medium-ask-strong/low", verdict: { risk: "medium", authorization: "ask", userAuthorization: "strong" }, tolerance: "low", action: "ask", rule: "judge-ask" },
 	{ name: "high-ask-strong/low", verdict: { risk: "high", authorization: "ask", userAuthorization: "strong" }, tolerance: "low", action: "ask", rule: "judge-ask" },
 	{ name: "high-ask-strong/high", verdict: { risk: "high", authorization: "ask", userAuthorization: "strong" }, tolerance: "high", action: "allow", rule: "judge-ask" },
 	// explicit user authorization is what carries an above-tolerance allow
@@ -133,13 +140,20 @@ test("decidePolicy: a judge's allow no longer overrides the tolerance by itself"
 	assert.equal(decidePolicy({ risk: "medium", authorization: "allow" }, { tolerance: "low" }).action, "ask");
 	// ... and an unknown authorization field is the conservative reading
 	assert.equal(decidePolicy({ risk: "medium", authorization: "allow" }, { tolerance: "high" }).action, "allow");
-	assert.equal(decidePolicy({ risk: "medium", authorization: "ask" }, { tolerance: "low" }).rule, "authorization-unknown");
+	assert.equal(decidePolicy({ risk: "medium", authorization: "ask" }, { tolerance: "low" }).rule, "ask-without-authorization");
+	// ... and a judge's own doubt about a medium-risk action is not waved through
+	// just because the tolerance is wide enough.
+	assert.equal(decidePolicy({ risk: "medium", authorization: "ask" }, { tolerance: "high" }).action, "ask");
+	assert.equal(decidePolicy({ risk: "medium", authorization: "ask" }, { tolerance: "high" }).enforced, true);
 });
 
 test("decidePolicy: a missing tolerance falls back to medium", () => {
-	assert.equal(decidePolicy({ risk: "medium", authorization: "ask" }).action, "allow");
+	// medium + ask + no authorization is an enforced human decision now; what the
+	// default tolerance still decides is the low-risk case.
+	assert.equal(decidePolicy({ risk: "low", authorization: "ask" }).action, "allow");
+	assert.equal(decidePolicy({ risk: "medium", authorization: "ask" }).action, "ask");
 	assert.equal(decidePolicy({ risk: "high", authorization: "ask" }).action, "ask");
-	assert.equal(decidePolicy({ risk: "medium", authorization: "ask" }, {}).action, "allow");
+	assert.equal(decidePolicy({ risk: "low", authorization: "ask" }, {}).action, "allow");
 });
 
 test("judgeWith: happy path returns parsed verdict", async () => {
