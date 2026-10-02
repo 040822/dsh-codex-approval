@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { CARD_CSS, CARD_STYLE_ID, ensureCardStyle } from "../client-card-style.js";
+import { CARD_CSS, CARD_STYLE_ID, ensureCardStyle } from "../src/client/client-card-style.js";
 
 /**
  * The card styles are injected into the page once, with the same

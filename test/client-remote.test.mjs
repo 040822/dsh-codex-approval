@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { resolveModelCatalogLoader } from "../client-remote.js";
+import { resolveModelCatalogLoader } from "../src/client/client-remote.js";
 
 /**
  * The client runtime's cordis proxy refuses undeclared services, and the host

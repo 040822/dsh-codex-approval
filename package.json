@@ -17,9 +17,6 @@
   "files": [
     "index.js",
     "lib/client.js",
-    "client-model-picker.js",
-    "client-remote.js",
-    "client-card-style.js",
     "rules.js",
     "shell-shape.js",
     "redact.js",
@@ -29,7 +26,6 @@
     "modes.js",
     "transcript.js",
     "cordis.patch.yml",
-    "scripts/build-client.mjs",
     "README.md",
     "LICENSE"
   ],

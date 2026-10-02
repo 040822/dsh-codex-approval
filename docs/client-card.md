@@ -29,7 +29,7 @@ Web UI → **设置 → 插件 → 插件配置**（英文 `Settings → Plugins
 
 与内置插件卡片一致——`<ul>` 里的 `<li>` 卡片（`.5px` 边框、16px 圆角、`bg-layer-3`／展开后 `bg-layer-2`），可折叠 header（名称 + 描述 + 未保存 Tag + 箭头）、body 表单、footer 的「放弃 / 保存」。
 
-样式取值逐条抄自内置的 `PluginCard.module.css` 与 `fields.module.css`（边框、圆角、14/16px 内边距、15px/600 标题、13px 描述、34px 控件高、focus 用 `--dsw-alias-brand-primary` 描边），并作用域在 `dsh-ca-` 前缀下，通过 `data-plugin-css` 约定的 `<style>` 注入（`client-card-style.js`，测试见 `test/client-card-style.test.mjs`）。
+样式取值逐条抄自内置的 `PluginCard.module.css` 与 `fields.module.css`（边框、圆角、14/16px 内边距、15px/600 标题、13px 描述、34px 控件高、focus 用 `--dsw-alias-brand-primary` 描边），并作用域在 `dsh-ca-` 前缀下，通过 `data-plugin-css` 约定的 `<style>` 注入（`src/client/client-card-style.js`，测试见 `test/client-card-style.test.mjs`）。
 
 图标、`Tag`、`Switch` 来自 shell 静态表模块 `@deepseek-ai/dsh-client-ui-primitives`。卡片默认折叠，与其它插件卡片行为一致。
 
@@ -57,7 +57,7 @@ Web UI → **设置 → 插件 → 插件配置**（英文 `Settings → Plugins
 **3. `remote.session` 是点号服务名，必须在 cordis `inject` 里显式声明。**
 DSH 自带的设置面板声明的是 `["slots","locale","remote","remote.credentials","remote.session","settingsScope"]`。只声明 `remote` 会抛 `cannot get property "remote.session" without inject`；而且 slot 卡片是在**标签页的 fiber** 里渲染的，在那里碰这个代理会直接 `slot entry crashed in 'settings.plugin.item'`，整张卡片消失。
 
-所以本插件在自己的 fiber 里把 `modelCatalog()` 解析成普通函数再交给卡片（`client-remote.js`，测试见 `test/client-remote.test.mjs`）。
+所以本插件在自己的 fiber 里把 `modelCatalog()` 解析成普通函数再交给卡片（`src/client/client-remote.js`，测试见 `test/client-remote.test.mjs`）。
 
 ### 自查
 

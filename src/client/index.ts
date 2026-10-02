@@ -8,8 +8,8 @@ import type {} from '@deepseek-ai/dsh-api-remotes/client'
 // module in the graph, so the renderer is the module to depend on.
 import type {} from '@deepseek-ai/dsh-client-ui-renderer/client'
 import { makeCodexApprovalSection } from './DshCodexApprovalCard.tsx'
-import { resolveModelCatalogLoader } from '../../client-remote.js'
-import { ensureCardStyle } from '../../client-card-style.js'
+import { resolveModelCatalogLoader } from './client-remote.js'
+import { ensureCardStyle } from './client-card-style.js'
 
 /** 0.1.x 的 settings 命名空间名。 */
 const SETTINGS_NAMESPACE = 'dsh-codex-approval-config'

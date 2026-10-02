@@ -50,7 +50,7 @@ import {
   readChain,
   splitByAvailability,
   validateChain,
-} from '../../client-model-picker.js'
+} from './client-model-picker.js'
 
 /**
  * Settings card for the approval judge models.
@@ -58,7 +58,7 @@ import {
  * Rendered into the Plugins → Plugin configuration tab's `settings.plugin.item`
  * slot, so it must look like the built-in cards: an `<li>` with the same chrome
  * (collapsible header, name + description, unsaved tag, body, footer with
- * discard/save). Styles live in client-card-style.js and mirror the shipped
+ * discard/save). Styles live in src/client/client-card-style.js and mirror the shipped
  * PluginCard/fields stylesheets value for value.
  */
 
@@ -66,7 +66,7 @@ type Props = {
   settingsScope: SettingsScope<Record<string, unknown>>
   /**
    * Bound `remote.session.modelCatalog()` resolved by the plugin's own fiber
-   * (see client-remote.js). The card must not touch the `remote` service proxy
+   * (see src/client/client-remote.js). The card must not touch the `remote` service proxy
    * itself: slot entries render in the tab's fiber, where cordis refuses
    * undeclared services and the whole card would crash.
    */

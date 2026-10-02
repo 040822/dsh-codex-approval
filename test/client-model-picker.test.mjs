@@ -9,7 +9,7 @@ import {
 	readChain,
 	splitByAvailability,
 	validateChain
-} from "../client-model-picker.js";
+} from "../src/client/client-model-picker.js";
 
 const CATALOG = {
 	routableProviders: ["cpa-wx301", "deepseek-official"],

@@ -4,7 +4,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
-import { resolveModelCatalogLoader } from "../client-remote.js";
+import { resolveModelCatalogLoader } from "../src/client/client-remote.js";
 
 /**
  * Loads the shipped browser bundle (lib/client.js) in a fake module loader and
