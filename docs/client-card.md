@@ -16,9 +16,10 @@ Web UI → **设置 → 插件 → 插件配置**（英文 `Settings → Plugins
 |---|---|
 | **主模型** | 下拉，按 provider 分组，可用项在前、不可用项标 `⚠` 并置底 |
 | **兜底候选** | 最多 4 项，可增删、可上下移动调序 |
-| **风险容忍度** | `low` / `medium` / `high` |
+| **风险容忍度** | `low` / `medium` / `high`；只决定 AI 判 `ask` 时的落点 |
 | **`failOpen`** | AI 全部候选失败时的兜底动作 |
 | **`mode3OnAsk`** | `ai-auto` 下 `ask` 的归宿 |
+| **红条无人值守时** | `ai.hardAskOnUnattended`：发布 / 凭据这类红条在 `ai-auto` 下的归宿（默认拒绝，不受 `mode3OnAsk` 影响） |
 | **超时** | 每个候选各自的超时 |
 | **最大输出 token** | 判定输出上限 |
 | **拒绝反馈开关** | `denyFeedback` |

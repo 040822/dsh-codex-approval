@@ -308,7 +308,7 @@ test("card: is a collapsed plugin card that expands into the full form", () => {
 	assert.match(text, /cpa-wx301 \/ command\/deepseek\/deepseek-v4\.1-flash → deepseek-official \/ deepseek-flash/);
 	assert.doesNotMatch(text, /undefined/, `card leaked "undefined": ${text}`);
 
-	assert.equal(collectElements(tree).filter((element) => element.type === "select").length, 5, "primary + 1 fallback + 3 policy selects");
+	assert.equal(collectElements(tree).filter((element) => element.type === "select").length, 6, "primary + 1 fallback + 4 policy selects");
 	assert.equal(byClass(tree, "dsh-ca-save").length, 1);
 	assert.equal(byClass(tree, "dsh-ca-discard").length, 1);
 	assert.equal(byClass(tree, "dsh-ca-save")[0].props.disabled, true, "save is disabled until something changes");
@@ -369,7 +369,7 @@ test("card: a downgraded catalog sinks unavailable providers and flags a dead pr
 });
 
 test("card: risk-tolerance copy agrees with the judge's actual permissiveness", async () => {
-	const { decideAuthorization } = await import("../judge.js");
+	const { decidePolicy } = await import("../judge.js");
 	const react = makeReact();
 	const mod = loadBundle(react);
 	const { component, scope, slotProps, loadModelCatalog } = mountCard(mod, { value: VALUE });
@@ -381,11 +381,14 @@ test("card: risk-tolerance copy agrees with the judge's actual permissiveness", 
 	assert.deepEqual(options.map((option) => option.props.value), ["low", "medium", "high"]);
 	const labels = options.map((option) => collectText(option.props.children).join(""));
 
-	// Ground truth from the decision mapping: higher tolerance = more permissive.
-	assert.equal(decideAuthorization({ risk: "high", authorization: "ask" }, "low"), "ask");
-	assert.equal(decideAuthorization({ risk: "medium", authorization: "ask" }, "low"), "ask");
-	assert.equal(decideAuthorization({ risk: "medium", authorization: "ask" }, "medium"), "allow");
-	assert.equal(decideAuthorization({ risk: "high", authorization: "ask" }, "high"), "allow");
+	// Ground truth from the policy layer: a higher tolerance is more permissive
+	// for an ask, with one deliberate exception — a high risk still needs the
+	// user to have asked for this exact action, whatever the tolerance says.
+	assert.equal(decidePolicy({ risk: "high", authorization: "ask" }, { tolerance: "low" }).action, "ask");
+	assert.equal(decidePolicy({ risk: "medium", authorization: "ask" }, { tolerance: "low" }).action, "ask");
+	assert.equal(decidePolicy({ risk: "medium", authorization: "ask" }, { tolerance: "medium" }).action, "allow");
+	assert.equal(decidePolicy({ risk: "medium", authorization: "ask" }, { tolerance: "high" }).action, "allow");
+	assert.equal(decidePolicy({ risk: "high", authorization: "ask" }, { tolerance: "high" }).action, "ask");
 
 	// The copy must not claim the opposite of that, which is exactly what the
 	// shipped labels did ("low · 尽量放行" / "high · 尽量询问").

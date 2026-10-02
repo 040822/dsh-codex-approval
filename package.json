@@ -21,6 +21,7 @@
     "shell-shape.js",
     "redact.js",
     "enrich.js",
+    "evidence.js",
     "i18n.js",
     "judge.js",
     "modes.js",

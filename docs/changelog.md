@@ -4,6 +4,21 @@
 
 ---
 
+## 未发布 — 决策语义与证据补齐（版本号待定）
+
+**两处语义变更：放行由程序按规则算，红条不再受无人值守开关影响。**
+
+- **策略层 `decidePolicy` 取代旧的容忍度映射**：裁判只给风险、处理意见与**用户授权强度**（`none` / `weak` / `strong`），最终动作由固定分支表算出，命中的分支名进审计（`policy`）。行为变化：裁判判 `allow` 不再自动越过 `riskTolerance`——超档放行需要用户明确要求过这条动作；**风险 high 且授权不是 strong 时一律交人工**，容忍度管不了它
+- **红条 `hardAsk`**：发布（npm / pnpm / yarn / bun publish、npm unpublish、twine upload、cargo publish、docker push、gh release create、git push）与凭据路径（`.ssh` / `.aws` / `.codex/auth.json` / `id_rsa` / `id_ed25519`）标为红条。`ai-auto` 下不走 `mode3OnAsk`，改由 `ai.hardAskOnUnattended` 决定（默认**拒绝**）；`.dsh/*` 保持普通 `ask`。`ai.hardAskOnUnattended` 不接受 `allow`
+- **执行事实进判定与审计**：`workdir`（本条命令的实际目录）、`sandbox_permissions` + `justification`（本次请求的提权目标与理由）此前被 `argsPreview` 丢掉，现在随请求进入判定与审计；提权理由是 agent 自述，属不可信证据
+- **按需补证（`ai.evidenceFetch`，默认 `read-file`）**：裁判可请求读取工作区内至多 `evidenceMaxFiles`（默认 2）个文件，插件按白名单抓取（realpath 复核、拒凭据与二进制、超长截断）并**再审一次**；拒绝原因进审计（`evidenceRefused`）与第二轮提示。`off` 恢复单轮判定
+- **审计可解释性**：记录新增 `policy` / `userAuthorization` / `aiEvidence` / `aiUnknowns` / `cwd` / `workdir` / `escalation` / `evidenceFetched` / `evidenceRefused` / `evidenceRounds` / `hardAsk`
+- 不变：规则优先级（deny > ask > allow）、证据门槛、`denyFeedback`、`transcript`、审计日志格式与轮转、候选链语义
+
+验证：`node --test` 全绿。
+
+---
+
 ## v0.4.5 — 2026-10-02
 
 **安全更新：关闭路径层、规则层与 git 配置层的确定性放行路径。**

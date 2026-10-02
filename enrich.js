@@ -60,6 +60,44 @@ export function findToolCallArgs(events, callId) {
 	return null;
 }
 
+/** Shell tools whose call arguments carry execution-location and escalation facts. */
+const SHELL_TOOLS = new Set(["bash", "pwsh"]);
+
+/**
+ * The execution facts of a shell call that the approval seam does not carry but
+ * the tool arguments do.
+ *
+ * The approval request handed to answerers is only `{ toolName, callId,
+ * reason }`; everything else has to be recovered from the call's arguments.
+ * For a shell call those arguments additionally answer three questions the
+ * judge needs and cannot guess:
+ *   - `workdir` — the directory THIS command runs in (the session cwd is only
+ *     the default; a call may override it, and a relative value resolves
+ *     against the session workspace).
+ *   - `sandbox_permissions` / `justification` — the widening this exact call
+ *     requests (DSH requires the pair together: a target mode plus one
+ *     sentence of justification). This is the "permission change" dimension:
+ *     the judge must weigh the intended effect under the WIDER mode.
+ *   - `run_in_background` — whether the command outlives the approval turn.
+ *
+ * `justification` is the agent's own statement: it travels as untrusted
+ * evidence and is never treated as user authorization.
+ *
+ * @param args - parsed tool arguments (or null)
+ * @param toolName - the tool that was called
+ * @returns a facts object, or null when there is nothing to add/not a shell call
+ */
+export function shellCallFacts(args, toolName) {
+	if (!SHELL_TOOLS.has(toolName)) return null;
+	if (args === null || typeof args !== "object") return null;
+	const facts = {};
+	if (typeof args.workdir === "string" && args.workdir.trim() !== "") facts.workdir = args.workdir;
+	if (typeof args.sandbox_permissions === "string" && args.sandbox_permissions.trim() !== "") facts.escalationTo = args.sandbox_permissions;
+	if (typeof args.justification === "string" && args.justification.trim() !== "") facts.justification = args.justification;
+	if (args.run_in_background === true) facts.background = true;
+	return Object.keys(facts).length === 0 ? null : facts;
+}
+
 /**
  * Build the arguments text: the raw command for bash/pwsh, compact JSON
  * otherwise.

@@ -6,16 +6,22 @@
 
 ```
 approval/request 到达（toolName + callId + reason）
-├─ 1. 参数反查：按 callId 从会话日志恢复**完整**命令（bash/pwsh 取原始 command；不截断）
+├─ 1. 参数反查：按 callId 从会话日志恢复**完整**命令（bash/pwsh 取原始 command；不截断），
+│      同时取出审批接缝不给的执行事实：workdir（本条命令的实际执行目录）、
+│      sandbox_permissions + justification（本次请求的提权目标与理由）
 ├─ 2. 形状判定（shell-shape.js，bash/pwsh）：simple（单条纯命令）/ compound（安全分隔符串联）/ opaque（重定向、替换、变量、通配、控制流…）
 │     只有 simple 才可能被 allow 规则放行；compound/opaque 一律交规则 ask/deny → AI/人类
 ├─ 3. 证据门槛：参数缺失或命令超 ai.maxJudgeCommandChars → 标记 evidence-incomplete，**不问 AI**
 │      ai → 交人类；ai-auto → 拒绝（mode3OnAsk=allow 也不能放行）
 ├─ 4. 规则层（deny > ask > allow，命中即定，0ms）
 │     deny → 直接拒绝（AI 无权覆盖）│ allow → 静默放行 │ ask → 交人类
+│     标了 hardAsk 的 ask 是**红条**（发布、凭据）：ai-auto 下不走 mode3OnAsk，
+│     改由 ai.hardAskOnUnattended 决定（默认 deny）
 ├─ 5. AI 审判层（规则未命中时）
-│     LLM 裁决 {risk, authorization, reason}——要求**单个**合法 JSON 对象，多裁决视为非法
-│     allow/deny 直接生效；ask 按 riskTolerance 映射
+│     LLM 裁决 {risk, authorization, user_authorization, evidence, unknowns, reason}
+│     ——要求**单个**合法 JSON 对象，多裁决视为非法
+│     判定要求补证（needs）→ 插件按白名单只读抓取（默认最多 2 个文件）→ 带证据再审一次
+│     策略层 decidePolicy 把裁决映射成 allow / ask / deny（见下「策略层」）
 │     主模型失败或未给出可解析判定 → 依次尝试 ai.fallbacks
 │     全部候选失败/超时/输出非法 → failOpen（默认 ask → 人类）
 └─ 6. 兜底：fallback（默认 ask → GUI 弹窗）
@@ -58,6 +64,8 @@ approval/request 到达（toolName + callId + reason）
 
 优先级：**deny > ask > allow**（与列表顺序无关）；同优先级内按列表顺序取首个。
 
+`ask` 规则可以再标 `hardAsk: true`（文本与结构化规则都支持），把它升级成**红条**：这是一条「必须本人签字」的询问，`ai-auto` 下不走 `mode3OnAsk`，而由 `ai.hardAskOnUnattended` 决定（默认拒绝）。默认规则里发布命令与凭据路径都标了红条；`.dsh/*` 不标（要常用 dsh 修 dsh）。
+
 ### ② 结构化 argv 前缀（仿 Codex `prefix_rule`）
 
 ```yaml
@@ -85,11 +93,40 @@ bash/pwsh 的 **allow 规则只在命令被 `shell-shape.js` 判定为 `simple`*
 
 > 边界说明：`shell-shape.js` 是**保守识别器**，不是 shell 解析器。它只回答"这条命令能否信任其 argv"，**不做子命令拆分**。真正不可绕过的边界仍是沙箱与宿主工具审批策略；规则里的 deny 是加速拒绝，不是沙箱强制。
 
+## 策略层（`decidePolicy`）
+
+裁判只给三条判断（风险、它自己的处理意见、用户授权强度），**放行与否由程序按固定规则算**；命中的分支名会写进审计的 `policy` 字段，所以事后能回答「这次为什么自动放行」。求值顺序（先命中先返回）：
+
+| 分支（`policy`） | 条件 | 结果 |
+|---|---|---|
+| `judge-deny` | 裁判判 deny | deny（任何容忍度都一样） |
+| `high-risk-insufficient-authorization` | 风险 high，且用户授权不是 strong | 交人工（**容忍度管不了它**） |
+| `judge-allow-above-tolerance` | 裁判判 allow，但风险高于容忍度、授权不是 strong | 交人工 |
+| `judge-allow` | 裁判判 allow，且在容忍度内（或授权 strong） | 放行 |
+| `judge-ask` | 裁判判 ask：风险 ≤ 容忍度 → 放行；否则交人工 | 两种落点 |
+| `authorization-unknown` | 裁判判 ask、超出容忍度、且没给授权字段 | 交人工（审计能看出是"没给字段"） |
+
+三档容忍度在 `ai` 模式下的落点：
+
+| 容忍度 | 自动放行 | 交人工 |
+|---|---|---|
+| `low` | 裁判 allow 且风险 low；裁判 ask 且风险 low | 其余，含一切 high |
+| `medium`（默认） | 裁判 allow 且风险 ≤ medium（或授权 strong）；裁判 ask 且风险 ≤ medium | 高风险、超出档位的 allow |
+| `high` | 裁判 allow 且风险 ≤ high（或授权 strong）；裁判 ask 且风险 ≤ high | 高风险且无 strong 授权 |
+
+容忍度**不是**「自动放行上限」：它决定裁判判 `ask` 时的落点，而裁判判 `allow` 时还要看风险档位与用户授权。`ai-auto` 下最终仍落到 `ask` 的动作，再按来源分流：证据不足 → 拒绝；红条 → `ai.hardAskOnUnattended`；其余 → `mode3OnAsk`。
+
+用户授权强度（`user_authorization`）由裁判给出：`strong` = 用户在本会话里用自己的话要求了这条动作或这个确切目标；`weak` = 用户要求过相近的事，但目标、范围或副作用不同；`none` = 没有用户请求覆盖它。agent 自己写的 reason 与提权理由**永远不算**用户授权；字段缺失时按「不是 strong」处理。
+
 ## AI 审判输入 / 输出
 
-**输入**：一条 `system` 消息（固定政策：审批员角色 + risk/authorization 定义 + 意图优先规则 + 只输出 JSON 约束）+ 一条 `user` 消息（`{"toolName", "command", "reason"}`，必要时附 `Context:` 会话骨架）。两者分属不同 role，命令文本无法冒充指令层级。命令本体**不截断**（截断只用于审计/UI 预览）；超过 `ai.maxJudgeCommandChars`（默认 8000）时不问 AI，按 evidence-incomplete 处理。命令与 reason 在进入 prompt 前统一脱敏（`redact.js`）。
+**输入**：一条 `system` 消息（固定政策：审批员角色 + 风险/授权定义 + 执行事实说明 + 补证规则 + 只输出 JSON 约束）+ 一条 `user` 消息（请求 JSON，必要时再附 `Evidence:` 与 `Context:` 块）。两者分属不同 role，命令文本无法冒充指令层级。命令本体**不截断**（截断只用于审计/UI 预览）；超过 `ai.maxJudgeCommandChars`（默认 8000）时不问 AI，按 evidence-incomplete 处理。命令、reason 与提权理由在进入 prompt 前统一脱敏（`redact.js`）。
 
-**输出**：`{"risk":"low|medium|high","authorization":"allow|ask|deny","reason":"一句话"}`。
+请求 JSON 里除 `toolName` / `command` / `reason`，还可能带执行事实：`cwd`（会话工作区）、`workdir`（本条命令的实际目录）、`escalation.to`（本次请求的提权目标）与 `escalation.justification`（提权理由）。后两者是**不可信证据**：它们由 agent 自己写，只用于判断，不构成用户授权。
+
+**输出**：`{"risk":"low|medium|high","authorization":"allow|ask|deny","user_authorization":"none|weak|strong","evidence":["…"],"unknowns":["…"],"reason":"一句话"}`。`evidence` 与 `unknowns` 是短列表，用来记录它依据了什么、以及它承认没看到什么。
+
+**按需补证**：裁判可在回复里加 `"needs":[{"type":"read-file","path":"<工作区相对路径>","why":"…"}]`（默认最多 2 条），请求读取会改变结论的文件——`bash scripts/deploy.sh` 的效果就藏在脚本里。插件按白名单抓取：realpath 复核后必须落在工作区内、拒凭据文件（`.ssh` / `.aws` / `.codex/auth.json` / `.dsh/profiles` / `.dsh/settings.yaml` / `.env` / 私钥 / `.npmrc` 等）、拒二进制、超长截断并标注；抓不到的文件连同原因记进 `evidenceRefused`，并在第二轮告知裁判。带证据的第二次判定是**最后一轮**（提示词不再提供补证入口），两轮共享同一次审批的时间预算。
 
 解析策略：整串 JSON，或"恰好一个**判决形状**的平衡对象"（允许前后散文/代码围栏）。出现两个及以上裁决、判决被包在别的对象里、或枚举非法 → 该候选失败。**不接受"取第一个对象"**：模型先说 allow 再说 deny 时不会被解读成 allow。
 
@@ -147,7 +184,7 @@ pwsh 的形状判定比 bash 更严格（`;` / `|` / `$()` / 反引号 / 数组�
 
 ## 审计记录格式
 
-决策记录为一行 JSON。`ai-error` 记录在 LLM 流以 `finish.reason.kind = "error"` 或 `"aborted"` 结束时，保留安全裁剪后的 `finishKind` 与 `failure` 字段：
+决策记录为一行 JSON。除判定本身，还会带：`policy`（命中的策略分支）、`userAuthorization`、`aiEvidence` / `aiUnknowns`（裁判引用的证据与它承认没看到的点）、`cwd` / `workdir` / `escalation`（执行事实）、`evidenceFetched` / `evidenceRefused` / `evidenceRounds`（补证轮次与结果）、`hardAsk`（红条命中）。`ai-error` 记录在 LLM 流以 `finish.reason.kind = "error"` 或 `"aborted"` 结束时，保留安全裁剪后的 `finishKind` 与 `failure` 字段：
 
 ```json
 {"kind":"ai-error","finishKind":"error","failure":{"code":"TIMEOUT","message":"upstream request timed out"},"error":"judge stream finished with error [TIMEOUT]: upstream request timed out"}

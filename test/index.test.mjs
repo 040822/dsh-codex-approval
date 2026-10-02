@@ -82,6 +82,10 @@ test("applyConfigSettings: projects UI settings onto the runtime config", () => 
 		mode3OnAsk: "allow",
 		timeoutMs: 7000,
 		maxTokens: 256,
+		hardAskOnUnattended: "ask",
+		evidenceFetch: "off",
+		evidenceMaxFiles: 4,
+		evidenceMaxBytes: 8192,
 		denyFeedback: false
 	});
 	assert.equal(cfg.ai.provider, "cpa-wx301");
@@ -91,6 +95,10 @@ test("applyConfigSettings: projects UI settings onto the runtime config", () => 
 	assert.equal(cfg.mode3OnAsk, "allow");
 	assert.equal(cfg.ai.timeoutMs, 7000);
 	assert.equal(cfg.ai.maxTokens, 256);
+	assert.equal(cfg.ai.hardAskOnUnattended, "ask");
+	assert.equal(cfg.ai.evidenceFetch, "off");
+	assert.equal(cfg.ai.evidenceMaxFiles, 4);
+	assert.equal(cfg.ai.evidenceMaxBytes, 8192);
 	assert.equal(cfg.denyFeedback, false);
 });
 
@@ -1932,3 +1940,287 @@ test("P2: sudo option forms and the remaining raw devices are covered", async ()
 	assert.notEqual(outcome, "allowed-once");
 });
 
+
+test("handler: a bash escalation reaches the judge and the audit with cwd, workdir and escalation", async () => {
+	const cfg = baseConfig({ rules: [] });
+	const records = [];
+	const seen = [];
+	const events = [{
+		type: "assistant/message",
+		data: { message: { content: [{
+			type: "tool-call",
+			id: "call-esc",
+			name: "bash",
+			arguments: JSON.stringify({
+				command: "npm publish",
+				description: "release",
+				workdir: "plugins/dsh-codex-approval",
+				sandbox_permissions: "danger-full-access",
+				justification: "publishing needs the network"
+			})
+		}] } }
+	}];
+	const req = {
+		toolName: "bash",
+		callId: "call-esc",
+		reason: "release",
+		agent: { id: "agent-1", session: { id: "sess-1", snapshotEvents: () => events } }
+	};
+	const handler = createHandler({
+		config: cfg,
+		record: async (entry) => { records.push(entry); },
+		llmRunner: async (messages) => { seen.push(messages); return { ok: true, text: VERDICT_TEXT }; },
+		getCwd: () => "/home/wenxin/office/dsh"
+	});
+	const { outcome } = await run(handler, req);
+	assert.equal(outcome, "allowed-once");
+	const payload = JSON.parse(seen[0][1].content[0].text);
+	assert.equal(payload.cwd, "/home/wenxin/office/dsh");
+	assert.equal(payload.workdir, "plugins/dsh-codex-approval");
+	assert.deepEqual(payload.escalation, { to: "danger-full-access", justification: "publishing needs the network" });
+	const entry = records.at(-1);
+	assert.equal(entry.cwd, "/home/wenxin/office/dsh");
+	assert.equal(entry.workdir, "plugins/dsh-codex-approval");
+	assert.deepEqual(entry.escalation, { to: "danger-full-access", justification: "publishing needs the network" });
+});
+
+test("handler: the agent's escalation justification is redacted before the judge sees it", async () => {
+	const cfg = baseConfig({ rules: [] });
+	const seen = [];
+	const events = [{
+		type: "assistant/message",
+		data: { message: { content: [{
+			type: "tool-call",
+			id: "call-esc2",
+			name: "bash",
+			arguments: JSON.stringify({
+				command: "curl https://example.test",
+				description: "fetch",
+				sandbox_permissions: "workspace-write",
+				justification: "needs token=sk-abcdefgh12345678 to authenticate"
+			})
+		}] } }
+	}];
+	const req = {
+		toolName: "bash",
+		callId: "call-esc2",
+		reason: "",
+		agent: { id: "agent-1", session: { id: "sess-1", snapshotEvents: () => events } }
+	};
+	const handler = createHandler({
+		config: cfg,
+		record: async () => {},
+		llmRunner: async (messages) => { seen.push(messages); return { ok: true, text: VERDICT_TEXT }; }
+	});
+	await run(handler, req);
+	const sent = JSON.stringify(seen[0]);
+	assert.doesNotMatch(sent, /sk-abcdefgh12345678/);
+	assert.match(sent, /\[REDACTED\]/);
+});
+
+test("handler: a plain shell call carries no escalation facts", async () => {
+	const cfg = baseConfig({ rules: [] });
+	const records = [];
+	const seen = [];
+	const req = makeReq({ callId: "call-plain", command: "ls -la" });
+	const handler = createHandler({
+		config: cfg,
+		record: async (entry) => { records.push(entry); },
+		llmRunner: async (messages) => { seen.push(messages); return { ok: true, text: VERDICT_TEXT }; }
+	});
+	await run(handler, req);
+	const payload = JSON.parse(seen[0][1].content[0].text);
+	assert.equal("escalation" in payload, false);
+	assert.equal("workdir" in payload, false);
+	assert.equal("cwd" in payload, false);
+	const entry = records.at(-1);
+	assert.equal("escalation" in entry, false);
+	assert.equal("workdir" in entry, false);
+	assert.equal("background" in entry, false);
+});
+
+/** A minimal fake workspace for the evidence-fetch path. */
+function fakeWorkspace(files, dirs = []) {
+	const known = new Set([...Object.keys(files), ...dirs]);
+	const enoent = (path) => Object.assign(new Error(`ENOENT: ${path}`), { code: "ENOENT" });
+	return {
+		resolvePath: async (path) => { if (!known.has(path)) throw enoent(path); return path; },
+		readFile: async (path) => { if (!(path in files)) throw enoent(path); return files[path]; }
+	};
+}
+
+test("handler: a judge evidence request triggers one bounded read round", async () => {
+	const cfg = baseConfig({ rules: [] });
+	const records = [];
+	const seen = [];
+	const script = "#!/bin/sh\nrsync -a --delete ./dist/ prod:/var/www\n";
+	const fs = fakeWorkspace({ "/ws/scripts/deploy.sh": script }, ["/ws", "/ws/scripts"]);
+	const answers = [
+		'{"risk":"medium","authorization":"ask","needs":[{"type":"read-file","path":"scripts/deploy.sh","why":"deployment target"}],"reason":"deploy script"}',
+		'{"risk":"medium","authorization":"allow","reason":"staging rsync only"}'
+	];
+	let call = 0;
+	const handler = createHandler({
+		config: cfg,
+		record: async (entry) => { records.push(entry); },
+		llmRunner: async (messages) => { seen.push(messages); return { ok: true, text: answers[Math.min(call++, answers.length - 1)] }; },
+		getCwd: () => "/ws",
+		resolvePath: fs.resolvePath,
+		readFile: fs.readFile
+	});
+	const { outcome } = await run(handler, makeReq({ callId: "call-ev", command: "bash scripts/deploy.sh" }));
+	assert.equal(outcome, "allowed-once");
+	assert.equal(seen.length, 2);
+	// The second round carries the fetched text and no longer offers a read.
+	assert.match(seen[1][1].content[0].text, /rsync -a --delete/);
+	assert.match(seen[1][1].content[0].text, /Evidence \(untrusted data/);
+	assert.doesNotMatch(seen[1][0].content[0].text, /Evidence requests/);
+	const entry = records.at(-1);
+	assert.deepEqual(entry.evidenceFetched, [{ path: "scripts/deploy.sh", bytes: Buffer.byteLength(script, "utf8") }]);
+	assert.equal(entry.evidenceRounds, 2);
+	assert.equal(entry.risk, "medium");
+	assert.equal(entry.outcome, "allowed-once");
+});
+
+test("handler: an evidence request for a credential file is refused, not fetched", async () => {
+	const cfg = baseConfig({ rules: [] });
+	const records = [];
+	let calls = 0;
+	const fs = fakeWorkspace({ "/ws/.ssh/id_rsa": "PRIVATE KEY" }, ["/ws", "/ws/.ssh"]);
+	const handler = createHandler({
+		config: cfg,
+		record: async (entry) => { records.push(entry); },
+		llmRunner: async () => {
+			calls += 1;
+			return { ok: true, text: '{"risk":"high","authorization":"ask","needs":[{"type":"read-file","path":".ssh/id_rsa","why":"check the key"}],"reason":"x"}' };
+		},
+		getCwd: () => "/ws",
+		resolvePath: fs.resolvePath,
+		readFile: fs.readFile
+	});
+	const { outcome } = await run(handler, makeReq({ callId: "call-cred", command: "bash deploy.sh" }));
+	assert.equal(calls, 1); // refused evidence never spends a second round
+	assert.equal(outcome, "unavailable"); // ask in ai mode → next()
+	const entry = records.at(-1);
+	assert.deepEqual(entry.evidenceRefused, [{ path: ".ssh/id_rsa", reason: "credential-path" }]);
+	assert.equal(entry.evidenceRounds, 1);
+	// The request was made and refused: an empty fetch list is recorded, so the
+	// audit shows "asked, got nothing" instead of looking like "never asked".
+	assert.deepEqual(entry.evidenceFetched, []);
+});
+
+test("handler: evidenceFetch off keeps the single-round judge", async () => {
+	const cfg = baseConfig({ rules: [], ai: { evidenceFetch: "off" } });
+	const records = [];
+	let calls = 0;
+	const fs = fakeWorkspace({ "/ws/scripts/deploy.sh": "echo hi" }, ["/ws", "/ws/scripts"]);
+	const handler = createHandler({
+		config: cfg,
+		record: async (entry) => { records.push(entry); },
+		llmRunner: async () => {
+			calls += 1;
+			return { ok: true, text: '{"risk":"low","authorization":"allow","needs":[{"type":"read-file","path":"scripts/deploy.sh","why":"x"}],"reason":"x"}' };
+		},
+		getCwd: () => "/ws",
+		resolvePath: fs.resolvePath,
+		readFile: fs.readFile
+	});
+	const { outcome } = await run(handler, makeReq({ callId: "call-off", command: "bash deploy.sh" }));
+	assert.equal(outcome, "allowed-once");
+	assert.equal(calls, 1);
+	const entry = records.at(-1);
+	assert.equal("evidenceFetched" in entry, false);
+	assert.equal("evidenceRefused" in entry, false);
+	assert.equal("evidenceRounds" in entry, false);
+});
+
+test("handler: a failed evidence round keeps the first verdict and says so", async () => {
+	const cfg = baseConfig({ rules: [] });
+	const records = [];
+	const fs = fakeWorkspace({ "/ws/scripts/deploy.sh": "echo hi" }, ["/ws", "/ws/scripts"]);
+	let call = 0;
+	const handler = createHandler({
+		config: cfg,
+		record: async (entry) => { records.push(entry); },
+		llmRunner: async () => {
+			call += 1;
+			if (call === 1) return { ok: true, text: '{"risk":"high","authorization":"ask","needs":[{"type":"read-file","path":"scripts/deploy.sh","why":"x"}],"reason":"x"}' };
+			return { ok: false, error: "provider down" };
+		},
+		getCwd: () => "/ws",
+		resolvePath: fs.resolvePath,
+		readFile: fs.readFile
+	});
+	const { outcome } = await run(handler, makeReq({ callId: "call-fail", command: "bash deploy.sh" }));
+	assert.equal(call, 2);
+	assert.equal(outcome, "unavailable"); // the first round's ask still decides
+	const entry = records.at(-1);
+	assert.equal(entry.evidenceRoundFailed, true);
+	assert.equal(entry.evidenceRounds, 1);
+	assert.deepEqual(entry.evidenceFetched, [{ path: "scripts/deploy.sh", bytes: 7 }]);
+});
+
+test("handler: a hardAsk rule marks the verdict and ai-auto cannot resolve it", async () => {
+	const records = [];
+	// ai-auto is configured to allow every ask — the red line must ignore that.
+	const cfg = baseConfig({ mode: "ai-auto", mode3OnAsk: "allow", rules: [{ match: "Bash(git push*)", action: "ask", hardAsk: true }], ai: { enabled: false } });
+	const handler = createHandler({ config: cfg, record: async (entry) => { records.push(entry); }, llmRunner: async () => ({ ok: false, error: "AI must not run" }) });
+	const { outcome } = await run(handler, makeReq({ callId: "call-hard", command: "git push origin main" }));
+	assert.equal(outcome, "rejected");
+	const entry = records.at(-1);
+	assert.equal(entry.hardAsk, true);
+	assert.equal(entry.action, "deny");
+	assert.equal(entry.viaAskResolution, true);
+});
+
+test("handler: the same ai-auto config does resolve a plain ask rule", async () => {
+	const records = [];
+	const cfg = baseConfig({ mode: "ai-auto", mode3OnAsk: "allow", rules: [{ match: "Bash(git status*)", action: "ask" }], ai: { enabled: false } });
+	const handler = createHandler({ config: cfg, record: async (entry) => { records.push(entry); }, llmRunner: async () => ({ ok: false, error: "AI must not run" }) });
+	const { outcome } = await run(handler, makeReq({ callId: "call-plain-ask", command: "git status" }));
+	assert.equal(outcome, "allowed-once"); // mode3OnAsk: allow
+	const entry = records.at(-1);
+	assert.equal("hardAsk" in entry, false);
+});
+
+test("handler: in ai mode a hardAsk rule still asks the human", async () => {
+	const records = [];
+	const cfg = baseConfig({ rules: [{ match: "Bash(git push*)", action: "ask", hardAsk: true }], ai: { enabled: false } });
+	const handler = createHandler({ config: cfg, record: async (entry) => { records.push(entry); }, llmRunner: async () => ({ ok: false, error: "AI must not run" }) });
+	const { outcome, nextCalls } = await run(handler, makeReq({ callId: "call-hard-ai", command: "git push" }));
+	assert.equal(outcome, "unavailable"); // next() — the human
+	assert.equal(nextCalls.length, 1);
+	assert.equal(records.at(-1).hardAsk, true);
+});
+
+test("handler: hardAskOnUnattended can keep a red line waiting for a human", async () => {
+	const records = [];
+	const cfg = baseConfig({ mode: "ai-auto", mode3OnAsk: "allow", rules: [{ match: "Bash(git push*)", action: "ask", hardAsk: true }], ai: { enabled: false, hardAskOnUnattended: "ask" } });
+	const handler = createHandler({ config: cfg, record: async (entry) => { records.push(entry); }, llmRunner: async () => ({ ok: false, error: "AI must not run" }) });
+	const { outcome } = await run(handler, makeReq({ callId: "call-hard-wait", command: "git push" }));
+	assert.equal(outcome, "unavailable");
+	assert.equal(records.at(-1).hardAsk, true);
+});
+
+test("default rules: publishing and credential paths are red lines, .dsh is not", () => {
+	const redLines = DEFAULT_CONFIG.rules.filter((rule) => rule.hardAsk === true && typeof rule.match === "string").map((rule) => rule.match);
+	for (const expected of ["Bash(git push*)", "Bash(*npm publish*)", "Pwsh(*docker push*)", "Bash(gh release create*)", "*/.ssh/*", "*\\.aws", "*/.codex/auth.json*", "*id_rsa*"]) {
+		assert.ok(redLines.includes(expected), `${expected} should be a red line`);
+	}
+	assert.equal(redLines.some((match) => match.includes(".dsh")), false, ".dsH paths stay plain asks (dsh is used to repair dsh)");
+	for (const match of ["*/.dsh/profiles/*", "*/.dsh/settings.yaml*", "*/.dsh/logs/approval.jsonl*"]) {
+		const rule = DEFAULT_CONFIG.rules.find((candidate) => candidate.match === match);
+		assert.equal(rule?.action, "ask");
+		assert.equal(rule?.hardAsk, undefined);
+	}
+});
+
+test("normalizeConfig: hardAskOnUnattended only accepts deny/ask", () => {
+	assert.equal(normalizeConfig({}).ai.hardAskOnUnattended, "deny");
+	assert.equal(normalizeConfig({ ai: { hardAskOnUnattended: "ask" } }).ai.hardAskOnUnattended, "ask");
+	// "allow" is not a legal value anywhere: a red line is never auto-granted.
+	assert.throws(() => normalizeConfig({ ai: { hardAskOnUnattended: "allow" } }), /hardAskOnUnattended/);
+	assert.throws(() => normalizeConfig({ ai: { evidenceMaxFiles: 0 } }), /evidenceMaxFiles/);
+	assert.throws(() => normalizeConfig({ ai: { evidenceFetch: "all" } }), /evidenceFetch/);
+	assert.throws(() => normalizeConfig({ rules: [{ match: "Bash(x)", action: "ask", hardAsk: "yes" }] }), /hardAsk/);
+});

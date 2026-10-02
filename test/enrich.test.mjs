@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { findToolCallArgs, getSessionEvents, argsPreview } from "../enrich.js";
+import { findToolCallArgs, getSessionEvents, argsPreview, shellCallFacts } from "../enrich.js";
 
 function assistantMsg(parts) {
 	return { type: "assistant/message", data: { message: { content: parts } } };
@@ -95,4 +95,48 @@ test("argsPreview: null/undefined/primitive handling", () => {
 	assert.equal(argsPreview(null, "bash", 100), "");
 	assert.equal(argsPreview(undefined, "bash", 100), "");
 	assert.equal(argsPreview(42, "bash", 100), "42");
+});
+
+test("shellCallFacts: recovers workdir, escalation pair and background from a bash call", () => {
+	assert.deepEqual(
+		shellCallFacts({
+			command: "rm -rf build",
+			description: "clean",
+			workdir: "sub/dir",
+			sandbox_permissions: "workspace-write",
+			justification: "the build tree lives outside the sandbox",
+			run_in_background: true
+		}, "bash"),
+		{
+			workdir: "sub/dir",
+			escalationTo: "workspace-write",
+			justification: "the build tree lives outside the sandbox",
+			background: true
+		}
+	);
+	assert.deepEqual(shellCallFacts({ command: "Get-ChildItem", sandbox_permissions: "danger-full-access", justification: "x" }, "pwsh"), {
+		escalationTo: "danger-full-access",
+		justification: "x"
+	});
+});
+
+test("shellCallFacts: a plain shell call has no extra facts", () => {
+	assert.equal(shellCallFacts({ command: "git status", description: "x" }, "bash"), null);
+	assert.equal(shellCallFacts({ command: "git status", workdir: "   ", justification: "" }, "bash"), null);
+});
+
+test("shellCallFacts: non-shell tools and unusable arguments return null", () => {
+	assert.equal(shellCallFacts({ command: "x", workdir: "/tmp" }, "fs"), null);
+	assert.equal(shellCallFacts({ command: "x", workdir: "/tmp" }, "web"), null);
+	assert.equal(shellCallFacts(null, "bash"), null);
+	assert.equal(shellCallFacts(undefined, "bash"), null);
+	assert.equal(shellCallFacts("rm -rf /", "bash"), null);
+});
+
+test("shellCallFacts: an escalation target without a justification is still reported", () => {
+	// The host rejects the pair when it is incomplete, so this only proves the
+	// reader never drops a requested widening on the floor.
+	assert.deepEqual(shellCallFacts({ command: "x", sandbox_permissions: "danger-full-access" }, "bash"), {
+		escalationTo: "danger-full-access"
+	});
 });

@@ -35,8 +35,9 @@ import { join, dirname, isAbsolute, relative, resolve } from "node:path";
 import z from "@deepseek-ai/schemastery";
 
 import { classifyRequest, evaluateRules, ruleLabel } from "./rules.js";
-import { findToolCallArgs, argsPreview } from "./enrich.js";
-import { judgeWith, decideAuthorization, parseVerdict } from "./judge.js";
+import { findToolCallArgs, argsPreview, shellCallFacts } from "./enrich.js";
+import { judgeWith, decidePolicy, parseVerdict } from "./judge.js";
+import { parseNeeds, fetchEvidence } from "./evidence.js";
 import { buildTranscript } from "./transcript.js";
 import { MODES, parseMode, resolveMode, effectiveOnAsk } from "./modes.js";
 import { T, pickLocale, commandDescription, renderDenialNotice } from "./i18n.js";
@@ -53,6 +54,28 @@ export const name = "dsh-codex-approval";
  * load when the composition has no approval service).
  */
 export const inject = ["approval", "llm"];
+
+/**
+ * Publishing commands that always need a human — the "red lines".
+ *
+ * A `hardAsk` rule is an ask that an unattended mode may not resolve through
+ * `mode3OnAsk`: with no human around it fails closed (see
+ * `ai.hardAskOnUnattended`, default deny). Matched with the tool prefix (so a
+ * non-shell tool that merely mentions the text stays out) and with a wildcard
+ * inside it (so `cd pkg && npm publish` is caught too), for bash and pwsh.
+ */
+const PUBLISH_COMMANDS = [
+	"npm publish",
+	"npm unpublish",
+	"pnpm publish",
+	"yarn publish",
+	"bun publish",
+	"twine upload",
+	"cargo publish",
+	"docker push",
+	"gh release create",
+	"git push"
+];
 
 /** Default configuration — tune via the profile patch id-targeted config. */
 export const DEFAULT_CONFIG = {
@@ -140,10 +163,14 @@ export const DEFAULT_CONFIG = {
 		{ match: "Pwsh(Stop-Computer*)", action: "deny" },
 		{ match: "Pwsh(Restart-Computer*)", action: "deny" },
 		// ---- always ask a human ---------------------------------------------
-		// publishing: never auto-decided — a human must confirm every publish
-		// (both bare `npm publish` and prefixed forms like `cd x && npm publish`)
-		{ match: "Bash(npm publish*)", action: "ask" },
-		{ match: "Bash(*npm publish*)", action: "ask" },
+		// publishing: a red line — never auto-decided, and an unattended mode
+		// cannot resolve it through `mode3OnAsk` (it fails closed instead).
+		...PUBLISH_COMMANDS.flatMap((command) => [
+			{ match: `Bash(${command}*)`, action: "ask", hardAsk: true },
+			{ match: `Bash(*${command}*)`, action: "ask", hardAsk: true },
+			{ match: `Pwsh(${command}*)`, action: "ask", hardAsk: true },
+			{ match: `Pwsh(*${command}*)`, action: "ask", hardAsk: true }
+		]),
 		// credentials and approval configuration: reading, copying or writing
 		// these always needs a human, however harmless the command looks. The
 		// *directory* is the secret, so it is matched in three shapes —
@@ -153,38 +180,38 @@ export const DEFAULT_CONFIG = {
 		// starts with the name (`docs/.aws-guide.md`). The backslash forms cover
 		// Windows paths, where the separator is `\` and the forward-slash
 		// patterns never matched.
-		{ match: "*id_rsa*", action: "ask" },
-		{ match: "*id_ed25519*", action: "ask" },
-		{ match: "*/.ssh/*", action: "ask" },
-		{ match: "*/.ssh", action: "ask" },
-		{ match: "*/.ssh *", action: "ask" },
+		{ match: "*id_rsa*", action: "ask", hardAsk: true },
+		{ match: "*id_ed25519*", action: "ask", hardAsk: true },
+		{ match: "*/.ssh/*", action: "ask", hardAsk: true },
+		{ match: "*/.ssh", action: "ask", hardAsk: true },
+		{ match: "*/.ssh *", action: "ask", hardAsk: true },
 		// the same directory written relative to the workspace, with either
 		// separator (`.ssh/config`, `.ssh\\config`, `x\\.ssh\\config`)
-		{ match: "*.ssh/*", action: "ask" },
-		{ match: "*.ssh", action: "ask" },
-		{ match: "*.ssh *", action: "ask" },
-		{ match: "*.ssh\\*", action: "ask" },
-		{ match: "*.ssh\\", action: "ask" },
-		{ match: "*.ssh\\ *", action: "ask" },
-		{ match: "*\\.ssh\\*", action: "ask" },
-		{ match: "*\\.ssh", action: "ask" },
-		{ match: "*\\.ssh *", action: "ask" },
-		{ match: "*/.aws/*", action: "ask" },
-		{ match: "*/.aws", action: "ask" },
-		{ match: "*/.aws *", action: "ask" },
-		{ match: "*.aws/*", action: "ask" },
-		{ match: "*.aws", action: "ask" },
-		{ match: "*.aws *", action: "ask" },
-		{ match: "*.aws\\*", action: "ask" },
-		{ match: "*.aws\\", action: "ask" },
-		{ match: "*.aws\\ *", action: "ask" },
-		{ match: "*\\.aws\\*", action: "ask" },
-		{ match: "*\\.aws", action: "ask" },
-		{ match: "*\\.aws *", action: "ask" },
-		{ match: "*/.codex/auth.json*", action: "ask" },
-		{ match: "*\\.codex\\auth.json*", action: "ask" },
-		{ match: "*.codex/auth.json*", action: "ask" },
-		{ match: "*.codex\\auth.json*", action: "ask" },
+		{ match: "*.ssh/*", action: "ask", hardAsk: true },
+		{ match: "*.ssh", action: "ask", hardAsk: true },
+		{ match: "*.ssh *", action: "ask", hardAsk: true },
+		{ match: "*.ssh\\*", action: "ask", hardAsk: true },
+		{ match: "*.ssh\\", action: "ask", hardAsk: true },
+		{ match: "*.ssh\\ *", action: "ask", hardAsk: true },
+		{ match: "*\\.ssh\\*", action: "ask", hardAsk: true },
+		{ match: "*\\.ssh", action: "ask", hardAsk: true },
+		{ match: "*\\.ssh *", action: "ask", hardAsk: true },
+		{ match: "*/.aws/*", action: "ask", hardAsk: true },
+		{ match: "*/.aws", action: "ask", hardAsk: true },
+		{ match: "*/.aws *", action: "ask", hardAsk: true },
+		{ match: "*.aws/*", action: "ask", hardAsk: true },
+		{ match: "*.aws", action: "ask", hardAsk: true },
+		{ match: "*.aws *", action: "ask", hardAsk: true },
+		{ match: "*.aws\\*", action: "ask", hardAsk: true },
+		{ match: "*.aws\\", action: "ask", hardAsk: true },
+		{ match: "*.aws\\ *", action: "ask", hardAsk: true },
+		{ match: "*\\.aws\\*", action: "ask", hardAsk: true },
+		{ match: "*\\.aws", action: "ask", hardAsk: true },
+		{ match: "*\\.aws *", action: "ask", hardAsk: true },
+		{ match: "*/.codex/auth.json*", action: "ask", hardAsk: true },
+		{ match: "*\\.codex\\auth.json*", action: "ask", hardAsk: true },
+		{ match: "*.codex/auth.json*", action: "ask", hardAsk: true },
+		{ match: "*.codex\\auth.json*", action: "ask", hardAsk: true },
 		{ match: "*/.dsh/profiles/*", action: "ask" },
 		{ match: "*/.dsh/profiles", action: "ask" },
 		{ match: "*/.dsh/profiles *", action: "ask" },
@@ -240,7 +267,21 @@ export const DEFAULT_CONFIG = {
 		maxJudgeCommandChars: 8000,
 		timeoutMs: 15000,
 		maxTokens: 512,
-		failOpen: "ask"
+		failOpen: "ask",
+		// Where a `hardAsk` red line lands when nobody can be asked. A red line
+		// is an ask an unattended mode may not resolve through `mode3OnAsk`
+		// (publishing, credentials): "nobody could consent" is not consent, so
+		// the default is deny. Set to "ask" only if you want the prompt to block.
+		hardAskOnUnattended: "deny",
+		// Read-only evidence fetch for the judge. "read-file" lets a verdict ask
+		// for at most `evidenceMaxFiles` workspace-local files (each bounded by
+		// `evidenceMaxBytes`) and be judged once more with them attached; "off"
+		// keeps the single-round judge. The plugin — not the model — decides what
+		// is readable (evidence.js): realpath-verified inside the workspace, no
+		// credential files, no binaries, and a refusal reason when it says no.
+		evidenceFetch: "read-file",
+		evidenceMaxFiles: 2,
+		evidenceMaxBytes: 16_384
 	},
 	fallback: "ask",
 	// Rejection-attribution feedback: after the plugin denies an escalation,
@@ -266,6 +307,8 @@ export const DEFAULT_CONFIG = {
 
 const ACTIONS = ["allow", "ask", "deny"];
 const TOLERANCES = ["low", "medium", "high"];
+/** Evidence-fetch modes: single-round judge, or one bounded read round. */
+const EVIDENCE_FETCH = ["off", "read-file"];
 /** Upper bound on the ordered judge-fallback chain (the primary is not counted). */
 const MAX_FALLBACKS = 4;
 
@@ -448,6 +491,10 @@ export const Config = z.object({
 	mode3OnAsk: live(z.union(["deny", "allow"])),
 	timeoutMs: live(z.number().step(1).min(1)),
 	maxTokens: live(z.number().step(1).min(1)),
+	hardAskOnUnattended: live(z.union(["deny", "ask"])),
+	evidenceFetch: live(z.union(EVIDENCE_FETCH)),
+	evidenceMaxFiles: live(z.number().step(1).min(1)),
+	evidenceMaxBytes: live(z.number().step(1).min(256)),
 	denyFeedback: live(z.boolean()),
 	sessionOverrides: live(z.dict(z.union(MODES)).default({}))
 });
@@ -485,6 +532,7 @@ function assertConfig(cfg) {
 			}
 			continue;
 		}
+		if (rule.hardAsk !== void 0 && typeof rule.hardAsk !== "boolean") throw new TypeError("dsh-codex-approval: rule.hardAsk must be a boolean");
 		if (typeof rule.match !== "string" || rule.match === "") throw new TypeError("dsh-codex-approval: each rule needs a non-empty match");
 	}
 	if (typeof cfg.ai !== "object" || cfg.ai === null) throw new TypeError("dsh-codex-approval: config.ai must be an object");
@@ -494,8 +542,15 @@ function assertConfig(cfg) {
 	if (!Number.isSafeInteger(cfg.ai.maxJudgeCommandChars) || cfg.ai.maxJudgeCommandChars < 200 || cfg.ai.maxJudgeCommandChars > 200_000) {
 		throw new TypeError("dsh-codex-approval: config.ai.maxJudgeCommandChars must be an integer in 200..200000");
 	}
-	if (!Array.isArray(cfg.ai.fallbacks)) throw new TypeError("dsh-codex-approval: config.ai.fallbacks must be an array");
-	if (cfg.ai.fallbacks.length > MAX_FALLBACKS) throw new TypeError(`dsh-codex-approval: config.ai.fallbacks must hold at most ${MAX_FALLBACKS} entries`);
+	if (!["deny", "ask"].includes(cfg.ai.hardAskOnUnattended)) throw new TypeError("dsh-codex-approval: config.ai.hardAskOnUnattended must be deny/ask");
+	if (!EVIDENCE_FETCH.includes(cfg.ai.evidenceFetch)) throw new TypeError(`dsh-codex-approval: config.ai.evidenceFetch must be one of ${EVIDENCE_FETCH.join("/")}`);
+	if (!Number.isSafeInteger(cfg.ai.evidenceMaxFiles) || cfg.ai.evidenceMaxFiles < 1 || cfg.ai.evidenceMaxFiles > 8) {
+		throw new TypeError("dsh-codex-approval: config.ai.evidenceMaxFiles must be an integer in 1..8");
+	}
+	if (!Number.isSafeInteger(cfg.ai.evidenceMaxBytes) || cfg.ai.evidenceMaxBytes < 256 || cfg.ai.evidenceMaxBytes > 512_000) {
+		throw new TypeError("dsh-codex-approval: config.ai.evidenceMaxBytes must be an integer in 256..512000");
+	}
+	if (!Array.isArray(cfg.ai.fallbacks)) throw new TypeError("dsh-codex-approval: config.ai.fallbacks must be an array");	if (cfg.ai.fallbacks.length > MAX_FALLBACKS) throw new TypeError(`dsh-codex-approval: config.ai.fallbacks must hold at most ${MAX_FALLBACKS} entries`);
 	for (const entry of cfg.ai.fallbacks) {
 		if (typeof entry?.provider !== "string" || entry.provider === "" || typeof entry?.model !== "string" || entry.model === "") {
 			throw new TypeError("dsh-codex-approval: each ai.fallbacks entry needs a non-empty provider and model");
@@ -576,7 +631,11 @@ export function applyConfigSettings(baseConfig, settings) {
 			riskTolerance: pick("riskTolerance", baseAi.riskTolerance),
 			failOpen: pick("failOpen", baseAi.failOpen),
 			timeoutMs: pick("timeoutMs", baseAi.timeoutMs),
-			maxTokens: pick("maxTokens", baseAi.maxTokens)
+			maxTokens: pick("maxTokens", baseAi.maxTokens),
+			hardAskOnUnattended: pick("hardAskOnUnattended", baseAi.hardAskOnUnattended),
+			evidenceFetch: pick("evidenceFetch", baseAi.evidenceFetch),
+			evidenceMaxFiles: pick("evidenceMaxFiles", baseAi.evidenceMaxFiles),
+			evidenceMaxBytes: pick("evidenceMaxBytes", baseAi.evidenceMaxBytes)
 		}
 	});
 }
@@ -1022,6 +1081,20 @@ export function createHandler({ config, record, llmRunner, getSessionMode, denia
 		const args = findToolCallArgs(req.agent?.session, req.callId);
 		const fullText = argsPreview(args, req.toolName);
 
+		// 1b) Execution facts the approval seam does not carry: the directory this
+		//     call runs in and the sandbox widening it requests. They are recovered
+		//     from the same arguments, so they cost nothing extra — and a judge
+		//     that cannot see them is judging a bare command line. `justification`
+		//     is the agent's own sentence: it travels redacted, as evidence to
+		//     verify, never as authorization.
+		const facts = shellCallFacts(args, req.toolName);
+		const escalation = facts === null || (facts.escalationTo === undefined && facts.justification === undefined)
+			? null
+			: {
+				...facts.escalationTo === undefined ? {} : { to: facts.escalationTo },
+				...facts.justification === undefined ? {} : { justification: redactSensitive(facts.justification) }
+			};
+
 		// 2) Classify the command's shape from the ORIGINAL text — redaction must
 		//    never turn an opaque command into an approvable one — then redact
 		//    once, so rules, the judge, the log and the denial feedback all see
@@ -1052,7 +1125,13 @@ export function createHandler({ config, record, llmRunner, getSessionMode, denia
 				evidenceIncomplete: evidenceIssue
 			};
 		} else if (rule !== null) {
-			verdict = { kind: "rule", action: rule.action, outcome: outcomeFor(rule.action), match: ruleLabel(rule) };
+			verdict = {
+				kind: "rule",
+				action: rule.action,
+				outcome: outcomeFor(rule.action),
+				match: ruleLabel(rule),
+				...rule.hardAsk === true ? { hardAsk: true } : {}
+			};
 		} else if (cfg.ai.enabled) {
 			context = cfg.transcript === "short"
 				? buildTranscript({
@@ -1066,9 +1145,10 @@ export function createHandler({ config, record, llmRunner, getSessionMode, denia
 					cwd
 				})
 				: "";
+			const judgeInput = { toolName: req.toolName, argsText, reason: reasonText, context, cwd, workdir: facts?.workdir, escalation };
 			const judged = await judgeWith({
 				runner: llmRunner,
-				input: { toolName: req.toolName, argsText, reason: reasonText, context },
+				input: judgeInput,
 				// Cancel propagation: without this the judge chain keeps spending
 				// model calls (and fallbacks) after the approval was cancelled.
 				signal: req.signal,
@@ -1076,16 +1156,65 @@ export function createHandler({ config, record, llmRunner, getSessionMode, denia
 				sessionId
 			});
 			if (judged.ok) {
-				const authorization = decideAuthorization(judged.verdict, cfg.ai.riskTolerance);
+				// The judge may name up to `evidenceMaxFiles` workspace-local files
+				// whose content would change the verdict (`bash scripts/deploy.sh`
+				// is one line; the deployment target lives in the script). The
+				// plugin fetches them under its own whitelist (evidence.js) and
+				// re-judges ONCE with them attached. A refusal is recorded, never
+				// hidden — "I could not see it" is a judgement input, so the second
+				// round gets the reason list as well.
+				let answered = judged;
+				let evidenceFetched;
+				let evidenceRefused;
+				let evidenceRoundFailed;
+				const needs = cfg.ai.evidenceFetch === "read-file" ? parseNeeds(judged.verdict.needs, cfg.ai.evidenceMaxFiles) : [];
+				if (needs.length > 0) {
+					const fetched = await fetchEvidence(needs, {
+						root: cwd,
+						base: facts?.workdir === undefined || typeof cwd !== "string" ? cwd : resolve(cwd, facts.workdir),
+						maxBytes: cfg.ai.evidenceMaxBytes,
+						resolvePath,
+						readFile: readConfigFile
+					});
+					evidenceFetched = fetched.files.map((file) => ({
+						path: file.path,
+						bytes: file.bytes,
+						...file.truncated === true ? { truncated: true } : {}
+					}));
+					evidenceRefused = fetched.refused;
+					if (fetched.files.length > 0 && req.signal?.aborted !== true) {
+						const second = await judgeWith({
+							runner: llmRunner,
+							input: { ...judgeInput, evidence: fetched.files },
+							signal: req.signal,
+							allowAsk: mode !== "ai-auto",
+							allowNeeds: false,
+							sessionId
+						});
+						if (second.ok) answered = second;
+						else evidenceRoundFailed = true;
+					}
+				}
+				const decision = decidePolicy(answered.verdict, { tolerance: cfg.ai.riskTolerance });
 				verdict = {
 					kind: "ai",
-					action: authorization,
-					outcome: outcomeFor(authorization),
-					risk: judged.verdict.risk,
-					aiReason: judged.verdict.reason,
-					...judged.judgeModel === undefined ? {} : { judgeModel: judged.judgeModel },
-					...judged.judgeFallbackFrom === undefined ? {} : { judgeFallbackFrom: judged.judgeFallbackFrom },
-					...judged.judgeAttempts === undefined ? {} : { judgeAttempts: judged.judgeAttempts }
+					action: decision.action,
+					outcome: outcomeFor(decision.action),
+					// Which policy branch decided, so the audit says why an action
+					// was auto-approved rather than only that it was.
+					policy: decision.rule,
+					risk: answered.verdict.risk,
+					...answered.verdict.userAuthorization === undefined ? {} : { userAuthorization: answered.verdict.userAuthorization },
+					...answered.verdict.evidence === undefined ? {} : { aiEvidence: answered.verdict.evidence },
+					...answered.verdict.unknowns === undefined ? {} : { aiUnknowns: answered.verdict.unknowns },
+					aiReason: answered.verdict.reason,
+					...evidenceFetched === undefined ? {} : { evidenceFetched },
+					...evidenceRefused === undefined || evidenceRefused.length === 0 ? {} : { evidenceRefused },
+					...evidenceRoundFailed === true ? { evidenceRoundFailed: true } : {},
+					...needs.length === 0 ? {} : { evidenceRounds: answered === judged ? 1 : 2 },
+					...answered.judgeModel === undefined ? {} : { judgeModel: answered.judgeModel },
+					...answered.judgeFallbackFrom === undefined ? {} : { judgeFallbackFrom: answered.judgeFallbackFrom },
+					...answered.judgeAttempts === undefined ? {} : { judgeAttempts: answered.judgeAttempts }
 				};
 			} else {
 				verdict = {
@@ -1121,6 +1250,10 @@ export function createHandler({ config, record, llmRunner, getSessionMode, denia
 				commandChars: argsText.length,
 				shape: shapeInfo.shape,
 				transcriptChars: context.length,
+				...cwd === undefined ? {} : { cwd },
+				...facts?.workdir === undefined ? {} : { workdir: facts.workdir },
+				...escalation === null ? {} : { escalation },
+				...facts?.background === true ? { background: true } : {},
 				kind: "cancelled",
 				outcome: "cancelled",
 				ms: Date.now() - started
@@ -1131,10 +1264,18 @@ export function createHandler({ config, record, llmRunner, getSessionMode, denia
 		// mode 3 (ai-auto): an "ask" is never routed to a human — resolve it
 		// through mode3OnAsk (default deny), regardless of its source
 		// (rule ask, AI ask over tolerance, failOpen=ask, fallback=ask).
-		// Evidence-incomplete is exempt: a mode switch must not turn "the
-		// operation could not be seen" into permission.
+		// Two exceptions, deliberately:
+		//   - evidence-incomplete: a mode switch must not turn "the operation
+		//     could not be seen" into permission;
+		//   - hardAsk red lines (publishing, credentials): an unattended switch
+		//     must not grant a consent only a human can give. They land on
+		//     `ai.hardAskOnUnattended` (default deny), never on `mode3OnAsk`.
 		if (mode === "ai-auto" && verdict.action === "ask") {
-			const resolved = verdict.kind === "evidence-incomplete" ? "deny" : effectiveOnAsk(mode, cfg.mode3OnAsk);
+			const resolved = verdict.kind === "evidence-incomplete"
+				? "deny"
+				: verdict.hardAsk === true
+					? cfg.ai.hardAskOnUnattended
+					: effectiveOnAsk(mode, cfg.mode3OnAsk);
 			verdict = { ...verdict, action: resolved, outcome: outcomeFor(resolved), viaAskResolution: true };
 		}
 
@@ -1149,6 +1290,10 @@ export function createHandler({ config, record, llmRunner, getSessionMode, denia
 			commandChars: argsText.length,
 			shape: shapeInfo.shape,
 			transcriptChars: context.length,
+			...cwd === undefined ? {} : { cwd },
+			...facts?.workdir === undefined ? {} : { workdir: facts.workdir },
+			...escalation === null ? {} : { escalation },
+			...facts?.background === true ? { background: true } : {},
 			...verdict,
 			ms: Date.now() - started
 		});

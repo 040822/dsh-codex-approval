@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { buildJudgeMessages, parseVerdict, decideAuthorization, judgeWith } from "../judge.js";
+import { buildJudgeMessages, parseVerdict, decidePolicy, POLICY_RULES, judgeWith } from "../judge.js";
 
 test("buildJudgeMessages: policy is a system message, the request a user message", () => {
 	const [system, user] = buildJudgeMessages({ toolName: "bash", argsText: "git status", reason: "escalate" });
@@ -77,17 +77,69 @@ test("parseVerdict: reason truncated", () => {
 	assert.equal(parsed.reason.length, 200);
 });
 
-test("decideAuthorization: direct allow/deny respected regardless of tolerance", () => {
-	assert.equal(decideAuthorization({ risk: "high", authorization: "allow" }, "low"), "allow");
-	assert.equal(decideAuthorization({ risk: "low", authorization: "deny" }, "high"), "deny");
+/**
+ * The policy matrix: every branch of decidePolicy at every tolerance, asserting
+ * both the action AND the branch that produced it. The second half matters as
+ * much as the first — a branch that quietly starts reading the tolerance would
+ * still return the right action in most rows.
+ */
+const POLICY_CASES = [
+	// judge-deny: the judge's refusal is final at every tolerance
+	{ name: "deny/low", verdict: { risk: "low", authorization: "deny" }, tolerance: "low", action: "deny", rule: "judge-deny" },
+	{ name: "deny/medium", verdict: { risk: "low", authorization: "deny" }, tolerance: "medium", action: "deny", rule: "judge-deny" },
+	{ name: "deny/high", verdict: { risk: "low", authorization: "deny" }, tolerance: "high", action: "deny", rule: "judge-deny" },
+	// high risk without a strong user authorization: a human, whatever the tolerance
+	{ name: "high-allow-none/low", verdict: { risk: "high", authorization: "allow", userAuthorization: "none" }, tolerance: "low", action: "ask", rule: "high-risk-insufficient-authorization" },
+	{ name: "high-allow-weak/medium", verdict: { risk: "high", authorization: "allow", userAuthorization: "weak" }, tolerance: "medium", action: "ask", rule: "high-risk-insufficient-authorization" },
+	{ name: "high-allow-unknown/high", verdict: { risk: "high", authorization: "allow" }, tolerance: "high", action: "ask", rule: "high-risk-insufficient-authorization" },
+	// a judge "allow" above the tolerance needs the user to have asked for it
+	{ name: "medium-allow-weak/low", verdict: { risk: "medium", authorization: "allow", userAuthorization: "weak" }, tolerance: "low", action: "ask", rule: "judge-allow-above-tolerance" },
+	{ name: "medium-allow-weak/medium", verdict: { risk: "medium", authorization: "allow", userAuthorization: "weak" }, tolerance: "medium", action: "allow", rule: "judge-allow" },
+	{ name: "medium-allow-none/high", verdict: { risk: "medium", authorization: "allow", userAuthorization: "none" }, tolerance: "high", action: "allow", rule: "judge-allow" },
+	// judge allow within the tolerance
+	{ name: "low-allow/low", verdict: { risk: "low", authorization: "allow" }, tolerance: "low", action: "allow", rule: "judge-allow" },
+	{ name: "low-allow/medium", verdict: { risk: "low", authorization: "allow" }, tolerance: "medium", action: "allow", rule: "judge-allow" },
+	{ name: "low-allow/high", verdict: { risk: "low", authorization: "allow" }, tolerance: "high", action: "allow", rule: "judge-allow" },
+	// judge ask: the landing zone the tolerance was introduced for
+	{ name: "low-ask/low", verdict: { risk: "low", authorization: "ask" }, tolerance: "low", action: "allow", rule: "judge-ask" },
+	{ name: "medium-ask/medium", verdict: { risk: "medium", authorization: "ask" }, tolerance: "medium", action: "allow", rule: "judge-ask" },
+	{ name: "medium-ask/high", verdict: { risk: "medium", authorization: "ask" }, tolerance: "high", action: "allow", rule: "judge-ask" },
+	// judge ask above the tolerance, with and without an authorization field
+	{ name: "medium-ask-unknown/low", verdict: { risk: "medium", authorization: "ask" }, tolerance: "low", action: "ask", rule: "authorization-unknown" },
+	{ name: "medium-ask-none/low", verdict: { risk: "medium", authorization: "ask", userAuthorization: "none" }, tolerance: "low", action: "ask", rule: "judge-ask" },
+	{ name: "high-ask-strong/low", verdict: { risk: "high", authorization: "ask", userAuthorization: "strong" }, tolerance: "low", action: "ask", rule: "judge-ask" },
+	{ name: "high-ask-strong/high", verdict: { risk: "high", authorization: "ask", userAuthorization: "strong" }, tolerance: "high", action: "allow", rule: "judge-ask" },
+	// explicit user authorization is what carries an above-tolerance allow
+	{ name: "medium-allow-strong/low", verdict: { risk: "medium", authorization: "allow", userAuthorization: "strong" }, tolerance: "low", action: "allow", rule: "judge-allow" },
+	{ name: "high-allow-strong/low", verdict: { risk: "high", authorization: "allow", userAuthorization: "strong" }, tolerance: "low", action: "allow", rule: "judge-allow" }
+];
+
+test("decidePolicy: the full branch × tolerance matrix", () => {
+	for (const item of POLICY_CASES) {
+		const decision = decidePolicy(item.verdict, { tolerance: item.tolerance });
+		assert.equal(decision.action, item.action, `${item.name}: action`);
+		assert.equal(decision.rule, item.rule, `${item.name}: branch`);
+	}
 });
 
-test("decideAuthorization: ask verdict falls back to tolerance", () => {
-	assert.equal(decideAuthorization({ risk: "low", authorization: "ask" }, "medium"), "allow");
-	assert.equal(decideAuthorization({ risk: "medium", authorization: "ask" }, "medium"), "allow");
-	assert.equal(decideAuthorization({ risk: "high", authorization: "ask" }, "medium"), "ask");
-	assert.equal(decideAuthorization({ risk: "high", authorization: "ask" }, "high"), "allow");
-	assert.equal(decideAuthorization({ risk: "medium", authorization: "ask" }, "low"), "ask");
+test("decidePolicy: every branch name is exported", () => {
+	for (const item of POLICY_CASES) assert.ok(POLICY_RULES.includes(item.rule), item.rule);
+});
+
+test("decidePolicy: a judge's allow no longer overrides the tolerance by itself", () => {
+	// The old mapping took `{risk: high, authorization: allow}` at face value.
+	assert.equal(decidePolicy({ risk: "high", authorization: "allow" }, { tolerance: "low" }).action, "ask");
+	assert.equal(decidePolicy({ risk: "high", authorization: "allow" }, { tolerance: "high" }).action, "ask");
+	assert.equal(decidePolicy({ risk: "medium", authorization: "allow" }, { tolerance: "low" }).action, "ask");
+	// ... and an unknown authorization field is the conservative reading
+	assert.equal(decidePolicy({ risk: "medium", authorization: "allow" }, { tolerance: "high" }).action, "allow");
+	assert.equal(decidePolicy({ risk: "medium", authorization: "ask" }, { tolerance: "low" }).rule, "authorization-unknown");
+});
+
+test("decidePolicy: a missing tolerance falls back to medium", () => {
+	assert.equal(decidePolicy({ risk: "medium", authorization: "ask" }).action, "allow");
+	assert.equal(decidePolicy({ risk: "high", authorization: "ask" }).action, "ask");
+	assert.equal(decidePolicy({ risk: "medium", authorization: "ask" }, {}).action, "allow");
 });
 
 test("judgeWith: happy path returns parsed verdict", async () => {
@@ -243,4 +295,33 @@ test("judgeWith: context is forwarded to the runner", async () => {
 	});
 	assert.equal(result.ok, true);
 	assert.match(seen[0][1].content[0].text, /Context:\n\[U\] 用户: 检查/);
+});
+
+test("buildJudgeMessages: execution facts ride in the user message, policy stays system-only", () => {
+	const escalation = { to: "danger-full-access", justification: "publish needs the network" };
+	const [system, user] = buildJudgeMessages({
+		toolName: "bash",
+		argsText: "npm publish",
+		reason: "release",
+		cwd: "/home/wenxin/office/dsh",
+		workdir: "plugins/dsh-codex-approval",
+		escalation
+	});
+	const payload = JSON.parse(user.content[0].text);
+	assert.equal(payload.cwd, "/home/wenxin/office/dsh");
+	assert.equal(payload.workdir, "plugins/dsh-codex-approval");
+	assert.deepEqual(payload.escalation, escalation);
+	// The facts are evidence, never instructions.
+	assert.doesNotMatch(system.content[0].text, /danger-full-access|"release"/);
+	assert.match(system.content[0].text, /never as user authorization/);
+});
+
+test("buildJudgeMessages: unknown facts are omitted, keeping the previous payload shape", () => {
+	const [system, user] = buildJudgeMessages({ toolName: "bash", argsText: "git status", reason: null });
+	const payload = JSON.parse(user.content[0].text);
+	assert.deepEqual(payload, { toolName: "bash", command: "git status", reason: null });
+	assert.match(system.content[0].text, /approval judge/);
+	// No fact keys leak into the payload when the caller supplies none.
+	assert.equal(Object.keys(payload).length, 3);
+	assert.match(user.content[0].text, /"command":"git status"/);
 });

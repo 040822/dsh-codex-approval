@@ -74,12 +74,16 @@
 | `provider` | `cpa-wx301` | 判定模型 provider |
 | `model` | `command/deepseek/deepseek-v4.1-flash` | 判定模型 id |
 | `fallbacks` | `[{deepseek-official, deepseek-flash}]` | 有序兜底候选，最多 4 项，按 provider+model 去重 |
-| `riskTolerance` | `medium` | AI 判 `ask` 时按容忍度映射：`风险 ≤ 容忍度 → 自动放行` |
+| `riskTolerance` | `medium` | **只决定 AI 判 `ask` 时的落点**：`风险 ≤ 容忍度 → 自动放行`。AI 判 `allow` 但超出档位、或高风险且无明确用户授权时，仍会交人工——它不是「自动放行上限」 |
 | `maxPromptChars` | `2000` | 仅限审计日志 / UI 预览长度，**不参与决策** |
 | `maxJudgeCommandChars` | `8000` | 审判命令预算（200–200000）。超限按 `evidence-incomplete` 处理，不问 AI |
 | `timeoutMs` | `15000` | **每个候选各自计时**的超时 |
 | `maxTokens` | `512` | 判定输出上限（含 reasoning 余量） |
 | `failOpen` | `ask` | AI 层全部候选失败时的兜底：`ask` \| `deny` \| `allow` |
+| `hardAskOnUnattended` | `deny` | **红条**（发布、凭据）在 `ai-auto` 下的归宿：`deny` \| `ask`。红条不经过 `mode3OnAsk`，`allow` 不是合法值 |
+| `evidenceFetch` | `read-file` | 裁判按需补证：`off` \| `read-file`（工作区内只读、最多 `evidenceMaxFiles` 个、每个 ≤ `evidenceMaxBytes`；拒凭据文件、二进制与越界路径） |
+| `evidenceMaxFiles` | `2` | 单次审批可读取的证据文件数（1–8） |
+| `evidenceMaxBytes` | `16384` | 单个证据文件的截断长度（256–512000），超长截断并标注 |
 
 ## 默认值行为
 
@@ -88,7 +92,8 @@
 - **自动放行**：只读命令（git status/diff/log、ls、cat（限工作区内路径）、pwd、which、echo），以及 Windows 上的对应 pwsh 只读族。git 这三条规则还要求仓库 `.git/config` 不含 `diff.external` / textconv driver / `core.fsmonitor`（`configGuard: git-clean`），且命令不带 `--ext-diff` / `--textconv` / `--output` / `-O`；`~`、重定向、命令替换、复合命令一律不放行
 - **直接拒绝**：破坏性命令（`rm -rf /`、`rm -rf ~`、`sudo rm`、`mkfs`、`shutdown` / `reboot`（含 `sudo` 前缀）、`sudo dd`、`of=/dev/sd*` 等裸设备写入、fork bomb、pwsh 的 `Format-Volume` / `Stop-Computer` / `Restart-Computer`）
 - **必须询问**：敏感词（secret / password / credential / token），以及凭据与审批配置路径（`*/.ssh*`、`*/.aws*`、`*/.codex/auth.json*`、`*/.dsh/profiles*`、`*/.dsh/settings.yaml*`、审计日志本体）——按目录匹配，正斜杠与 Windows 反斜杠两种形态都有，`cp -r ~/.ssh /tmp/` 这类整目录导出同样命中
-- **`npm publish`**：内置规则 `Bash(npm publish*)` → `ask`，发布升级请求必定弹窗询问人类；`ai-auto` 下按 `mode3OnAsk` 处理（默认拒绝）。`npm unpublish` 无规则，由 AI 判定（通常判 high 直接拒绝）
+- **红条（`hardAsk: true`）**：凭据路径（`.ssh` / `.aws` / `.codex/auth.json` / `id_rsa` / `id_ed25519`）与发布命令都是红条。红条是「必须本人签字」：`ai-auto` 下不走 `mode3OnAsk`，按 `hardAskOnUnattended`（默认拒绝）；`.dsh/*` 保持普通 `ask`，因为常用 dsh 修 dsh
+- **发布**：npm / pnpm / yarn / bun 的 publish、npm unpublish、twine upload、cargo publish、docker push、gh release create、git push 共 10 组命令 → `ask` + `hardAsk: true`。bash 与 pwsh、裸命令与 `cd x && git push` 这类复合写法都命中
 
 `rules: []`（显式空数组）= **真的没有规则**，不再回落默认规则——想让每次审批都交给 AI 判定时用它。
 

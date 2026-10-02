@@ -9,7 +9,10 @@
 - **路径参数完整**：`--` 终止符之后的每一项、以及内联在选项里的值（`-Path:..\secret` / `--file=/etc/passwd`）都算路径参数，不能靠"看起来像选项"躲过 `pathGuard`
 - **规则扫还原面**：除原始文本外还匹配"裸参数文本"、"重建 argv"与（deny/ask 专用的）"折叠紧贴引号 + 规范化空白"，`npm  publish`、`rm -r"f" /tmp/x`、`npm<TAB>publish 2>log` 与它们的常规写法同样命中（见[决策链与规则语法](decision-chain.md#规则语法)）
 - **`configGuard`**：`git diff` / `git log` / `git status` 的自动放行要求仓库 `.git/config`（以及 `extensions.worktreeConfig` 下的 `.git/config.worktree`）里没有 `external` / `command` / `textconv` 键、没有 `gpg` 配置、没有 `[include]` / `include.path`、且 `fsmonitor` 值只为布尔 —— 这些让一条只读命令无需任何开关就执行别处指定的程序（或被包含文件里的同名键）。**配置读不出来就不放行**：只有"不存在"算干净，权限/I-O 失败视为无法核验；`.git` 是 worktree/submodule 指针文件时同样不放行。用户级 `~/.gitconfig` 不在检查范围（属使用者自己的环境）
-- **固定政策与证据分属两条消息**：判定提示是 `system` 消息，命令 / reason / 会话骨架是 `user` 消息——请求文本无法冒充指令层级
+- **固定政策与证据分属两条消息**：判定提示是 `system` 消息，命令 / reason / 会话骨架 / 补证内容是 `user` 消息——请求文本无法冒充指令层级
+- **执行事实进判定**：`workdir`（本条命令的实际执行目录）与本次请求的提权目标 / 理由随请求进入判定与审计；提权理由是 agent 自己写的，属不可信证据，**从不作为用户授权**
+- **红条不受无人值守开关影响**：`hardAsk` 规则（发布、凭据）在 `ai-auto` 下由 `ai.hardAskOnUnattended` 决定（默认拒绝），`mode3OnAsk: allow` 放行不了它们
+- **补证是白名单只读**：裁判只能请求工作区内的文件——realpath 复核、拒凭据文件与二进制、超长截断并标注，拒绝原因同时进审计与第二轮判定；插件不给裁判 shell、目录列举或任意读盘能力
 - **原文进判**：规则与 AI 看到的是完整命令；截断只用于日志与 UI 预览
 - **证据门槛**：参数缺失 / 无法解析 / 命令超预算 → 不问 AI，直接交人类（`ai-auto` 下直接拒绝），审计标 `evidenceIncomplete`。这是"没看到操作"，不是"AI 判定不确定"，因此不受 `mode3OnAsk` 影响
 - **统一脱敏**：命令与 reason 在进入 AI prompt、审计日志、拒绝反馈前一律脱敏；插件新建的审计日志为 `0600` 并按 `logMaxBytes` 轮转（**已存在的旧日志权限不会被自动改动**）
@@ -39,6 +42,8 @@ a materially safer alternative, or stop and ask the user.
 
 ## 已知边界（不是安全保证）
 
+- **策略层的「用户授权」来自模型**：程序保证的是「没有 strong 授权就不自动放行高风险」，但 `user_authorization: strong` 是模型对用户消息的判断，模型可能高估——衡量这一点需要真实模型评测集（`eval/`，尚未建立）
+- **裁判模型不遵循新 schema 时更保守**：`user_authorization` 缺失按「不是 strong」处理，结果是高风险一律交人工——更安全，也更打扰；更换模型或兜底模型后审批尺度会变
 - **枚举校验只约束 AI 输出的格式**，不能保证裁判不受提示注入影响。role 分离（政策 `system` / 证据 `user`）削弱了"命令文本冒充指令"的路径，但削弱不等于消除，且 `authorization` 仍要过规则层
 - **role 分离依赖宿主与上游接受 `system` 消息**：DSH 会把 `system` 透传给 provider；若某模型的通道会把 system 映射成 `developer` 而该上游不接受（此前实测 opencode 系通道即如此），需要在模型配置上声明 `compat: { supportsDeveloperRole: false }`，否则判定调用直接 400（走 failOpen）
 - **形状闸门是保守识别器，不是 shell 解析器**。它只回答"这条命令能否信任其 argv"，**不做子命令拆分**；无法覆盖所有间接副作用

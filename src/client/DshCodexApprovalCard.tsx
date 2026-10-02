@@ -87,17 +87,19 @@ const fallbackModels = [
 
 const NUL = '\u0000'
 /**
- * Risk tolerance decides how much of the AI's *ask* verdict is auto-approved:
- * `decideAuthorization` returns allow when `risk <= tolerance`, otherwise ask.
- * A HIGHER tolerance is therefore MORE permissive, and the copy has to say so —
- * the previous labels ("low · 尽量放行" / "high · 尽量询问") were inverted, so a
+ * Risk tolerance is the landing zone for the AI's *ask* verdict, not a ceiling
+ * on what may be auto-approved: `decidePolicy` maps `risk <= tolerance` to
+ * allow when the AI asked for a human, while an `allow` above the tolerance
+ * additionally needs the user to have asked for this exact action, and a high
+ * risk without that authorization always reaches a human. A HIGHER tolerance
+ * is therefore MORE permissive for asks, and the copy has to say so — the
+ * previous labels ("low · 尽量放行" / "high · 尽量询问") were inverted, so a
  * user picking the stricter-sounding option silently widened auto-approval.
- * A direct allow/deny verdict is respected regardless of this setting.
  */
 const TOLERANCES = [
   { value: 'low', label: 'low · 严格：只放行 low 风险的 ask' },
-  { value: 'medium', label: 'medium · 平衡（默认）' },
-  { value: 'high', label: 'high · 宽松：high 风险的 ask 也放行' },
+  { value: 'medium', label: 'medium · 平衡（默认）：放行 ≤medium 的 ask' },
+  { value: 'high', label: 'high · 宽松：high 风险的 ask 也放行（仍需用户明确要求该动作）' },
 ]
 const FAIL_OPEN = [
   { value: 'ask', label: 'ask · 交给人确认（默认）' },
@@ -107,6 +109,11 @@ const FAIL_OPEN = [
 const MODE3_ON_ASK = [
   { value: 'deny', label: 'deny · 拒绝（默认）' },
   { value: 'allow', label: 'allow · 放行' },
+]
+/** Where the red lines (publishing, credentials) land when nobody can be asked. */
+const HARD_ASK = [
+  { value: 'deny', label: 'deny · 拒绝（默认）' },
+  { value: 'ask', label: 'ask · 交给人（无人值守时会一直等）' },
 ]
 
 /** One labelled form row, mirroring the shipped fields.module.css layout. */
@@ -322,7 +329,7 @@ export function DshCodexApprovalCard({ settingsScope, loadModelCatalog }: Props)
           </Field>
 
           <div className="dsh-ca-grid">
-            <Field label="风险容忍度" hint="只约束 AI 判 ask 时的落点；越高越宽松。AI 直接返回 allow/deny 时不受此项影响。">
+            <Field label="风险容忍度" hint="只约束 AI 判 ask 时的落点；越高越宽松。AI 放行但超出档位、或高风险且无明确用户授权时，仍会交给人工。">
               <select className="dsh-ca-select" value={String(value.riskTolerance ?? 'medium')} disabled={disabled}
                 onChange={(event) => setField('riskTolerance', event.target.value)}>
                 {TOLERANCES.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}
@@ -338,6 +345,12 @@ export function DshCodexApprovalCard({ settingsScope, loadModelCatalog }: Props)
               <select className="dsh-ca-select" value={String(value.mode3OnAsk ?? 'deny')} disabled={disabled}
                 onChange={(event) => setField('mode3OnAsk', event.target.value)}>
                 {MODE3_ON_ASK.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}
+              </select>
+            </Field>
+            <Field label="红条（发布/凭据）无人值守时" hint="发布与凭据目录属红条，不受上面两项开关影响；默认直接拒绝">
+              <select className="dsh-ca-select" value={String(value.hardAskOnUnattended ?? 'deny')} disabled={disabled}
+                onChange={(event) => setField('hardAskOnUnattended', event.target.value)}>
+                {HARD_ASK.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}
               </select>
             </Field>
             <Field label="超时（毫秒）" hint="每个候选各自计时，默认 15000">
