@@ -10,6 +10,7 @@
 - **规则扫还原面**：除原始文本外还匹配"裸参数文本"、"重建 argv"与（deny/ask 专用的）"折叠紧贴引号 + 规范化空白"，`npm  publish`、`rm -r"f" /tmp/x`、`npm<TAB>publish 2>log` 与它们的常规写法同样命中（见[决策链与规则语法](decision-chain.md#规则语法)）
 - **`configGuard`**：`git diff` / `git log` / `git status` 的自动放行要求仓库 `.git/config`（以及 `extensions.worktreeConfig` 下的 `.git/config.worktree`）里没有 `external` / `command` / `textconv` 键、没有 `gpg` 配置、没有 `[include]` / `include.path`、且 `fsmonitor` 值只为布尔 —— 这些让一条只读命令无需任何开关就执行别处指定的程序（或被包含文件里的同名键）。**配置读不出来就不放行**：只有"不存在"算干净，权限/I-O 失败视为无法核验；`.git` 是 worktree/submodule 指针文件时同样不放行。用户级 `~/.gitconfig` 不在检查范围（属使用者自己的环境）
 - **固定政策与证据分属两条消息**：判定提示是 `system` 消息，命令 / reason / 会话骨架 / 补证内容是 `user` 消息——请求文本无法冒充指令层级
+- **判定能看到结构化的命令线索**：越界路径、网络目标主机、破坏性选项由 `command-facts.js` 从命令**文本**解析后交给裁判（`facts`），提示词标明它们只是线索、不是核验结果——"看不到的仍是未知"这条不因线索而放松
 - **执行事实进判定**：`workdir`（本条命令的实际执行目录）与本次请求的提权目标 / 理由随请求进入判定与审计；提权理由是 agent 自己写的，属不可信证据，**从不作为用户授权**
 - **红条不受无人值守开关影响**：`hardAsk` 规则（发布、凭据）在 `ai-auto` 下由 `ai.hardAskOnUnattended` 决定（默认拒绝），`mode3OnAsk: allow` 放行不了它们；`hardAsk` 只能标在 `ask` 规则上，标到 `allow` 上在装配期就报错（否则它会读成「人类已确认」，与原意相反）
 - **「没有用户授权」同样不受无人值守开关影响**：高风险且用户未明确要求的动作、AI 放行但超出档位的动作、以及 **AI 自己拿不准（ask）且风险 ≥ medium 又没人授权**的动作，在 `ai-auto` 下由 `ai.enforcedAskOnUnattended` 决定（默认拒绝）——`mode3OnAsk: allow` 只能接管「低风险或用户已明确要求的拿不准」

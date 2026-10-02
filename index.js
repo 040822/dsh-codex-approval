@@ -36,6 +36,7 @@ import z from "@deepseek-ai/schemastery";
 
 import { classifyRequest, evaluateRules, ruleLabel } from "./rules.js";
 import { findToolCallArgs, argsPreview, shellCallFacts } from "./enrich.js";
+import { commandFacts } from "./command-facts.js";
 import { judgeWith, decidePolicy, parseVerdict } from "./judge.js";
 import { parseNeeds, fetchEvidence } from "./evidence.js";
 import { buildTranscript } from "./transcript.js";
@@ -1309,6 +1310,10 @@ export function createHandler({ config, record, llmRunner, getSessionMode, denia
 		const shapeInfo = classifyRequest(req.toolName, fullText);
 		const argsText = redactSensitive(fullText);
 		const reasonText = redactSensitive(req.reason ?? "");
+		// Hints the judge would otherwise have to guess from the raw text: paths
+		// that leave the workspace, network destinations, destructive options.
+		// Derived from the redacted text, so no credential leaks into the prompt.
+		const textFacts = commandFacts({ toolName: req.toolName, argsText, shapeInfo });
 		const matchReq = { toolName: req.toolName, argsText, reason: reasonText };
 		const preview = boundedText(argsText, ARGS_PREVIEW_MAX_CHARS) ?? "";
 		const evidenceIssue = evidenceProblem({ args, toolName: req.toolName, argsText, cfg });
@@ -1382,7 +1387,7 @@ export function createHandler({ config, record, llmRunner, getSessionMode, denia
 					cwd
 				})
 				: "";
-			const judgeInput = { toolName: req.toolName, argsText, reason: reasonText, context, cwd, workdir: facts?.workdir, escalation };
+			const judgeInput = { toolName: req.toolName, argsText, reason: reasonText, context, cwd, workdir: facts?.workdir, escalation, facts: textFacts };
 			// One budget for the whole approval: every candidate AND the evidence
 			// round share it, so a slow chain cannot stretch an approval to minutes.
 			const deadline = cfg.ai.totalBudgetMs > 0 ? started + cfg.ai.totalBudgetMs : undefined;
@@ -1507,6 +1512,7 @@ export function createHandler({ config, record, llmRunner, getSessionMode, denia
 				commandChars: argsText.length,
 				shape: shapeInfo.shape,
 				transcriptChars: context.length,
+				...textFacts === null ? {} : { commandFacts: textFacts },
 				...cwd === undefined ? {} : { cwd },
 				...facts?.workdir === undefined ? {} : { workdir: facts.workdir },
 				...escalation === null ? {} : { escalation },
@@ -1560,6 +1566,7 @@ export function createHandler({ config, record, llmRunner, getSessionMode, denia
 			commandChars: argsText.length,
 			shape: shapeInfo.shape,
 			transcriptChars: context.length,
+			...textFacts === null ? {} : { commandFacts: textFacts },
 			...cwd === undefined ? {} : { cwd },
 			...facts?.workdir === undefined ? {} : { workdir: facts.workdir },
 			...escalation === null ? {} : { escalation },

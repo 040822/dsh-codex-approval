@@ -285,6 +285,7 @@ async function runLive({ base, key, model, repeat, withTranscript }) {
 			rows.push({
 				id: c.id,
 				round,
+				disputed: c.disputed === true,
 				tags: c.tags ?? [],
 				expected: c.truth?.expected,
 				truthAuthorization: c.truth?.userAuthorization,
@@ -308,7 +309,7 @@ async function runLive({ base, key, model, repeat, withTranscript }) {
 		`| p95 判定耗时 | ${metrics.p95Ms ?? "n/a"} ms |`,
 		`| 同案例结论不一致 | ${metrics.contradictory.length === 0 ? "无" : metrics.contradictory.join(", ")} |`
 	];
-	const details = rows.map((r) => `| ${r.id} | ${r.round} | ${r.risk ?? "-"} | ${r.judgeAuthorization ?? "-"} | ${r.userAuthorization ?? "-"} | ${r.outcome}${r.retried === true ? "（重试过一次）" : ""} | ${r.expected} |`);
+	const details = rows.map((r) => `| ${r.id}${r.disputed === true ? " ⚖" : ""} | ${r.round} | ${r.risk ?? "-"} | ${r.judgeAuthorization ?? "-"} | ${r.userAuthorization ?? "-"} | ${r.outcome}${r.retried === true ? "（重试过一次）" : ""} | ${r.expected} |`);
 	const text = renderReport({
 		mode: "live",
 		meta: [
@@ -316,7 +317,8 @@ async function runLive({ base, key, model, repeat, withTranscript }) {
 			`端点：${base}`,
 			`重复：${repeat}`,
 			`会话骨架：${withTranscript ? "on（案例的 userTurns 渲染成 [U] 行，等价 transcript: short）" : "off（出厂默认：模型看不到用户消息）"}`,
-			"真值来自 eval/cases/model.jsonl（人工标注）"
+			"真值来自 eval/cases/model.jsonl（人工标注）",
+			"⚖ = 真值口径本身有争议的案例（见 docs/evaluation.md），不计入「危险放行不许增加」的门槛，但在报告里单列"
 		],
 		lines: ["## 汇总", "", ...table, "", "## 逐条", "", "| 案例 | 轮次 | risk | judge 意见 | 用户授权 | 结果 | 真值 |", "|---|---|---|---|---|---|---|", ...details],
 		table: []
@@ -382,7 +384,8 @@ async function main() {
 			process.exitCode = 2;
 			return;
 		}
-		liveSuffix = flag("--transcript") ? "transcript" : "no-transcript";
+		// Model name in the file name: comparing models must not overwrite reports.
+		liveSuffix = `${flag("--transcript") ? "transcript" : "no-transcript"}-${model.replace(/[^A-Za-z0-9._-]+/g, "_")}`;
 		const { metrics, file } = await runLive({ base, key, model, repeat, withTranscript: flag("--transcript") });
 		console.log(`live: 危险放行 ${metrics.dangerousAllow}/${metrics.total}，误拒 ${metrics.needlessDeny}/${metrics.total} → ${file}`);
 		return;

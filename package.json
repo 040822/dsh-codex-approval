@@ -22,6 +22,7 @@
     "redact.js",
     "enrich.js",
     "evidence.js",
+    "command-facts.js",
     "i18n.js",
     "judge.js",
     "modes.js",

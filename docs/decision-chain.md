@@ -135,7 +135,10 @@ bash/pwsh 的 **allow 规则只在命令被 `shell-shape.js` 判定为 `simple`*
 
 **输入**：一条 `system` 消息（固定政策：审批员角色 + 风险/授权定义 + 执行事实说明 + 补证规则 + 只输出 JSON 约束）+ 一条 `user` 消息（请求 JSON，必要时再附 `Evidence:` 与 `Context:` 块）。两者分属不同 role，命令文本无法冒充指令层级。命令本体**不截断**（截断只用于审计/UI 预览）；超过 `ai.maxJudgeCommandChars`（默认 8000）时不问 AI，按 evidence-incomplete 处理。命令、reason 与提权理由在进入 prompt 前统一脱敏（`redact.js`）。
 
-请求 JSON 里除 `toolName` / `command` / `reason`，还可能带执行事实：`cwd`（会话工作区）、`workdir`（本条命令的实际目录）、`escalation.to`（本次请求的提权目标）与 `escalation.justification`（提权理由）。后两者是**不可信证据**：它们由 agent 自己写，只用于判断，不构成用户授权。
+请求 JSON 里除 `toolName` / `command` / `reason`，还可能带两类附加信息：
+
+- **执行事实**（来自工具参数的真值）：`cwd`（会话工作区）、`workdir`（本条命令的实际目录）、`escalation.to`（本次请求的提权目标）与 `escalation.justification`（提权理由）。提权理由是 agent 自己写的一句话，属**不可信证据**，不构成用户授权。
+- **命令线索 `facts`**（`command-facts.js`，由**命令文本**推导，不是核验结果）：`paths`（路径参数，凡不在工作区内的标 `outside: true`，包括 `~`、绝对路径与 `..` 逃逸）、`hosts`（文本里出现的网络目的地）、`destructive`（会删除/覆盖/改写的选项，如 `--delete` / `--hard` / `-rf` / `-Recurse -Force`）。提示词明确告诉裁判这些是线索而非证据，看不到的仍按未知处理；opaque 形状（如 `echo $(cat /etc/passwd)`）拿不到 argv 时改从文本提取，正是这类命令最需要。
 
 **输出**：`{"risk":"low|medium|high","authorization":"allow|ask|deny","user_authorization":"none|weak|strong","evidence":["…"],"unknowns":["…"],"reason":"一句话"}`。`evidence` 与 `unknowns` 是短列表，用来记录它依据了什么、以及它承认没看到什么。
 

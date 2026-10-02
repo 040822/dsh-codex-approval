@@ -2782,3 +2782,24 @@ test("fetchEvidence: a hung resolver is bounded by the approval deadline (findin
 	assert.deepEqual(refused, [{ path: "x.txt", reason: "deadline-exceeded" }]);
 	assert.ok(elapsed < 2000, `the resolver must not hang the approval (took ${elapsed}ms)`);
 });
+
+test("handler: the judge and the audit get the command's structured facts", async () => {
+	const cfg = baseConfig({ rules: [] });
+	const seen = [];
+	const records = [];
+	const handler = createHandler({
+		config: cfg,
+		record: async (entry) => { records.push(entry); },
+		llmRunner: async (messages) => { seen.push(messages); return { ok: true, text: VERDICT_TEXT }; }
+	});
+	await run(handler, makeReq({ callId: "facts-1", command: "echo $(cat /etc/passwd)" }));
+	const payload = JSON.parse(seen[0][1].content[0].text);
+	assert.deepEqual(payload.facts, { paths: [{ path: "/etc/passwd", outside: true }] });
+	assert.deepEqual(records.at(-1).commandFacts, { paths: [{ path: "/etc/passwd", outside: true }] });
+
+	// A command with nothing to report adds no field anywhere.
+	await run(handler, makeReq({ callId: "facts-2", command: "git status" }));
+	const plain = JSON.parse(seen.at(-1)[1].content[0].text);
+	assert.equal("facts" in plain, false);
+	assert.equal("commandFacts" in records.at(-1), false);
+});
