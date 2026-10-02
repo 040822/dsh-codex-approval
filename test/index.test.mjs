@@ -984,7 +984,9 @@ test("P0: credentials are redacted in the judge input, the audit record and the 
 		record: async (entry) => entries.push(entry),
 		denialFeed,
 		llmRunner: async (messages) => {
-			prompts.push(messages[0].content[0].text);
+			// every message, not just the first: the policy is a system message now
+			// and the request itself travels in the user message
+			prompts.push(messages.map((message) => message.content.map((part) => part.text).join("\n")).join("\n---\n"));
 			return { ok: true, text: '{"risk":"high","authorization":"deny","reason":"credential exfiltration"}' };
 		}
 	});
@@ -992,6 +994,9 @@ test("P0: credentials are redacted in the judge input, the audit record and the 
 	const { outcome } = await run(handler, makeReq({ command, reason: "apiKey=hidden-value" }));
 	assert.equal(outcome, "rejected");
 	assert.doesNotMatch(prompts[0], /super-secret-token|hidden-value|query-secret/);
+	// and the request really did reach the judge, with the values redacted in place
+	assert.match(prompts[0], /"command":/);
+	assert.match(prompts[0], /\[REDACTED\]/);
 	assert.doesNotMatch(JSON.stringify(entries[0]), /super-secret-token|hidden-value|query-secret/);
 	assert.doesNotMatch(JSON.stringify(denialFeed.get("sess-1")), /super-secret-token|hidden-value|query-secret/);
 });
@@ -1445,5 +1450,369 @@ test("handler: text without a verdict is audited as no-verdict, with the origina
 	assert.equal(entries[0].error, "unparseable judge output (no verdict)");
 	assert.equal(entries[0].rawOutput, 'I checked it: {"note":"fine"}');
 	assert.equal(entries[0].textChars, 'I checked it: {"note":"fine"}'.length);
+});
+
+// ---------------------------------------------------------------------------
+// 2026-10-02 review — P1 (deterministic auto-approval escapes) and P2 (rules
+// whose match is a text coincidence) regressions.
+// ---------------------------------------------------------------------------
+
+/**
+ * A handler over the DEFAULT rules whose judge always answers "ask": anything
+ * that comes back `allowed-once` can only have been cleared by a rule, and
+ * anything that reaches `next()` was handed to the human. The config reader
+ * reports "no such file", so `configGuard` sees a workspace with no git config.
+ */
+function defaultRuleHandler({ entries = [] } = {}) {
+	return createHandler({
+		config: normalizeConfig({ mode: "ai" }),
+		record: async (entry) => entries.push(entry),
+		llmRunner: async () => ({ ok: true, text: '{"risk":"high","authorization":"ask","reason":"not read-only"}' }),
+		getCwd: () => "/work",
+		resolvePath: async (path) => path,
+		readFile: async () => {
+			const error = new Error("ENOENT");
+			error.code = "ENOENT";
+			throw error;
+		}
+	});
+}
+
+test("P1: a colon-bound pwsh parameter value cannot skip the path guard", async () => {
+	const handler = defaultRuleHandler();
+	for (const command of [
+		"Get-Content -Path:..\\secret.txt",
+		"Get-Content -Path:..\\..\\..\\Users\\wenxin\\.dsh\\settings.yaml",
+		"Get-Content -Path:/etc/passwd",
+		"cat -Path:..\\secret.txt"
+	]) {
+		const { outcome } = await run(handler, makeReq({ toolName: "pwsh", command }));
+		assert.notEqual(outcome, "allowed-once", `an inline-bound path must not be auto-approved: ${command}`);
+	}
+});
+
+test("P1: after `--` a dash-prefixed path is still a path, so it is checked", async () => {
+	const handler = defaultRuleHandler();
+	const { outcome } = await run(handler, makeReq({ command: "cat -- -../../../etc/passwd" }));
+	assert.notEqual(outcome, "allowed-once");
+});
+
+test("P1: ordinary workspace-relative reads stay auto-approved (no over-blocking)", async () => {
+	const entries = [];
+	const handler = defaultRuleHandler({ entries });
+	for (const [toolName, command] of [
+		["bash", "cat README.md"],
+		["bash", "cat sub/dir/file.txt"],
+		["pwsh", "Get-Content -Path:ok.txt"],
+		["pwsh", "Get-Content ok.txt"]
+	]) {
+		const { outcome } = await run(handler, makeReq({ toolName, command }));
+		assert.equal(outcome, "allowed-once", `should stay auto-approved: ${toolName} ${command}`);
+	}
+	assert.ok(entries.every((entry) => entry.kind === "rule" && entry.action === "allow"), JSON.stringify(entries));
+});
+
+test("P2: spliced-token commands still reach the safety rules (space, tab, glued quotes)", async () => {
+	const entries = [];
+	const handler = defaultRuleHandler({ entries });
+	for (const [command, match] of [
+		["npm  publish", "Bash(npm publish*)"],
+		["npm\tpublish", "Bash(npm publish*)"],
+		['rm -r"f" /tmp/x', "*rm -rf /*"]
+	]) {
+		entries.length = 0;
+		await run(handler, makeReq({ command }));
+		assert.equal(entries[0].kind, "rule", `a rule must claim the request: ${command}`);
+		assert.equal(entries[0].match, match, `wrong rule for: ${command}`);
+	}
+	assert.equal(entries[0].action, "deny");
+});
+
+test("P2: credential paths are protected with either separator, with or without a trailing one", async () => {
+	const entries = [];
+	const handler = defaultRuleHandler({ entries });
+	for (const [toolName, command] of [
+		["bash", "cp -r ~/.ssh /tmp/"],
+		["bash", "tar -czf x.tgz ~/.aws"],
+		["bash", "zip -r x.zip ~/.ssh"],
+		["pwsh", "Get-Content C:\\Users\\x\\.aws\\credentials"],
+		["pwsh", "Get-Content C:\\Users\\x\\.dsh\\settings.yaml"]
+	]) {
+		entries.length = 0;
+		const { outcome } = await run(handler, makeReq({ toolName, command }));
+		assert.equal(outcome, "unavailable", `a human must confirm: ${command}`);
+		assert.equal(entries[0].kind, "rule", command);
+		assert.equal(entries[0].action, "ask", command);
+	}
+});
+
+test("P2: git switches that make git run configured programs are not auto-approved", async () => {
+	const handler = defaultRuleHandler();
+	for (const command of ["git diff --ext-diff", "git diff --textconv"]) {
+		const { outcome } = await run(handler, makeReq({ command }));
+		assert.notEqual(outcome, "allowed-once", `must not be auto-approved: ${command}`);
+	}
+	// the plain read-only forms keep it
+	for (const command of ["git diff --stat", "git log --oneline -5"]) {
+		const { outcome } = await run(handler, makeReq({ command }));
+		assert.equal(outcome, "allowed-once", `should stay auto-approved: ${command}`);
+	}
+});
+
+test("P2: git config that could run a program also refuses the auto-approval", async () => {
+	// `diff.external` runs with no switch at all, so no forbidOptions can stop it:
+	// the check is on the config that names the program.
+	const detail = "the read-only allow family is not auto-approved over an exec-capable git config";
+	for (const config of [
+		"[diff]\n\texternal = rm -rf /\n",
+		'[diff "md"]\n\ttextconv = /usr/bin/evil\n',
+		"[core]\n\tfsmonitor = /usr/bin/evil\n",
+		'[diff "x"]\n\tcommand = evil\n'
+	]) {
+		const handler = createHandler({
+			config: normalizeConfig({ mode: "ai" }),
+			record: async () => {},
+			llmRunner: async () => ({ ok: true, text: '{"risk":"high","authorization":"ask","reason":"runs a program"}' }),
+			getCwd: () => "/work",
+			resolvePath: async (path) => path,
+			readFile: async (file) => {
+				if (file === "/work/.git/config") return config;
+				const error = new Error("ENOENT");
+				error.code = "ENOENT";
+				throw error;
+			},
+		});
+		const { outcome } = await run(handler, makeReq({ command: "git log --oneline -5" }));
+		assert.notEqual(outcome, "allowed-once", `${detail}: ${JSON.stringify(config)}`);
+		// the same request is still auto-approved when `.git` is a pointer file…
+		const pointer = createHandler({
+			config: normalizeConfig({ mode: "ai" }),
+			record: async () => {},
+			llmRunner: async () => ({ ok: true, text: '{"risk":"high","authorization":"ask","reason":"runs a program"}' }),
+			getCwd: () => "/work",
+			resolvePath: async (path) => path,
+			readFile: async (file) => (file === "/work/.git" ? "gitdir: /elsewhere/.git/worktrees/w\n" : ""),
+		});
+		assert.notEqual((await run(pointer, makeReq({ command: "git log --oneline -5" }))).outcome, "allowed-once");
+	}
+	// a config with no exec-capable key (and no repo at all) keeps the allow
+	const clean = createHandler({
+		config: normalizeConfig({ mode: "ai" }),
+		record: async () => {},
+		llmRunner: async () => ({ ok: true, text: '{"risk":"high","authorization":"ask","reason":"x"}' }),
+		getCwd: () => "/work",
+		resolvePath: async (path) => path,
+		readFile: async () => {
+			const error = new Error("ENOENT");
+			error.code = "ENOENT";
+			throw error;
+		},
+		home: "/home/u"
+	});
+	assert.equal((await run(clean, makeReq({ command: "git status --short" }))).outcome, "allowed-once");
+});
+
+test("P2: destructiveness behind sudo and raw-device writes is denied outright", async () => {
+	const entries = [];
+	const handler = defaultRuleHandler({ entries });
+	for (const command of [
+		"sudo shutdown -h now",
+		"sudo reboot",
+		"sudo dd if=/dev/zero of=/dev/sda",
+		"dd if=/dev/urandom of=/dev/sda"
+	]) {
+		entries.length = 0;
+		const { outcome } = await run(handler, makeReq({ command }));
+		assert.equal(outcome, "rejected", `must be denied: ${command}`);
+		assert.equal(entries[0].kind, "rule", command);
+	}
+});
+
+test("P2: the new deny/ask patterns do not fire on harmless look-alikes", async () => {
+	const handler = defaultRuleHandler();
+	for (const command of ["echo hello", "git status --short", "echo rebuild the shuttered service", "ls -la"]) {
+		const { outcome } = await run(handler, makeReq({ command }));
+		assert.equal(outcome, "allowed-once", `must stay auto-approved: ${command}`);
+	}
+});
+
+// ---- second pass (2026-10-02, codex review) -------------------------------
+
+test("P1: a quoted dash-prefixed value is a path, and a bare `-` is resolved", async () => {
+	// PowerShell binds a *quoted* string as a value, not as a parameter name, so
+	// what follows `-Path` is an argument even when it starts with `-`; the
+	// recognizer has already dropped that quoting, so the shape of the token is
+	// the only evidence left and it must not be read as an option name.
+	const handler = defaultRuleHandler();
+	// a realpath that fails closed on a path that does not exist, the way the
+	// filesystem does — `-LiteralPath '-'` must be *resolved*, not assumed safe
+	const resolved = createHandler({
+		config: normalizeConfig({ mode: "ai" }),
+		record: async () => {},
+		llmRunner: async () => ({ ok: true, text: '{"risk":"high","authorization":"ask","reason":"resolve it"}' }),
+		getCwd: () => "/work",
+		resolvePath: async (path) => {
+			if (path === "/work/-") throw new Error("ENOENT");
+			return path;
+		},
+		readFile: async () => {
+			const error = new Error("ENOENT");
+			error.code = "ENOENT";
+			throw error;
+		}
+	});
+	for (const command of [
+		"Get-Content -Path '-/../../../../../../etc/passwd'",
+		"Get-Content -Path: '-/../../../../../../etc/passwd'",
+		"Get-Content -LiteralPath '-\\..\\..\\outside.txt'",
+		"cat -- -../../../etc/passwd"
+	]) {
+		const { outcome } = await run(handler, makeReq({ toolName: "pwsh", command }));
+		assert.notEqual(outcome, "allowed-once", `must not be auto-approved: ${command}`);
+	}
+	// the bare `-` is a path PowerShell has to open: nothing to resolve → no allow
+	const { outcome } = await run(resolved, makeReq({ toolName: "pwsh", command: "Get-Content -LiteralPath '-'" }));
+	assert.notEqual(outcome, "allowed-once");
+});
+
+test("P1: rebuilt argv never collapses a differently-named program into an allow", async () => {
+	// `"git status"` is one executable whose name contains a space; rejoining its
+	// single argv entry would spell it exactly like the two-word `git status`
+	const cfg = normalizeConfig({ mode: "ai", rules: [{ match: "Bash(git status)", action: "allow" }] });
+	const handler = createHandler({
+		config: cfg,
+		record: async () => {},
+		llmRunner: async () => ({ ok: true, text: '{"risk":"high","authorization":"ask","reason":"not this"}' })
+	});
+	assert.equal((await run(handler, makeReq({ command: 'git "status"' }))).outcome, "allowed-once");
+	assert.notEqual((await run(handler, makeReq({ command: '"git status"' }))).outcome, "allowed-once");
+});
+
+test("P2: whitespace splicing in an opaque command still reaches a safety rule", async () => {
+	const entries = [];
+	const handler = defaultRuleHandler({ entries });
+	for (const [command, match] of [
+		["npm  publish > /tmp/publish.log", "Bash(npm publish*)"],
+		["npm\tpublish 2>/tmp/publish.log", "Bash(npm publish*)"],
+		["rm  -rf /tmp/x > /tmp/log", "*rm -rf /*"]
+	]) {
+		entries.length = 0;
+		await run(handler, makeReq({ command }));
+		assert.equal(entries[0].kind, "rule", `a rule must claim: ${command}`);
+		assert.equal(entries[0].match, match, `wrong rule for: ${command}`);
+	}
+});
+
+test("P2: credential patterns do not fire on a file that merely starts with the name", async () => {
+	for (const [toolName, command] of [
+		["bash", "git diff docs/.aws-guide.md"],
+		["bash", "cat docs/.ssh-notes.md"],
+		["bash", "git log -- .aws-guide.md"]
+	]) {
+		const { outcome } = await run(defaultRuleHandler(), makeReq({ toolName, command }));
+		assert.equal(outcome, "allowed-once", `must stay auto-approved: ${command}`);
+	}
+});
+
+test("P2: folding never reaches inside a quoted argument, so an echo is not denied", async () => {
+	const entries = [];
+	await run(defaultRuleHandler({ entries }), makeReq({ command: "echo 'rm -r\"f\" /'" }));
+	assert.equal(entries[0].kind, "rule", JSON.stringify(entries[0]));
+	assert.equal(entries[0].action, "allow", JSON.stringify(entries[0]));
+});
+
+test("P2: an inline numeric switch value is not mistaken for a path", async () => {
+	for (const command of ["Get-Content -ReadCount:0 README.md", "Get-Content -Tail:5 README.md"]) {
+		const { outcome } = await run(defaultRuleHandler(), makeReq({ toolName: "pwsh", command }));
+		assert.equal(outcome, "allowed-once", `must stay auto-approved: ${command}`);
+	}
+});
+
+test("P1: a quoted word in pwsh is a value, never an option name", async () => {
+	// `-x` looks exactly like an option name, but it was written as a quoted
+	// string, so PowerShell binds it as the value of `-LiteralPath`; if it were
+	// skipped as an option the symlink target would never be resolved
+	const links = { "/work/-x": "/etc/passwd", "/work/-n": "/etc/passwd" };
+	const handler = createHandler({
+		config: normalizeConfig({ mode: "ai" }),
+		record: async () => {},
+		llmRunner: async () => ({ ok: true, text: '{"risk":"high","authorization":"ask","reason":"resolve it"}' }),
+		getCwd: () => "/work",
+		resolvePath: async (path) => links[path] ?? path,
+		readFile: async () => {
+			const error = new Error("ENOENT");
+			error.code = "ENOENT";
+			throw error;
+		}
+	});
+	for (const command of ["Get-Content -LiteralPath '-x'", "Get-Content -Path '-n'", "Get-Content '-x'"]) {
+		const { outcome } = await run(handler, makeReq({ toolName: "pwsh", command }));
+		assert.notEqual(outcome, "allowed-once", `must be resolved, not skipped: ${command}`);
+	}
+});
+
+test("P2: the git config guard reads include directives, gpg and fsmonitor values", async () => {
+	const withConfig = (config) => createHandler({
+		config: normalizeConfig({ mode: "ai" }),
+		record: async () => {},
+		llmRunner: async () => ({ ok: true, text: '{"risk":"high","authorization":"ask","reason":"runs a program"}' }),
+		getCwd: () => "/work",
+		resolvePath: async (path) => path,
+		readFile: async (file) => {
+			if (file === "/work/.git/config") return config;
+			const error = new Error("ENOENT");
+			error.code = "ENOENT";
+			throw error;
+		}
+	});
+	// exec-capable config → no auto-approval
+	for (const config of [
+		"[include]\n\tpath = /elsewhere/evil.config\n",
+		"[gpg]\n\tprogram = evil\n",
+		"[core]\n\tfsmonitor = /usr/bin/evil\n",
+		// the same keys in git's legal single-line form
+		"[diff \"md\"] command = evil\n",
+		"[diff] external = evil\n",
+		"[core] fsmonitor = /usr/bin/evil\n",
+		"include.path = /elsewhere/evil.config\n"
+	]) {
+		const { outcome } = await run(withConfig(config), makeReq({ command: "git log --oneline -5" }));
+		assert.notEqual(outcome, "allowed-once", `must not be auto-approved over: ${JSON.stringify(config)}`);
+	}
+	// values that run nothing, and a URL that merely contains the word
+	for (const config of [
+		"[core]\n\tfsmonitor = false\n",
+		"[core]\n\tfsmonitor = true\n",
+		'[remote "origin"]\n\turl = https://example.test/fsmonitor.git\n'
+	]) {
+		const { outcome } = await run(withConfig(config), makeReq({ command: "git log --oneline -5" }));
+		assert.equal(outcome, "allowed-once", `must stay auto-approved over: ${JSON.stringify(config)}`);
+	}
+});
+
+test("P2: a quoted credential directory still asks, and signature verification needs a human", async () => {
+	const entries = [];
+	const handler = defaultRuleHandler({ entries });
+	entries.length = 0;
+	await run(handler, makeReq({ command: 'tar -czf x "/home/u/.aws"' }));
+	assert.equal(entries[0].kind, "rule", JSON.stringify(entries[0]));
+	assert.equal(entries[0].action, "ask", JSON.stringify(entries[0]));
+	const signature = await run(handler, makeReq({ command: "git log --show-signature -1" }));
+	assert.notEqual(signature.outcome, "allowed-once");
+});
+
+test("P2: sudo option forms and the remaining raw devices are covered", async () => {
+	for (const command of [
+		"sudo -n reboot",
+		"sudo /sbin/shutdown -h now",
+		"dd if=/dev/zero of=/dev/mapper/root",
+		"dd if=/dev/zero of=/dev/md0"
+	]) {
+		const { outcome } = await run(defaultRuleHandler(), makeReq({ command }));
+		assert.equal(outcome, "rejected", `must be denied: ${command}`);
+	}
+	// an unrecognised raw-device write asks a human rather than denying outright
+	const { outcome } = await run(defaultRuleHandler(), makeReq({ command: "dd if=x of=/dev/weird" }));
+	assert.notEqual(outcome, "allowed-once");
 });
 

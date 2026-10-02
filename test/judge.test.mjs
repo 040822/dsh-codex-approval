@@ -2,13 +2,16 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { buildJudgeMessages, parseVerdict, decideAuthorization, judgeWith } from "../judge.js";
 
-test("buildJudgeMessages: single user message with strict instruction", () => {
-	const [message] = buildJudgeMessages({ toolName: "bash", argsText: "git status", reason: "escalate" });
-	assert.equal(message.role, "user");
-	assert.equal(message.content.length, 1);
-	assert.match(message.content[0].text, /approval judge/);
-	assert.match(message.content[0].text, /"git status"/);
-	assert.match(message.content[0].text, /"escalate"/);
+test("buildJudgeMessages: policy is a system message, the request a user message", () => {
+	const [system, user] = buildJudgeMessages({ toolName: "bash", argsText: "git status", reason: "escalate" });
+	assert.equal(system.role, "system");
+	assert.equal(user.role, "user");
+	assert.equal(system.content.length, 1);
+	assert.match(system.content[0].text, /approval judge/);
+	// The untrusted request text must not sit on the instruction level.
+	assert.doesNotMatch(system.content[0].text, /"git status"|"escalate"/);
+	assert.match(user.content[0].text, /"git status"/);
+	assert.match(user.content[0].text, /"escalate"/);
 });
 
 test("parseVerdict: valid verdict", () => {
@@ -173,6 +176,7 @@ test("judgeWith: candidate diagnostics are carried through the failure path", as
 test("buildJudgeMessages: allowAsk=false forbids ask in the prompt", () => {
 	const [message] = buildJudgeMessages({ toolName: "bash", argsText: "ls", reason: "" }, { allowAsk: false });
 	const text = message.content[0].text;
+	assert.equal(message.role, "system");
 	assert.match(text, /"ask" is NOT available/);
 	assert.match(text, /"authorization":"allow\|deny"/);
 	assert.doesNotMatch(text, /When uncertain, prefer "ask"/);
@@ -193,11 +197,13 @@ test("judgeWith: allowAsk=false is forwarded to the messages", async () => {
 	};
 	const result = await judgeWith({ runner, input: { toolName: "bash", argsText: "ls", reason: "" }, allowAsk: false });
 	assert.equal(result.ok, true);
+	assert.equal(seen[0][0].role, "system");
 	assert.match(seen[0][0].content[0].text, /"ask" is NOT available/);
+	assert.equal(seen[0][1].role, "user");
 });
 
 test("buildJudgeMessages: context block appended after the request JSON", () => {
-	const [message] = buildJudgeMessages({ toolName: "pwsh", argsText: "Remove-Item x", reason: "r", context: "[U] 用户: 清理\n[T] pwsh(ls) → ok" });
+	const [, message] = buildJudgeMessages({ toolName: "pwsh", argsText: "Remove-Item x", reason: "r", context: "[U] 用户: 清理\n[T] pwsh(ls) → ok" });
 	const text = message.content[0].text;
 	const blockIdx = text.indexOf("\nContext:\n");
 	assert.ok(blockIdx > text.indexOf("Remove-Item"), "context comes after the request JSON");
@@ -205,9 +211,9 @@ test("buildJudgeMessages: context block appended after the request JSON", () => 
 });
 
 test("buildJudgeMessages: empty context is omitted entirely", () => {
-	const [withCtx] = buildJudgeMessages({ toolName: "pwsh", argsText: "ls", reason: "" });
+	const [, withCtx] = buildJudgeMessages({ toolName: "pwsh", argsText: "ls", reason: "" });
 	assert.doesNotMatch(withCtx.content[0].text, /\nContext:\n/);
-	const [withEmpty] = buildJudgeMessages({ toolName: "pwsh", argsText: "ls", reason: "", context: "" });
+	const [, withEmpty] = buildJudgeMessages({ toolName: "pwsh", argsText: "ls", reason: "", context: "" });
 	assert.doesNotMatch(withEmpty.content[0].text, /\nContext:\n/);
 });
 
@@ -217,11 +223,12 @@ test("buildJudgeMessages: intent-first rule present in prompt", () => {
 });
 
 test("buildJudgeMessages: NO_ASK variant keeps intent rule and context", () => {
-	const [message] = buildJudgeMessages({ toolName: "pwsh", argsText: "ls", reason: "", context: "[U] 用户: x" }, { allowAsk: false });
-	const text = message.content[0].text;
-	assert.match(text, /User intent matters/);
-	assert.match(text, /Context:\n\[U\] 用户: x/);
-	assert.match(text, /"ask" is NOT available/);
+	const [system, user] = buildJudgeMessages({ toolName: "pwsh", argsText: "ls", reason: "", context: "[U] 用户: x" }, { allowAsk: false });
+	assert.match(system.content[0].text, /User intent matters/);
+	assert.match(system.content[0].text, /"ask" is NOT available/);
+	// The transcript is evidence, so it travels with the request, not the policy.
+	assert.match(user.content[0].text, /Context:\n\[U\] 用户: x/);
+	assert.doesNotMatch(system.content[0].text, /\[U\] 用户: x/);
 });
 
 test("judgeWith: context is forwarded to the runner", async () => {
@@ -235,5 +242,5 @@ test("judgeWith: context is forwarded to the runner", async () => {
 		input: { toolName: "pwsh", argsText: "ls", reason: "", context: "[U] 用户: 检查" }
 	});
 	assert.equal(result.ok, true);
-	assert.match(seen[0][0].content[0].text, /Context:\n\[U\] 用户: 检查/);
+	assert.match(seen[0][1].content[0].text, /Context:\n\[U\] 用户: 检查/);
 });

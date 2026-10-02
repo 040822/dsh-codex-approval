@@ -47,9 +47,18 @@ const SYSTEM_PROMPT_NO_ASK = SYSTEM_PROMPT.replace(
 
 /**
  * Build the messages array for the judge call.
+ *
+ * The fixed policy and the untrusted evidence travel as **two messages with
+ * different roles**: the instructions are a `system` message, the request JSON
+ * (command / reason) and the optional transcript follow as a `user` message.
+ * Concatenating both into one user message — as this used to — puts the
+ * attacker-controlled command text on the same instruction level as the policy,
+ * so nothing but the `\n\n` separator tells the model which part it must obey.
+ * The host's LLM service passes roles through to the adapter, so the split costs
+ * nothing.
  * @param opts - { toolName, argsText, reason, context }
  *   `context` is an optional compact session transcript (transcript.js);
- *   when present it is appended as a "Context:" block after the request JSON.
+ *   when present it is appended after the request JSON in the user message.
  * @param allowAsk - when false (ai-auto mode), the prompt forbids "ask":
  *   the judge must commit to allow or deny.
  */
@@ -63,10 +72,10 @@ export function buildJudgeMessages({ toolName, argsText, reason, context }, { al
 	const body = context !== undefined && context !== ""
 		? `${user}\n\nContext:\n${context}`
 		: user;
-	return [{
-		role: "user",
-		content: [{ type: "text", text: `${system}\n\n${body}` }]
-	}];
+	return [
+		{ role: "system", content: [{ type: "text", text: system }] },
+		{ role: "user", content: [{ type: "text", text: body }] }
+	];
 }
 
 /**

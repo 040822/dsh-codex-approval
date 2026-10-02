@@ -29,6 +29,12 @@
  *  2. **Option / path guards.** A structured allow rule may name options that
  *     turn a read-only command into a writer (`git diff --output=<file>`), or
  *     require every path argument to stay inside the workspace (`cat`).
+ *
+ * Text rules also scan the argv the recognizer rebuilt and (for deny/ask) the
+ * raw text with glued quoted literals folded, because a rule matches characters
+ * while the shell matches tokens: `npm  publish` and `rm -r"f" /tmp/x` are the
+ * same commands with a spliced token. See `semanticSurfaces` and
+ * `foldQuotedLiterals`.
  */
 
 import {
@@ -94,6 +100,126 @@ export function matchSurfaces(req) {
 	return surfaces.filter((surface) => surface !== "");
 }
 
+/**
+ * The command text as the shell itself would deliver it: the argv of every
+ * safely-recognised part, rejoined with single spaces. `git  status` →
+ * `git status`; `rm -r"f" /tmp/x` → `rm -rf /tmp/x`.
+ *
+ * Rules match *text*, the shell matches *argv*, and the two disagree whenever
+ * quoting or spacing splices a token — which is how `npm  publish` (an extra
+ * space) and `rm -r"f" /tmp/x` used to walk past the `npm publish` ask rule and
+ * the `rm -rf` deny rule. Rebuilt argv is the same command with that splicing
+ * removed, so scanning it as an extra surface restores the match.
+ *
+ * The rebuild is **lossy in one direction**: a part whose argument itself
+ * contains whitespace (`"git status"` — the name of an executable with a space
+ * in it) rejoins into the same text as the two-word `git status`. Such a part
+ * therefore contributes **no** surface at all: without argument boundaries the
+ * rebuilt text is not equivalent to the command, and using it would let a legacy
+ * `Bash(git status)` allow rule authorize that differently-named program.
+ * @param req - { toolName }
+ * @param opts - { parts } from shell-shape.classifyCommand
+ */
+export function semanticSurfaces(req, opts) {
+	if (typeof req.toolName !== "string" || req.toolName === "") return [];
+	const parts = opts?.parts;
+	if (!Array.isArray(parts)) return [];
+	const surfaces = [];
+	for (const part of parts) {
+		if (!Array.isArray(part)) continue;
+		if (part.some((word) => typeof word !== "string" || /\s/.test(word))) continue;
+		const text = part.join(" ");
+		if (text !== "") surfaces.push(`${req.toolName}(${text})`);
+	}
+	return surfaces;
+}
+
+/**
+ * Fold the two splices that keep a text rule from seeing what the shell runs,
+ * without ever crossing a quote boundary:
+ *
+ *   - a quoted block **glued to what precedes it** is spliced, so its contents
+ *     are the literal that was being padded: `-r"f"` → `-rf`,
+ *     `~/.ss''h/i''d_rsa` → `~/.ssh/id_rsa`;
+ *   - a quoted block standing on its own (`echo 'rm -rf /'`) is an argument, and
+ *     is left exactly as written — folding inside it would deny a command that
+ *     only prints text (`echo 'rm -r"f" /'`).
+ *
+ * The scan is quote-state aware precisely so that a quote *inside* a quoted
+ * string never opens a new block.
+ *
+ * Only deny/ask rules scan this surface: it exists to make a *safety* rule fire,
+ * never to let an allow rule claim something new.
+ * @param text - one match surface
+ */
+export function foldQuotedLiterals(text) {
+	if (typeof text !== "string" || text === "") return text;
+	let out = "";
+	let i = 0;
+	while (i < text.length) {
+		const ch = text[i];
+		if (ch !== "'" && ch !== '"') {
+			out += ch;
+			i += 1;
+			continue;
+		}
+		const end = text.indexOf(ch, i + 1);
+		if (end === -1) {
+			// unterminated quote: nothing to splice, leave the rest as-is
+			out += text.slice(i);
+			break;
+		}
+		const inner = text.slice(i + 1, end);
+		const gluedLeft = out !== "" && !/\s/.test(out[out.length - 1]);
+		out += gluedLeft ? inner : `${ch}${inner}${ch}`;
+		i = end + 1;
+	}
+	return out;
+}
+
+/**
+ * Normalize runs of spaces/tabs to one space. An **opaque** command has no argv
+ * to rebuild, so `npm  publish > /tmp/log` or `npm\tpublish 2>log` (one
+ * separator too many, or a tab) would otherwise still slip past the
+ * `npm publish` ask rule; normalizing the text restores the match. Safe by
+ * construction: it only makes text *more* like the canonical spelling a rule is
+ * written in.
+ * @param text - one match surface
+ */
+export function collapseWhitespace(text) {
+	return typeof text === "string" ? text.replace(/[ \t]+/g, " ") : text;
+}
+
+/**
+ * Replace every quote with a space, so a quoted path lands on its own in the
+ * text: `tar -czf x "/home/u/.aws"` → `tar -czf x  /home/u/.aws ` — which is
+ * what makes the `<dir>`-at-end and `<dir> `-before-an-argument shapes fire.
+ * Unlike folding, this never *joins* characters, so it cannot turn a printed
+ * string into a command (`echo 'rm -r"f" /'` stays harmless).
+ * @param text - one match surface
+ */
+export function spaceOutQuotes(text) {
+	return typeof text === "string" ? text.replace(/['"]/g, " ") : text;
+}
+
+/** Every safety-side rewrite of a surface: quote splicing, quotes-as-space, whitespace. */
+function safetyFolds(text) {
+	const folded = foldQuotedLiterals(text);
+	const spaced = spaceOutQuotes(text);
+	return [
+		folded,
+		spaced,
+		collapseWhitespace(text),
+		collapseWhitespace(folded),
+		collapseWhitespace(spaced)
+	];
+}
+
+/** De-duplicate surfaces while keeping their order. */
+function unique(surfaces) {
+	return [...new Set(surfaces)];
+}
+
 /** Whether a rule is the structured (argv-prefix) form. */
 export function isStructuredRule(rule) {
 	return rule !== null
@@ -141,7 +267,7 @@ function matchesStructured(rule, req, opts) {
 	}
 	if (forbiddenOptionHit(argv, rule.forbidOptions) !== null) return false;
 	if (rule.pathGuard === "workspace-relative") {
-		const args = positionalArgs(argv, rule.pattern.length);
+		const args = positionalArgs(argv, rule.pattern.length, opts?.quoted);
 		if (!args.every((arg) => isWorkspaceRelativePath(arg))) return false;
 	}
 	return true;
@@ -149,18 +275,45 @@ function matchesStructured(rule, req, opts) {
 
 /**
  * Evaluate an ordered rule list against one request.
+ *
+ * Every rule is tested against three families of surfaces:
+ *   1. the raw text (`ToolName(args)`, `reason:...`, and their combination);
+ *   2. the argv the recognizer understood, rejoined (see `semanticSurfaces`) —
+ *      `git  status` and `git status` are the same command;
+ *   3. for deny/ask rules only, the raw text with glued quoted literals folded
+ *      and whitespace runs collapsed (see `foldQuotedLiterals` /
+ *      `collapseWhitespace`) — `rm -r"f" /tmp/x` is `rm -rf /tmp/x`, and
+ *      `npm  publish > log` is `npm publish > log`.
+ * (2) and (3) only ever *add* candidates, so a rule that matched before still
+ * matches; they close the gap between "what the text says" and "what the shell
+ * runs" on the fail-safe side.
  * @param rules - ordered rule list (legacy `{match}` and/or structured forms)
  * @param req - { toolName, argsText, reason }
- * @param opts - { shape, argv } from shell-shape.classifyCommand; a shell allow
- *   rule cannot fire without a `simple` shape.
+ * @param opts - { shape, argv, parts } from shell-shape.classifyCommand; a shell
+ *   allow rule cannot fire without a `simple` shape.
  * @returns the first matching rule under deny > ask > allow priority, or null.
  */
 export function evaluateRules(rules, req, opts = {}) {
-	const surfaces = matchSurfaces(req);
-	if (surfaces.length === 0) return null;
+	const strict = matchSurfaces(req);
+	if (strict.length === 0) return null;
+	const semantic = semanticSurfaces(req, opts);
+	// The bare arguments text, without the `ToolName(...)` wrapper, so a pattern
+	// can anchor on the end of the operation: `tar -czf x.tgz ~/.aws` ends with
+	// the credential directory, while the wrapped form would say `~/.aws)`.
+	const bare = typeof req.argsText === "string" && req.argsText !== "" ? [req.argsText] : [];
 	const allowOpen = allowEligible(req.toolName, opts);
 	for (const action of ["deny", "ask", "allow"]) {
 		if (action === "allow" && !allowOpen) continue;
+		const surfaces = action === "allow"
+			? unique([...strict, ...semantic])
+			: unique([
+				...strict,
+				...semantic,
+				...bare,
+				...strict.flatMap(safetyFolds),
+				...bare.flatMap(safetyFolds),
+				...semantic.flatMap(safetyFolds)
+			]);
 		for (const rule of rules) {
 			if (rule === null || typeof rule !== "object" || rule.action !== action) continue;
 			if (isStructuredRule(rule)) {

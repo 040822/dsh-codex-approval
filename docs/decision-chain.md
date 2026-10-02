@@ -48,6 +48,14 @@ approval/request 到达（toolName + callId + reason）
 
 通配：`*` 任意序列、`?` 单字符。
 
+**规则匹配字符，shell 匹配 token，两者会在引号或空格拼接处错开。** 因此除原始文本外，规则还会扫几个还原面：
+
+- **裸参数文本**（仅 deny/ask）：去掉 `ToolName(...)` 外壳的参数原文，让模式能锚定操作结尾——`tar -czf x.tgz ~/.aws` 以凭据目录结尾，而带外壳的文本是 `~/.aws)`
+- **重建 argv**（仅 `simple`/`compound`）：`git  status`（多一个空格）与 `git status` 同样命中；`rm -r"f" /tmp/x` 与 `rm -rf /tmp/x` 同样命中。若某段的参数自身含空白（`"git status"` 是名字带空格的一个可执行文件），该段**不生成**这个面——失去参数边界的重建文本与命令并不等价
+- **折叠紧贴引号 + 规范化空白**（仅 deny/ask）：删掉与相邻字符粘连的引号字面量（`~/.ss''h/i''d_rsa` → `~/.ssh/id_rsa`），并把连续空白/制表符折成单空格（`npm<TAB>publish 2>log` → `npm publish 2>log`）。独立成参数的引号块（`echo 'rm -rf /'`）不折叠——它只是打印文本，不执行
+
+这些面只**增加**匹配候选，不会让原本命中的规则失效。
+
 优先级：**deny > ask > allow**（与列表顺序无关）；同优先级内按列表顺序取首个。
 
 ### ② 结构化 argv 前缀（仿 Codex `prefix_rule`）
@@ -58,9 +66,12 @@ approval/request 到达（toolName + callId + reason）
   action: allow
   forbidOptions: [--output]     # 出现这些选项（含 --opt=value / -O<file>）则本规则不命中
   pathGuard: workspace-relative # 所有非选项参数必须是工作区相对路径
+  configGuard: git-clean        # 仓库 git 配置里没有可执行外部程序的名字才命中
 ```
 
-`pathGuard` 的判定是静态检查 + `realpath` 复核，避免符号链接逃逸。
+`pathGuard` 的判定是静态检查 + `realpath` 复核，避免符号链接逃逸。"路径参数"包括 `--` 终止符之后的每一项（`cat -- -x` 的 `-x` 是路径，不是选项），也包括内联在选项里的值（`-Path:..\secret`、`--file=/etc/passwd`）——PowerShell 的参数名与值可以用空格或冒号分隔，两种写法等价。**不以 `-` 开头的不一定是路径、以 `-` 开头的也不一定是选项**：只有形如 `-n` / `--output` / `-Path` 的选项**名**会被跳过，`'-/../../x'` 这种带引号的参数值、裸 `-` 都会照常送检；纯数字/布尔的开关值（`-ReadCount:0`）不算路径。
+
+`configGuard: "git-clean"` 读取 `<工作区>/.git/config`，命中任一条就不放行：`external` / `command` / `textconv` 键（行首）、`gpg`（`gpg.program`，签名校验时执行）、`[include]` / `[includeIf]`（被包含的文件读不到，无法核验）、`fsmonitor` 的值不是 `true`/`false`/`0`（非布尔即路径或命令行）。这些键让一条只读命令**无需任何开关**就执行别处指定的程序；`.git` 是 worktree/submodule 的指针文件时同样不放行（配置在读不到的地方）。用户级 `~/.gitconfig` 不在检查范围：那是使用者自己的环境，不是请求能影响的东西。
 
 ### 形状闸门（allow 专属，安全关键）
 
@@ -70,11 +81,13 @@ bash/pwsh 的 **allow 规则只在命令被 `shell-shape.js` 判定为 `simple`*
 
 `ask` / `deny` 规则不受闸门限制——它们是 fail-safe 那一侧。
 
+**只读命令也可能执行程序**：`git diff` / `git log` 会按仓库配置调用外部命令。默认规则用两道闸：显式开关（`--ext-diff` / `--textconv` / `--output` / `-O` 进 `forbidOptions`）与仓库配置（`configGuard`）。`core.pager` 只在有终端时启用（dsh 下是管道，普通 log/diff 不会起 pager），故不单独设闸。
+
 > 边界说明：`shell-shape.js` 是**保守识别器**，不是 shell 解析器。它只回答"这条命令能否信任其 argv"，**不做子命令拆分**。真正不可绕过的边界仍是沙箱与宿主工具审批策略；规则里的 deny 是加速拒绝，不是沙箱强制。
 
 ## AI 审判输入 / 输出
 
-**输入**：固定系统提示（审批员角色 + risk/authorization 定义 + 意图优先规则 + 只输出 JSON 约束）+ `{"toolName", "command", "reason"}`。命令本体**不截断**（截断只用于审计/UI 预览）；超过 `ai.maxJudgeCommandChars`（默认 8000）时不问 AI，按 evidence-incomplete 处理。命令与 reason 在进入 prompt 前统一脱敏（`redact.js`）。
+**输入**：一条 `system` 消息（固定政策：审批员角色 + risk/authorization 定义 + 意图优先规则 + 只输出 JSON 约束）+ 一条 `user` 消息（`{"toolName", "command", "reason"}`，必要时附 `Context:` 会话骨架）。两者分属不同 role，命令文本无法冒充指令层级。命令本体**不截断**（截断只用于审计/UI 预览）；超过 `ai.maxJudgeCommandChars`（默认 8000）时不问 AI，按 evidence-incomplete 处理。命令与 reason 在进入 prompt 前统一脱敏（`redact.js`）。
 
 **输出**：`{"risk":"low|medium|high","authorization":"allow|ask|deny","reason":"一句话"}`。
 

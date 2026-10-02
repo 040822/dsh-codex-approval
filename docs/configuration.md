@@ -85,9 +85,9 @@
 
 不配置即用内置默认：
 
-- **自动放行**：只读命令（git status/diff/log、ls、cat（限工作区内路径）、pwd、which、echo），以及 Windows 上的对应 pwsh 只读族
-- **直接拒绝**：破坏性命令（`rm -rf /`、`rm -rf ~`、`sudo rm`、`mkfs`、`shutdown`、`reboot`、pwsh 的 `Format-Volume` 等）
-- **必须询问**：敏感词（secret / password / credential / token），以及凭据与审批配置路径（`*/.ssh/*`、`*/.aws/*`、`*/.codex/auth.json*`、`*/.dsh/profiles/*`、审计日志本体）
+- **自动放行**：只读命令（git status/diff/log、ls、cat（限工作区内路径）、pwd、which、echo），以及 Windows 上的对应 pwsh 只读族。git 这三条规则还要求仓库 `.git/config` 不含 `diff.external` / textconv driver / `core.fsmonitor`（`configGuard: git-clean`），且命令不带 `--ext-diff` / `--textconv` / `--output` / `-O`；`~`、重定向、命令替换、复合命令一律不放行
+- **直接拒绝**：破坏性命令（`rm -rf /`、`rm -rf ~`、`sudo rm`、`mkfs`、`shutdown` / `reboot`（含 `sudo` 前缀）、`sudo dd`、`of=/dev/sd*` 等裸设备写入、fork bomb、pwsh 的 `Format-Volume` / `Stop-Computer` / `Restart-Computer`）
+- **必须询问**：敏感词（secret / password / credential / token），以及凭据与审批配置路径（`*/.ssh*`、`*/.aws*`、`*/.codex/auth.json*`、`*/.dsh/profiles*`、`*/.dsh/settings.yaml*`、审计日志本体）——按目录匹配，正斜杠与 Windows 反斜杠两种形态都有，`cp -r ~/.ssh /tmp/` 这类整目录导出同样命中
 - **`npm publish`**：内置规则 `Bash(npm publish*)` → `ask`，发布升级请求必定弹窗询问人类；`ai-auto` 下按 `mode3OnAsk` 处理（默认拒绝）。`npm unpublish` 无规则，由 AI 判定（通常判 high 直接拒绝）
 
 `rules: []`（显式空数组）= **真的没有规则**，不再回落默认规则——想让每次审批都交给 AI 判定时用它。

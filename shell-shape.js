@@ -66,13 +66,17 @@ function classifyBash(command) {
 	const parts = [];
 	let current = [];
 	let token = "";
+	// A quoted block is an argument even when it is empty: `cat ''` passes one
+	// empty argument, and a dropped one shifts every later path argument.
+	let tokenQuoted = false;
 	let inSingle = false;
 	let inDouble = false;
 
 	const pushToken = () => {
-		if (token !== "") {
+		if (token !== "" || tokenQuoted) {
 			current.push(token);
 			token = "";
+			tokenQuoted = false;
 		}
 	};
 	const endPart = () => {
@@ -109,10 +113,12 @@ function classifyBash(command) {
 		}
 		if (ch === "'") {
 			inSingle = true;
+			tokenQuoted = true;
 			continue;
 		}
 		if (ch === '"') {
 			inDouble = true;
+			tokenQuoted = true;
 			continue;
 		}
 		if (ch === " " || ch === "\t") {
@@ -154,6 +160,10 @@ function classifyBash(command) {
 	return {
 		shape: parts.length > 1 ? "compound" : "simple",
 		argv: parts[0],
+		// bash quotes are pure shell syntax: the program still receives `-n` from
+		// `'-n'`, so a quoted word is an option name here and there is nothing to
+		// track. PowerShell is the opposite case — see classifyPwsh.
+		quoted: null,
 		parts,
 		reason: null
 	};
@@ -168,13 +178,22 @@ function classifyBash(command) {
  */
 function classifyPwsh(command) {
 	const argv = [];
+	// Parallel to argv: was this word written as a quoted string? PowerShell binds
+	// a **quoted** token as a value, never as a parameter name (`-Path '-x'` is
+	// the path `-x`), and the word itself no longer shows that once the quotes are
+	// stripped — so the flag has to travel with the word.
+	const quoted = [];
 	let token = "";
+	// see classifyBash: an empty quoted string is still one argument
+	let tokenQuoted = false;
 	let inSingle = false;
 	let inDouble = false;
 	const pushToken = () => {
-		if (token !== "") {
+		if (token !== "" || tokenQuoted) {
 			argv.push(token);
+			quoted.push(tokenQuoted);
 			token = "";
+			tokenQuoted = false;
 		}
 	};
 	for (let i = 0; i < command.length; i += 1) {
@@ -195,10 +214,12 @@ function classifyPwsh(command) {
 		}
 		if (ch === "'") {
 			inSingle = true;
+			tokenQuoted = true;
 			continue;
 		}
 		if (ch === '"') {
 			inDouble = true;
+			tokenQuoted = true;
 			continue;
 		}
 		if (ch === " " || ch === "\t") {
@@ -218,18 +239,104 @@ function classifyPwsh(command) {
 	if (inSingle || inDouble) return opaque("unterminated-quote");
 	pushToken();
 	if (argv.length === 0) return opaque("empty-command");
-	return { shape: "simple", argv, parts: [argv], reason: null };
+	return { shape: "simple", argv, quoted, parts: [argv], reason: null };
 }
+
+/**
+ * The value an option carries inline, or null when the argument carries none.
+ *
+ * Two inline forms exist and neither may be treated as "just an option":
+ *   - PowerShell binds a value with a **colon** ("The parameter name and value
+ *     can be separated by a space or a colon character", about_Parameters), so
+ *     `-Path:..\secret` is the same call as `-Path ..\secret` — the path is in
+ *     the argument itself.
+ *   - GNU-style long options accept `--flag=value`.
+ *
+ * Ignoring these is how `Get-Content -Path:..\secret` was auto-approved with an
+ * empty path list.
+ * @param arg - one argv entry
+ * @returns the inline value, or null
+ */
+function inlineOptionValue(arg) {
+	const colon = /^-[A-Za-z][A-Za-z0-9_-]*:([\s\S]+)$/.exec(arg);
+	if (colon !== null) return colon[1];
+	const equals = /^-{1,2}[A-Za-z][A-Za-z0-9_-]*=([\s\S]+)$/.exec(arg);
+	return equals === null ? null : equals[1];
+}
+
+/** A token that names an option/switch rather than carrying a value: `-n`, `--output`, `-Path`. */
+const OPTION_NAME = /^-{1,2}[A-Za-z][A-Za-z0-9_-]*$/;
+
+/**
+ * Option/value pairs whose value is a count, never a path: `-ReadCount:0`,
+ * `-Tail:5`. Only these named switches are trusted to carry a non-path inline
+ * value — everything else (`-Path:0`) is checked, because a bare number is a
+ * perfectly good file name.
+ */
+const NON_PATH_INLINE = /^-(?:ReadCount|TotalCount|Tail):(?:\d+|true|false)$/i;
 
 /**
  * The arguments that name a path: everything after the matched prefix that is
  * not an option/switch. `cat -n file` → `["file"]`; `Get-Content -Path x` → `["x"]`.
+ *
+ * Two cases must **not** be dropped, because the path hides inside them:
+ *   - everything after a bare `--` terminator (`cat -- -../../etc/passwd`: the
+ *     `--` ends option parsing, so every later entry is a path — including one
+ *     that starts with `-`);
+ *   - the inline value of `-Name:Value` / `--flag=value`.
+ *
+ * A word that the recognizer saw **quoted** is always a value (`quoted[i]`),
+ * never an option name: PowerShell does not bind a quoted token as a parameter,
+ * so `Get-Content -LiteralPath '-x'` passes the path `-x` and it must be checked.
+ * bash reports no such flag — `cat '-n'` really does pass `-n` to `cat`.
+ *
+ * A dash-prefixed entry is only *skipped* when it actually looks like an option
+ * name. Anything else starting with `-` is treated as a path and checked:
+ * PowerShell binds a **quoted** string as a value, not as a parameter name
+ * (`Get-Content -Path '-/../../x'` — the argument is quoted, so it is the path
+ * `-/../../x`), and the recognizer has already dropped that quoting. A bare `-`
+ * is likewise checked rather than waved through: PowerShell treats it as a path
+ * (`-LiteralPath '-'`), and a symlink named `-` must still be resolved against
+ * the workspace root.
  * @param argv - the command's argv (simple shape only)
  * @param skip - how many leading argv entries the rule's prefix consumed
+ * @param quoted - optional per-word flags from classifyCommand (pwsh only)
  */
-export function positionalArgs(argv, skip = 1) {
+export function positionalArgs(argv, skip = 1, quoted = undefined) {
 	if (!Array.isArray(argv)) return [];
-	return argv.slice(skip).filter((arg) => typeof arg === "string" && !arg.startsWith("-"));
+	const args = [];
+	let afterTerminator = false;
+	for (let i = Math.max(0, skip); i < argv.length; i += 1) {
+		const arg = argv[i];
+		if (typeof arg !== "string") continue;
+		if (afterTerminator) {
+			args.push(arg);
+			continue;
+		}
+		if (Array.isArray(quoted) && quoted[i] === true) {
+			args.push(arg);
+			continue;
+		}
+		if (arg === "--") {
+			afterTerminator = true;
+			continue;
+		}
+		if (arg.startsWith("-")) {
+			if (NON_PATH_INLINE.test(arg)) continue;
+			const value = inlineOptionValue(arg);
+			if (value !== null) {
+				args.push(value);
+				continue;
+			}
+			// `-n` / `--output` / `-Path`: an option name, not a path. `-/../..`,
+			// `-x.y`, `-`: not an option name, so it is checked as a path.
+			if (OPTION_NAME.test(arg)) continue;
+			args.push(arg);
+			continue;
+		}
+		args.push(arg);
+	}
+	return args;
 }
 
 /**

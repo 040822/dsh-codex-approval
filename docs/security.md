@@ -6,6 +6,10 @@
 
 - **deny 规则永远最先求值**，AI 无权覆盖显式拒绝
 - **形状闸门**：命令文本不是"单条纯命令"就绝不被 allow 规则放行（复合命令 / 重定向 / 命令替换 / 变量 / 通配 / 控制流全部交 AI 或人类）
+- **路径参数完整**：`--` 终止符之后的每一项、以及内联在选项里的值（`-Path:..\secret` / `--file=/etc/passwd`）都算路径参数，不能靠"看起来像选项"躲过 `pathGuard`
+- **规则扫还原面**：除原始文本外还匹配"裸参数文本"、"重建 argv"与（deny/ask 专用的）"折叠紧贴引号 + 规范化空白"，`npm  publish`、`rm -r"f" /tmp/x`、`npm<TAB>publish 2>log` 与它们的常规写法同样命中（见[决策链与规则语法](decision-chain.md#规则语法)）
+- **`configGuard`**：`git diff` / `git log` / `git status` 的自动放行要求仓库 `.git/config` 里没有 `external` / `command` / `textconv` 键、没有 `gpg` 配置、没有 `[include]`、且 `fsmonitor` 值只为布尔 —— 这些让一条只读命令无需任何开关就执行别处指定的程序（或被包含文件里的同名键）；`.git` 是 worktree/submodule 指针文件时同样不放行（配置无法核验）。用户级 `~/.gitconfig` 不在检查范围（属使用者自己的环境）
+- **固定政策与证据分属两条消息**：判定提示是 `system` 消息，命令 / reason / 会话骨架是 `user` 消息——请求文本无法冒充指令层级
 - **原文进判**：规则与 AI 看到的是完整命令；截断只用于日志与 UI 预览
 - **证据门槛**：参数缺失 / 无法解析 / 命令超预算 → 不问 AI，直接交人类（`ai-auto` 下直接拒绝），审计标 `evidenceIncomplete`。这是"没看到操作"，不是"AI 判定不确定"，因此不受 `mode3OnAsk` 影响
 - **统一脱敏**：命令与 reason 在进入 AI prompt、审计日志、拒绝反馈前一律脱敏；插件新建的审计日志为 `0600` 并按 `logMaxBytes` 轮转（**已存在的旧日志权限不会被自动改动**）
@@ -35,7 +39,8 @@ a materially safer alternative, or stop and ask the user.
 
 ## 已知边界（不是安全保证）
 
-- **枚举校验只约束 AI 输出的格式**，不能保证裁判不受提示注入影响。因此固定政策与不可信请求文本分开处理，且 `authorization` 仍要过规则层
+- **枚举校验只约束 AI 输出的格式**，不能保证裁判不受提示注入影响。role 分离（政策 `system` / 证据 `user`）削弱了"命令文本冒充指令"的路径，但削弱不等于消除，且 `authorization` 仍要过规则层
+- **role 分离依赖宿主与上游接受 `system` 消息**：DSH 会把 `system` 透传给 provider；若某模型的通道会把 system 映射成 `developer` 而该上游不接受（此前实测 opencode 系通道即如此），需要在模型配置上声明 `compat: { supportsDeveloperRole: false }`，否则判定调用直接 400（走 failOpen）
 - **形状闸门是保守识别器，不是 shell 解析器**。它只回答"这条命令能否信任其 argv"，**不做子命令拆分**；无法覆盖所有间接副作用
 - **真正不可绕过的边界是沙箱与宿主工具审批策略**。规则里的 `deny` 是加速拒绝，不是沙箱强制
 - **`danger-full-access` 模式下插件自然空闲**：沙箱不拒绝任何操作 → 不产生审批请求 → 插件没有介入点。想让它生效，请保持在 `read-only` 或 `workspace-write`

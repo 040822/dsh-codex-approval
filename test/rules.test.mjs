@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { wildcardMatch, matchableText, evaluateRules } from "../rules.js";
+import { wildcardMatch, matchableText, evaluateRules, foldQuotedLiterals, classifyRequest } from "../rules.js";
 
 test("wildcardMatch: basic cases", () => {
 	assert.equal(wildcardMatch("Bash(git *)", "Bash(git status --short)"), true);
@@ -103,4 +103,41 @@ test("evaluateRules: Bash rule does not match pwsh calls and vice versa", () => 
 	assert.equal(evaluateRules(rules, { toolName: "pwsh", argsText: "git status", reason: "" }), null);
 	// bash call never matches the Pwsh rule
 	assert.equal(evaluateRules(rules, { toolName: "bash", argsText: "Get-ChildItem /tmp", reason: "" }), null);
+});
+
+test("foldQuotedLiterals: a glued quote is folded, a standalone argument is not", () => {
+	assert.equal(foldQuotedLiterals('bash(rm -r"f" /tmp/x)'), "bash(rm -rf /tmp/x)");
+	assert.equal(foldQuotedLiterals("bash(cat ~/.ss''h/i''d_rsa)"), "bash(cat ~/.ssh/id_rsa)");
+	// a quoted block that stands on its own keeps its quotes: `echo 'rm -rf /'`
+	// prints that text, it does not run it, and the fold must not pretend it does
+	assert.equal(foldQuotedLiterals("bash(echo 'rm -rf /')"), "bash(echo 'rm -rf /')");
+	assert.equal(foldQuotedLiterals('bash(cat "a b")'), 'bash(cat "a b")');
+	assert.equal(foldQuotedLiterals(""), "");
+});
+
+test("evaluateRules: spliced-token rewrites still reach the safety rules", () => {
+	const rules = [
+		{ match: "*rm -rf /*", action: "deny" },
+		{ match: "Bash(npm publish*)", action: "ask" }
+	];
+	const hit = (command) => {
+		const shape = classifyRequest("bash", command);
+		return evaluateRules(rules, { toolName: "bash", argsText: command, reason: "" }, shape)?.action;
+	};
+	// an extra space or a tab: the shell runs `npm publish`
+	assert.equal(hit("npm  publish"), "ask");
+	assert.equal(hit("npm\tpublish"), "ask");
+	// a spliced option letter: the shell runs `rm -rf /tmp/x`
+	assert.equal(hit('rm -r"f" /tmp/x'), "deny");
+	// the folded surface reaches an opaque command, which has no argv to rebuild
+	const opaque = "cat ~/.ss''h/i''d_rsa";
+	assert.equal(
+		evaluateRules([{ match: "*id_rsa*", action: "ask" }], { toolName: "bash", argsText: opaque, reason: "" }, classifyRequest("bash", opaque))?.action,
+		"ask"
+	);
+	// the rebuilt-argv surface also keeps a legitimately quoted call matched
+	assert.equal(
+		evaluateRules([{ match: "Bash(git status)", action: "allow" }], { toolName: "bash", argsText: 'git "status"', reason: "" }, classifyRequest("bash", 'git "status"'))?.action,
+		"allow"
+	);
 });

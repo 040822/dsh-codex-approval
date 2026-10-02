@@ -68,9 +68,17 @@ export const DEFAULT_CONFIG = {
 		// compound/opaque, so NO allow rule matches them; they reach the ask/deny
 		// rules below and then the judge / human. `git diff --output=<file>`
 		// writes a file, and `cat` only auto-approves workspace-relative paths.
-		{ tool: "bash", pattern: ["git", "status"], action: "allow" },
-		{ tool: "bash", pattern: ["git", "diff"], action: "allow", forbidOptions: ["--output", "-O"] },
-		{ tool: "bash", pattern: ["git", "log"], action: "allow", forbidOptions: ["--output", "-O"] },
+		//
+		// A read-only command can still *run* something: git executes external
+		// programs named by repository config (`diff.external` runs **without**
+		// any switch, a textconv filter likewise; `core.fsmonitor` runs on
+		// `git status`). Those switches therefore veto the allow, and
+		// `configGuard: "git-clean"` refuses the allow outright when the config
+		// that could name such a program is present — see gitConfigGuard.
+		// A path after `--` is a path even when it starts with `-`.
+		{ tool: "bash", pattern: ["git", "status"], action: "allow", configGuard: "git-clean" },
+		{ tool: "bash", pattern: ["git", "diff"], action: "allow", configGuard: "git-clean", forbidOptions: ["--output", "-O", "--ext-diff", "--textconv", "--show-signature"] },
+		{ tool: "bash", pattern: ["git", "log"], action: "allow", configGuard: "git-clean", forbidOptions: ["--output", "-O", "--ext-diff", "--textconv", "--show-signature"] },
 		{ tool: "bash", pattern: ["ls"], action: "allow" },
 		{ tool: "bash", pattern: ["pwd"], action: "allow" },
 		{ tool: "bash", pattern: ["which"], action: "allow" },
@@ -80,9 +88,9 @@ export const DEFAULT_CONFIG = {
 		// dsh's shell tool is `pwsh` on Windows; tool names are matched
 		// case-insensitively and a structured rule only ever matches its own
 		// tool, so the Bash and Pwsh families coexist.
-		{ tool: "pwsh", pattern: ["git", "status"], action: "allow" },
-		{ tool: "pwsh", pattern: ["git", "diff"], action: "allow", forbidOptions: ["--output", "-O"] },
-		{ tool: "pwsh", pattern: ["git", "log"], action: "allow", forbidOptions: ["--output", "-O"] },
+		{ tool: "pwsh", pattern: ["git", "status"], action: "allow", configGuard: "git-clean" },
+		{ tool: "pwsh", pattern: ["git", "diff"], action: "allow", configGuard: "git-clean", forbidOptions: ["--output", "-O", "--ext-diff", "--textconv", "--show-signature"] },
+		{ tool: "pwsh", pattern: ["git", "log"], action: "allow", configGuard: "git-clean", forbidOptions: ["--output", "-O", "--ext-diff", "--textconv", "--show-signature"] },
 		{ tool: "pwsh", pattern: ["Get-ChildItem"], action: "allow" },
 		{ tool: "pwsh", pattern: ["ls"], action: "allow" },
 		{ tool: "pwsh", pattern: ["Get-Location"], action: "allow" },
@@ -104,6 +112,30 @@ export const DEFAULT_CONFIG = {
 		{ match: "*mkfs*", action: "deny" },
 		{ match: "Bash(shutdown*)", action: "deny" },
 		{ match: "Bash(reboot*)", action: "deny" },
+		// the same commands behind `sudo`/`doas` — the plain `Bash(shutdown*)`
+		// form anchors at the start of the call and never saw them, and `sudo`
+		// options (`sudo -n reboot`) sit between the two words
+		{ match: "*sudo *shutdown*", action: "deny" },
+		{ match: "*sudo *reboot*", action: "deny" },
+		{ match: "*sudo *halt*", action: "deny" },
+		{ match: "*sudo *poweroff*", action: "deny" },
+		{ match: "*sudo *dd *", action: "deny" },
+		{ match: "*doas *dd *", action: "deny" },
+		// writing a raw device destroys whatever filesystem is on it
+		{ match: "*of=/dev/sd*", action: "deny" },
+		{ match: "*of=/dev/hd*", action: "deny" },
+		{ match: "*of=/dev/vd*", action: "deny" },
+		{ match: "*of=/dev/nvme*", action: "deny" },
+		{ match: "*of=/dev/mmcblk*", action: "deny" },
+		{ match: "*of=/dev/disk*", action: "deny" },
+		{ match: "*of=/dev/mapper/*", action: "deny" },
+		{ match: "*of=/dev/dm-*", action: "deny" },
+		{ match: "*of=/dev/md*", action: "deny" },
+		{ match: "*of=/dev/loop*", action: "deny" },
+		// any other raw-device write: a human decides (`of=/dev/null` is caught
+		// too — one confirmation for a rare, harmless form is the price)
+		{ match: "*of=/dev/*", action: "ask" },
+		{ match: "*:(){ :|:& };:*", action: "deny" },
 		{ match: "Pwsh(Format-Volume*)", action: "deny" },
 		{ match: "Pwsh(Stop-Computer*)", action: "deny" },
 		{ match: "Pwsh(Restart-Computer*)", action: "deny" },
@@ -113,15 +145,40 @@ export const DEFAULT_CONFIG = {
 		{ match: "Bash(npm publish*)", action: "ask" },
 		{ match: "Bash(*npm publish*)", action: "ask" },
 		// credentials and approval configuration: reading, copying or writing
-		// these always needs a human, however harmless the command looks
+		// these always needs a human, however harmless the command looks. The
+		// *directory* is the secret, so it is matched in three shapes —
+		// `<dir>/`, `<dir>` at the end of the text, and `<dir> ` followed by
+		// another argument — which catches `cp -r ~/.ssh /tmp/` and
+		// `tar -czf x.tgz ~/.aws` without also catching a file that merely
+		// starts with the name (`docs/.aws-guide.md`). The backslash forms cover
+		// Windows paths, where the separator is `\` and the forward-slash
+		// patterns never matched.
 		{ match: "*id_rsa*", action: "ask" },
 		{ match: "*id_ed25519*", action: "ask" },
 		{ match: "*/.ssh/*", action: "ask" },
+		{ match: "*/.ssh", action: "ask" },
+		{ match: "*/.ssh *", action: "ask" },
+		{ match: "*\\.ssh\\*", action: "ask" },
+		{ match: "*\\.ssh", action: "ask" },
+		{ match: "*\\.ssh *", action: "ask" },
 		{ match: "*/.aws/*", action: "ask" },
+		{ match: "*/.aws", action: "ask" },
+		{ match: "*/.aws *", action: "ask" },
+		{ match: "*\\.aws\\*", action: "ask" },
+		{ match: "*\\.aws", action: "ask" },
+		{ match: "*\\.aws *", action: "ask" },
 		{ match: "*/.codex/auth.json*", action: "ask" },
+		{ match: "*\\.codex\\auth.json*", action: "ask" },
 		{ match: "*/.dsh/profiles/*", action: "ask" },
+		{ match: "*/.dsh/profiles", action: "ask" },
+		{ match: "*/.dsh/profiles *", action: "ask" },
+		{ match: "*\\.dsh\\profiles\\*", action: "ask" },
+		{ match: "*\\.dsh\\profiles", action: "ask" },
+		{ match: "*\\.dsh\\profiles *", action: "ask" },
 		{ match: "*/.dsh/settings.yaml*", action: "ask" },
+		{ match: "*\\.dsh\\settings.yaml*", action: "ask" },
 		{ match: "*/.dsh/logs/approval.jsonl*", action: "ask" },
+		{ match: "*\\.dsh\\logs\\approval.jsonl*", action: "ask" },
 		{ match: "*/.dsh-codex-approval/*", action: "ask" },
 		// the agent's own justification (`reason:`) can only raise strictness,
 		// never grant: these patterns only ever add an ask
@@ -396,6 +453,9 @@ function assertConfig(cfg) {
 			}
 			if (rule.pathGuard !== void 0 && rule.pathGuard !== "workspace-relative") {
 				throw new TypeError("dsh-codex-approval: rule.pathGuard must be \"workspace-relative\"");
+			}
+			if (rule.configGuard !== void 0 && rule.configGuard !== "git-clean") {
+				throw new TypeError("dsh-codex-approval: rule.configGuard must be \"git-clean\"");
 			}
 			continue;
 		}
@@ -745,9 +805,77 @@ export async function pathGuardAllows(args, { cwd, root, resolvePath = realpath 
 }
 
 /**
+ * Config keys that make a *read-only* git command run a program somebody else
+ * named. `diff.external` and a textconv driver run with **no switch at all** —
+ * `--ext-diff` / `--textconv` only enable them explicitly — and `core.fsmonitor`
+ * runs on a plain `git status`. So `forbidOptions` alone cannot close this: the
+ * repository's own `.git/config` (or the user's `~/.gitconfig`) is the switch.
+ */
+const GIT_EXEC_CONFIG = [
+	// `[section] key = value` on one line is legal config, so the section header
+	// is optional in front of the key
+	/^\s*(?:\[[^\]]*\]\s*)?external\s*=/im, // [diff] external = <command>
+	/^\s*(?:\[[^\]]*\]\s*)?command\s*=/im, // [diff "<driver>"] command = <command>
+	/^\s*(?:\[[^\]]*\]\s*)?textconv\s*=/im, // [diff "<driver>"] textconv = <command>
+	/\bgpg\b/i, // [gpg] program = <command> (runs on a signature-verified log)
+	/\binclude(?:if)?\b/i // an included file we cannot read (`[include] path`, `include.path`)
+];
+
+/** `core.fsmonitor = <value>`; only a boolean/empty value runs no program. */
+const GIT_FSMONITOR = /^\s*(?:\[[^\]]*\]\s*)?fsmonitor\s*=\s*([^\n#;]*)/gim;
+
+/** Whether a git config text names a program a read-only command would run. */
+function gitConfigNamesProgram(text) {
+	if (GIT_EXEC_CONFIG.some((pattern) => pattern.test(text))) return true;
+	for (const match of text.matchAll(GIT_FSMONITOR)) {
+		const value = match[1].trim().toLowerCase();
+		// `true` uses git's built-in daemon and `false`/empty disable it; anything
+		// else is a path or command line
+		if (value !== "" && value !== "true" && value !== "false" && value !== "0") return true;
+	}
+	return false;
+}
+
+/**
+ * The check behind `configGuard: "git-clean"`: may this git command be
+ * auto-approved without running a program named in the repository's own git
+ * config?
+ *
+ * Scope: the **repository** config (`<root>/.git/config`) — the part of the
+ * setup that lives in the workspace and can therefore be influenced with the
+ * agent's own tools. A user's `~/.gitconfig` (their pager, their difftool) is
+ * their own environment, not something a request can reach, so it is out of
+ * scope by design.
+ *
+ * Fail-closed by design. A `.git` **pointer file** (a worktree or submodule
+ * checkout) means the real config lives elsewhere and cannot be verified here,
+ * so no auto-approval. A missing file is fine — nothing is configured there.
+ *
+ * @param opts - { root, readFile } — `readFile` is injectable so the check is
+ *   unit-testable without touching the filesystem.
+ * @returns true when no config that could run a program is present.
+ */
+export async function gitConfigGuard({ root, readFile: readConfig = readFile } = {}) {
+	if (typeof root !== "string" || root === "") return false;
+	const read = async (file) => {
+		try {
+			const value = await readConfig(file, "utf8");
+			return typeof value === "string" ? value : null;
+		} catch {
+			return null;
+		}
+	};
+	// a gitdir pointer file means the config is not where we can read it
+	if ((await read(join(root, ".git"))) !== null) return false;
+	const text = await read(join(root, ".git", "config"));
+	if (text === null) return true;
+	return !gitConfigNamesProgram(text);
+}
+
+/**
  * Create the approval/request handler with injected dependencies
  * (unit-testable without a cordis ctx).
- * @param deps - { config, record, llmRunner, getSessionMode, denialFeed, denialHistory, getCwd, resolvePath }
+ * @param deps - { config, record, llmRunner, getSessionMode, denialFeed, denialHistory, getCwd, resolvePath, readFile }
  *   `denialFeed` is an optional Map<sessionId, Array<DenialRecord>> used to
  *   stage plugin-originated denials for the `agent/pre-step` injector; when
  *   omitted the handler creates its own (shared only if the caller passes it).
@@ -756,10 +884,11 @@ export async function pathGuardAllows(args, { cwd, root, resolvePath = realpath 
  *   context ([D] lines) — created internally when omitted.
  *   `getCwd` optionally returns the workspace path for the transcript [W] line
  *   and for the path-guard check; `resolvePath` overrides the realpath used by
- *   that check (tests inject a pure resolver).
+ *   that check (tests inject a pure resolver); `readFile` overrides the config
+ *   reader behind `configGuard` (tests inject a pure reader).
  * @returns async (req, next) => ApprovalOutcome
  */
-export function createHandler({ config, record, llmRunner, getSessionMode, denialFeed, denialHistory, getCwd, resolvePath }) {
+export function createHandler({ config, record, llmRunner, getSessionMode, denialFeed, denialHistory, getCwd, resolvePath, readFile: readConfigFile }) {
 	let cfg = config;
 	const feed = denialFeed ?? new Map();
 	const history = denialHistory ?? new Map();
@@ -778,20 +907,26 @@ export function createHandler({ config, record, llmRunner, getSessionMode, denia
 		cfg = nextConfig;
 	};
 	/**
-	 * The rule that decides this request, with the path-guard hardening applied.
-	 * A rule whose path guard refuses (a "workspace-relative" path that resolves
-	 * outside the root through a symlink) is dropped and evaluation continues,
-	 * so a later ask/deny rule for the same command still wins instead of the
-	 * request silently becoming "no rule matched".
+	 * The rule that decides this request, with each rule's guard applied: a rule
+	 * whose path guard refuses (a "workspace-relative" path that resolves
+	 * outside the root through a symlink) or whose config guard refuses (git
+	 * config that could run a program) is dropped and evaluation continues, so a
+	 * later ask/deny rule for the same command still wins instead of the request
+	 * silently becoming "no rule matched".
 	 */
-	const resolveRule = async (request, shapeInfo, pathOpts) => {
+	const resolveRule = async (request, shapeInfo, guardOpts) => {
 		let remaining = cfg.rules;
 		for (;;) {
 			const match = evaluateRules(remaining, request, shapeInfo);
 			if (match === null) return null;
-			if (match.action !== "allow" || match.pathGuard !== "workspace-relative") return match;
-			const args = positionalArgs(shapeInfo.argv, match.pattern.length);
-			if (await pathGuardAllows(args, pathOpts)) return match;
+			if (match.action !== "allow") return match;
+			const pathsOk = match.pathGuard === "workspace-relative"
+				? await pathGuardAllows(positionalArgs(shapeInfo.argv, match.pattern.length, shapeInfo.quoted), guardOpts.path)
+				: true;
+			const configOk = match.configGuard === "git-clean"
+				? await gitConfigGuard({ ...guardOpts.config, readFile: readConfigFile })
+				: true;
+			if (pathsOk && configOk) return match;
 			remaining = remaining.filter((candidate) => candidate !== match);
 		}
 	};
@@ -832,7 +967,10 @@ export function createHandler({ config, record, llmRunner, getSessionMode, denia
 		let context = "";
 		let rule = null;
 		if (evidenceIssue === null) {
-			rule = await resolveRule(matchReq, shapeInfo, { cwd, root: cwd, resolvePath });
+			rule = await resolveRule(matchReq, shapeInfo, {
+				path: { cwd, root: cwd, resolvePath },
+				config: { root: cwd }
+			});
 		}
 		if (evidenceIssue !== null) {
 			// Incomplete evidence is never auto-approved, and the judge is not

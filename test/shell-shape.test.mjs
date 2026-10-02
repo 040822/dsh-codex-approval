@@ -94,6 +94,28 @@ test("positionalArgs: options are skipped, path targets survive", () => {
 	assert.deepEqual(positionalArgs(["git", "status"], 2), []);
 });
 
+test("positionalArgs: `--` terminator and inline option values are never dropped", () => {
+	// PowerShell's documented colon form — the value *is* the argument, so the
+	// path is inside it (`Get-Content -Path:..\secret` == `-Path ..\secret`).
+	assert.deepEqual(positionalArgs(["Get-Content", "-Path:..\\secret.txt"], 1), ["..\\secret.txt"]);
+	assert.deepEqual(positionalArgs(["Get-Content", "-Path:ok.txt"], 1), ["ok.txt"]);
+	assert.deepEqual(positionalArgs(["cat", "-Path:..\\secret.txt"], 1), ["..\\secret.txt"]);
+	// GNU-style `--flag=value`
+	assert.deepEqual(positionalArgs(["cat", "--file=/etc/passwd"], 1), ["/etc/passwd"]);
+	// `--` ends option parsing: everything after it is a path, dash or not
+	assert.deepEqual(positionalArgs(["cat", "--", "-../../../etc/passwd"], 1), ["-../../../etc/passwd"]);
+	assert.deepEqual(positionalArgs(["cat", "--file", "x", "--", "-y"], 1), ["x", "-y"]);
+	// a bare `-` is not an option name either: PowerShell reads it as a path
+	// (`-LiteralPath '-'`), so it must be resolved, not waved through
+	assert.deepEqual(positionalArgs(["cat", "-", "file.txt"], 1), ["-", "file.txt"]);
+	// a dash-prefixed argument that is not an option *name* is a path
+	assert.deepEqual(positionalArgs(["Get-Content", "-/../../x"], 1), ["-/../../x"]);
+	// an inline value stays a path candidate unless it is a *named* count switch
+	assert.deepEqual(positionalArgs(["Get-Content", "-ReadCount:0", "README.md"], 1), ["README.md"]);
+	assert.deepEqual(positionalArgs(["Get-Content", "-Path:0"], 1), ["0"]);
+	assert.deepEqual(positionalArgs(["Get-ChildItem", "-Recurse:true", "x"], 1), ["true", "x"]);
+});
+
 test("isWorkspaceRelativePath: rejects anything that can escape the workspace", () => {
 	assert.equal(isWorkspaceRelativePath("file.txt"), true);
 	assert.equal(isWorkspaceRelativePath("src/app.js"), true);
