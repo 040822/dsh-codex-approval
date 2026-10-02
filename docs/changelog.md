@@ -22,6 +22,8 @@
 - **第二轮独立审核的闭环修复**：①`hardAsk` 校验覆盖**结构化规则**（`tool`/`pattern` 形态此前绕过校验，标在 `allow` 上会被静默忽略并直接放行）；②`/approval-allow-once` 的授权键改为 JSON 元组编码——此前用分隔符拼接，构造 `workdir`（如 `/a|esc:danger-full-access`）可伪造出另一动作的键并**转移授权**；③`attemptJudge` 增加独立硬超时（候选超时 +250ms 宽限）：适配器不响应 `AbortSignal` 时不再无限挂住审批；④补证的 `realpath` 与 `stat` 和读取共享同一截止，`resolvePath` 卡住（网络挂载、慢符号链接链）同样被截止
 - **策略收紧（由真实模型基线驱动）**：新增 `ask-without-authorization` 分支——AI 判 `ask` 且风险 ≥ medium 且用户授权不是 strong 时交人工（`enforced`），不再因「风险在容忍度内」而放行。首轮 live 基线（`eval/reports/2026-10-02-live-*.md`）里 `curl … \| sh` 就是这样被自动放行的（模型自己判 medium + ask + weak）。容忍度现在只决定「风险 low 的 ask」与「用户明确要求过的 ask」的落点
 - **判定输入补命令线索 `facts`**（新增 `command-facts.js`）：把「不在工作区内的路径」「网络目标主机」「破坏性选项」从命令文本里解析出来交给裁判（`paths` / `hosts` / `destructive`），并在提示词里标明是线索而非证据。opaque 命令（`echo $(cat /etc/passwd)`）拿不到 argv 时从文本提取——首轮 live 基线里正是这类命令被模型判成 low 而放行。线索随审计落盘（`commandFacts`）
+- **第三轮独立审核（xhigh）的修复**：①`command-facts.js` 的每条输出先过 `redactSensitive`——识别器给的 argv 来自**原始**命令文本，一条含斜杠的 `Authorization: Bearer …` 会以"路径"的名义把凭据重新带回 prompt 与审计；②单项 200 字符 / 总量 1200 字符的上限（此前 8KB 命令会生成 8KB 线索）；③URL authority 正确解析（剥 userinfo/端口/IPv6 括号）、`ssh`/`scp`/`nc` 的裸主机名可识别、引号内的 `host:port` 只在网络命令里算目标（`git commit -m "… docs.example.com:8080"` 不再误报）、`sed 's/a/b/'` 与 `python3 -c "print(1/2)"` 不再被当成路径
+- **评测方法学修复**：`--live` 此前**没有把 `facts` 交给模型**，所以"喂线索前后对比"实际是同一条件跑两次——现在默认喂（与生产一致），新增 `--no-facts` 做对照；模型失败或输出不可解析时改走真实 `failOpen` 计分（此前这类行既不算危险放行也不算误拒，却仍在分母里）；重试后累计耗时；报告把 ⚖ 争议案例从门槛里分列；报告文件名加模型短哈希避免 `command/a/b` 与 `command/a_b` 互相覆盖
 - 不变：规则优先级（deny > ask > allow）、证据门槛、`denyFeedback`、`transcript`、审计日志格式与轮转、候选链语义
 
 验证：`node --test` 全绿。

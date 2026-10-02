@@ -52,3 +52,41 @@ test("commandFacts: the lists stay bounded", () => {
 	assert.ok(flags.destructive.length <= 6);
 	assert.ok(DESTRUCTIVE_OPTIONS.includes("--delete"));
 });
+
+test("commandFacts: nothing emitted carries an un-redacted credential", () => {
+	// The recogniser's argv comes from the RAW command, so a credential that
+	// redaction already removed from argsText could ride back in through a "path"
+	// that happens to contain a slash.
+	const bearer = facts('curl -H "Authorization: Bearer sk-abcdefgh12345678" https://api.example.com/x');
+	assert.equal(JSON.stringify(bearer).includes("sk-abcdefgh12345678"), false);
+	// `--password=…` is the shape redaction recognises; either way nothing with a
+	// slash may smuggle the value back in.
+	const password = facts("mysql -u root --password=pass/word/secret -h db.example.tld");
+	assert.equal(JSON.stringify(password).includes("pass/word/secret"), false);
+	assert.deepEqual(bearer.hosts, ["api.example.com"]);
+});
+
+test("commandFacts: every field is bounded, per item and in total", () => {
+	const long = `cat ${"/x".repeat(4000)}`;
+	const out = facts(long);
+	assert.ok(JSON.stringify(out).length < 500, `facts must stay small, got ${JSON.stringify(out).length}`);
+	assert.ok(out.paths.every((entry) => entry.path.length <= 200));
+	const manyHosts = facts("curl https://a.example.tld https://b.example.tld https://c.example.tld https://d.example.tld https://e.example.tld");
+	assert.ok(manyHosts.hosts.length <= 4, JSON.stringify(manyHosts.hosts));
+});
+
+test("commandFacts: inline code and prose are neither paths nor destinations", () => {
+	assert.deepEqual(facts("sed -i 's/foo/bar/g' docs/a.md"), { paths: [{ path: "docs/a.md" }] });
+	assert.deepEqual(facts('python3 -c "print(1/2)"'), null);
+	assert.deepEqual(facts('git commit -m "fix: see docs.example.com:8080"'), null);
+	// ... but a network command's quoted target IS a destination
+	assert.deepEqual(facts('rsync -a ./d/ "deploy@prod.example.tld:/srv"').hosts, ["prod.example.tld"]);
+});
+
+test("commandFacts: URL userinfo is stripped and ssh-like targets are found", () => {
+	assert.deepEqual(facts("curl https://user:pass@host.example.tld/v1/x").hosts, ["host.example.tld"]);
+	assert.deepEqual(facts("ssh deploy@prod.example.tld").hosts, ["prod.example.tld"]);
+	assert.deepEqual(facts("nc db.internal.tld 5432").hosts, ["db.internal.tld"]);
+	assert.deepEqual(facts("git push git@github.com:owner/repo.git").hosts, ["github.com"]);
+	assert.deepEqual(facts("curl http://[::1]:8080/x"), null);
+});

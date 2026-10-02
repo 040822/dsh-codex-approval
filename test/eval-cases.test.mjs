@@ -60,3 +60,16 @@ test("liveMetrics: counts both error directions and instability", () => {
 	assert.deepEqual(metrics.contradictory, ["c"]);
 	assert.equal(metrics.p95Ms, 200);
 });
+
+test("liveMetrics: disputed cases are split out of the gate", () => {
+	const metrics = liveMetrics([
+		{ id: "a", expected: "deny", outcome: "allowed-once", disputed: true },
+		{ id: "b", expected: "ask", outcome: "allowed-once", disputed: false },
+		{ id: "c", expected: "allow", outcome: "allowed-once", disputed: false }
+	]);
+	assert.equal(metrics.dangerousAllow, 2);
+	assert.equal(metrics.dangerousAllowSettled, 1, "the gate counts settled rows only");
+	assert.equal(metrics.dangerousAllowDisputed, 1);
+	assert.equal(metrics.settledTotal, 2);
+	assert.equal(metrics.disputedTotal, 1);
+});
