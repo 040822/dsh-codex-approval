@@ -6,9 +6,9 @@
 
 你可以继续使用工作区沙箱，同时减少反复点确认的打断。
 
-[开始使用](#开始使用) · [选择工作方式](#选择适合你的工作方式) · [详细文档](#详细文档) · [更新日志](docs/changelog.md)
+[为什么值得用](#为什么值得用) · [快速上手](#快速上手) · [文档与支持](#文档与支持) · [更新日志](docs/changelog.md)
 
-## 让任务继续，而不是一直等你
+## 为什么值得用
 
 交给 Agent 一个任务，离开一会儿，回来却发现它还停在审批弹窗前。
 
@@ -17,8 +17,6 @@
 - **日常开发少打断。** 常见只读操作按规则自动处理，其他请求由 AI 评估，再决定放行、拒绝或询问你。
 - **长任务不用守着点确认。** 切换到无人值守模式，审批不再等你回应；需要确认的操作默认拒绝。
 - **按你的习惯调整。** 哪些操作允许、哪些需要确认、哪些禁止，都可以配置；也能随时切回人工审批。
-
-## 不止是自动点「允许」
 
 | 你关心的事 | 插件怎么处理 |
 |---|---|
@@ -29,9 +27,9 @@
 | 调整起来麻烦吗？ | 模型和常用策略在 Web 设置里修改，保存即生效 |
 | 想知道某次为什么放行或拒绝？ | 有决策日志可查，便于回看和排查 |
 
-## 开始使用
+## 快速上手
 
-### 1. 安装
+**1. 安装并重启**
 
 ```bash
 dsh plugin --profile web add dsh-codex-approval
@@ -39,13 +37,13 @@ dsh plugin --profile web add dsh-codex-approval
 
 重启 `dsh web` 进程，再刷新页面。上面的命令只安装到 `web` profile。
 
-### 2. 选一个可用的模型
+**2. 选一个可用的模型**
 
 打开 **设置 → 插件 → 插件配置**，找到本插件，选择你已经在 DSH 中配置好的判定模型并保存。需要时，也可以添加备用模型。
 
 首次使用请检查主模型和备用模型：内置默认配置来自作者的环境，不一定适用于你的机器。如果模型均不可用，默认会回到人工审批。
 
-### 3. 正常交给 Agent 任务
+**3. 开始使用，按需切换模式**
 
 在会话权限选择器中保持 **`workspace-write`**，输入：
 
@@ -54,8 +52,6 @@ dsh plugin --profile web add dsh-codex-approval
 ```
 
 之后照常使用即可。只有操作触发审批时，插件才会介入。
-
-## 选择适合你的工作方式
 
 | 工作方式 | 会发生什么 | 切换命令 |
 |---|---|---|
@@ -67,7 +63,20 @@ dsh plugin --profile web add dsh-codex-approval
 
 无人值守模式适合不方便随时回应的长任务。遇到被拒绝的操作，Agent 仍需要调整方案；它不保证每个任务都能自动完成。
 
-## 它如何做决定？
+## 文档与支持
+
+| 想了解 | 文档 |
+|---|---|
+| 调整策略、开启会话上下文 | [配置参考](docs/configuration.md) |
+| 编写规则、理解判断过程与日志 | [决策链与规则语法](docs/decision-chain.md) |
+| Web 设置与模型配置排查 | [Web 配置卡片](docs/client-card.md) |
+| 安全机制与已知限制 | [安全模型与边界](docs/security.md) |
+| 开发、构建与兼容性声明 | [开发说明](docs/development.md) |
+| 作者本地部署的特殊配置 | [本地部署环境说明](docs/dev-environment.md) |
+| 版本变化 | [更新日志](docs/changelog.md) |
+
+<details>
+<summary>它如何做决定？</summary>
 
 **先看规则，再请 AI 判断，最后按你选择的模式处理。**
 
@@ -81,13 +90,18 @@ dsh plugin --profile web add dsh-codex-approval
 
 想了解具体判断方式，见 [决策链与规则语法](docs/decision-chain.md)。
 
-## 使用前了解这几件事
+</details>
+
+<details>
+<summary>使用注意、常见问题与卸载</summary>
+
+**使用注意**
 
 - **保留沙箱。** 支持 `workspace-write` 和 `read-only`；`danger-full-access` 不产生这类审批请求，插件不会介入。
 - **同一个 profile 只启用一个自动审批插件。** 多个审批插件可能互相干扰。
 - **AI 可能判断错误。** 自动审批不能保证所有操作安全，请按任务需要配置权限与策略。具体边界见 [安全说明](docs/security.md)。
 
-## 常见问题
+**常见问题**
 
 **装了以后没变化？**
 
@@ -103,20 +117,8 @@ dsh plugin --profile web add dsh-codex-approval
 dsh plugin --profile web remove dsh-codex-approval
 ```
 
-## 详细文档
-
-| 想了解 | 文档 |
-|---|---|
-| 调整策略、开启会话上下文 | [配置参考](docs/configuration.md) |
-| 编写规则、理解判断过程与日志 | [决策链与规则语法](docs/decision-chain.md) |
-| Web 设置与模型配置排查 | [Web 配置卡片](docs/client-card.md) |
-| 安全机制与已知限制 | [安全模型与边界](docs/security.md) |
-| 开发、构建与兼容性声明 | [开发说明](docs/development.md) |
-| 作者本地部署的特殊配置 | [本地部署环境说明](docs/dev-environment.md) |
-| 版本变化 | [更新日志](docs/changelog.md) |
+</details>
 
 需要 Node.js **22.19 或更高版本**。内置 Bash 与 Windows PowerShell 规则。
 
-## License
-
-[MIT](LICENSE)
+开源协议：[MIT](LICENSE)。
