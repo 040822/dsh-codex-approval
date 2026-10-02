@@ -4,6 +4,24 @@
 
 ---
 
+## v0.4.5 — 2026-10-02
+
+**安全更新：关闭路径层、规则层与 git 配置层的确定性放行路径。**
+
+本版把"看起来只读、实际不是"的命令从自动放行里摘出来，全部是可复现的确定性缺陷（判定提示词也改为按 role 分离的两条消息）。配置字段与默认值向后兼容；只有那些**此前被误判为只读而自动放行**的写法，现在会交给 AI 或人类。
+
+- **路径参数完整化**：`--` 终止符之后的每一项、选项的内联值（`-Path:..\secret`、`--file=/etc/passwd`）、pwsh 里用引号写出的词（含裸 `-` 与 `-/../../x`）都送 `realpath` 复核；只有 `-n` / `--output` / `-Path` 这类选项**名**会被跳过，`-ReadCount:0` 一类具名计数开关的值不算路径。引号位置参与判定：`-Path:'link'` 检查 `link`，整词被引号包裹的 `'--file=link'` 检查整串
+- **规则扫还原面**：deny / ask 规则除原文外还扫重建 argv（`rm -r"f" /tmp/x` 即 `rm -rf /tmp/x`）、紧贴引号折叠（`~/.ss''h/i''d_rsa` 即 `~/.ssh/id_rsa`）、引号转空格、标点转空格与空白规范化（`npm  publish`、`npm<TAB>publish`），三种改写**三轮复合**；`allow` 仍只用原始文本与重建 argv，参数含空白的段不生成重建面（`"git status"` 不是 `git status`）
+- **git 自动放行加 `configGuard`**：仓库 `.git/config` 与 `extensions.worktreeConfig` 的 `.git/config.worktree` 命中 `external` / `command` / `textconv`（含段头与键同行写法）、`gpg`、`include` / `include.path`，或 `fsmonitor` 取值非布尔（值按引号语法解析，`"true; exec evil"` 是命令行），即不再自动放行；**配置读不出来也不放行**（只有"文件不存在"算干净，权限与 I/O 失败视为无法核验）。`--ext-diff` / `--textconv` / `--show-signature` 进 `forbidOptions`
+- **默认 deny / ask 扩充**：`sudo` / `doas` 包裹的 shutdown / reboot / halt / poweroff / dd；裸设备写入（`of=/dev/sd*`、`nvme`、`mapper`、`md`、`dm-`、`loop` 等 → deny，其余 `of=/dev/*` → ask）；fork bomb；凭据路径补全绝对 / 相对 / 正反斜杠 / 点目录矩阵（`.ssh\config`、`.dsh/profiles/…`、`id_rsa` 等），同时不再误伤 `docs/.aws-guide.md` 这类同名前缀文件
+- **判定提示按 role 分离**：固定政策走 `system` 消息，命令 / reason / 会话骨架走 `user` 消息，请求文本不再与指令同级
+- **文档与包结构**：客户端源码移入 `src/client/`（`package.json` 的 `files` 相应收紧，不再发布根级 `client-*.js` 与构建脚本）；README 改为特性导向，细节拆进 `docs/`，新增配置 / 决策链 / 安全 / 客户端卡片 / 开发 / 本地环境 / 第一性原理等文档与 README 横幅
+- 不变：配置字段与默认值、`/approval-mode` 语义、`denyFeedback`、transcript、审计记录格式
+
+验证：`node --test` 282 用例全绿（v0.4.4 为 256）；另以 120 组凭据路径矩阵与 28 项修复/对照矩阵复核。
+
+---
+
 ## v0.4.4 — 2026-10-01
 
 **修复：空回复现在会推进候选链，兜底模型终于能被用上。**
