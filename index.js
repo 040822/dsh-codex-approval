@@ -279,6 +279,11 @@ export const DEFAULT_CONFIG = {
 		timeoutMs: 15000,
 		maxTokens: 512,
 		failOpen: "ask",
+		// Where an *enforced* policy ask lands in an unattended mode: a high risk
+		// nobody authorized, or an allow above the tolerance nobody asked for.
+		// It is not the judge being unsure — `mode3OnAsk: allow` must not be able
+		// to turn "no user consented" into permission, so this is its own knob.
+		enforcedAskOnUnattended: "deny",
 		// Where a `hardAsk` red line lands when nobody can be asked. A red line
 		// is an ask an unattended mode may not resolve through `mode3OnAsk`
 		// (publishing, credentials): "nobody could consent" is not consent, so
@@ -335,8 +340,6 @@ const ACTIONS = ["allow", "ask", "deny"];
 const TOLERANCES = ["low", "medium", "high"];
 /** Evidence-fetch modes: single-round judge, or one bounded read round. */
 const EVIDENCE_FETCH = ["off", "read-file"];
-/** Floor for a single judge attempt, so a nearly-spent budget cannot cut one off at 1ms. */
-const MIN_CANDIDATE_TIMEOUT_MS = 1000;
 /** Upper bound on the ordered judge-fallback chain (the primary is not counted). */
 const MAX_FALLBACKS = 4;
 
@@ -520,6 +523,7 @@ export const Config = z.object({
 	timeoutMs: live(z.number().step(1).min(1)),
 	maxTokens: live(z.number().step(1).min(1)),
 	hardAskOnUnattended: live(z.union(["deny", "ask"])),
+	enforcedAskOnUnattended: live(z.union(["deny", "ask"])),
 	totalBudgetMs: live(z.number().step(1).min(0)),
 	evidenceFetch: live(z.union(EVIDENCE_FETCH)),
 	evidenceMaxFiles: live(z.number().step(1).min(1)),
@@ -567,6 +571,12 @@ function assertConfig(cfg) {
 			continue;
 		}
 		if (rule.hardAsk !== void 0 && typeof rule.hardAsk !== "boolean") throw new TypeError("dsh-codex-approval: rule.hardAsk must be a boolean");
+		// `hardAsk` means "this ask needs the human, and an unattended mode may not
+		// resolve it away". On an allow rule the marker would be silently ignored —
+		// and it would read as "a human confirmed this", the opposite of its meaning.
+		if (rule.hardAsk === true && rule.action !== "ask") {
+			throw new TypeError("dsh-codex-approval: rule.hardAsk is only meaningful on an ask rule");
+		}
 		if (typeof rule.match !== "string" || rule.match === "") throw new TypeError("dsh-codex-approval: each rule needs a non-empty match");
 	}
 	if (typeof cfg.ai !== "object" || cfg.ai === null) throw new TypeError("dsh-codex-approval: config.ai must be an object");
@@ -577,6 +587,7 @@ function assertConfig(cfg) {
 		throw new TypeError("dsh-codex-approval: config.ai.maxJudgeCommandChars must be an integer in 200..200000");
 	}
 	if (!["deny", "ask"].includes(cfg.ai.hardAskOnUnattended)) throw new TypeError("dsh-codex-approval: config.ai.hardAskOnUnattended must be deny/ask");
+	if (!["deny", "ask"].includes(cfg.ai.enforcedAskOnUnattended)) throw new TypeError("dsh-codex-approval: config.ai.enforcedAskOnUnattended must be deny/ask");
 	if (!Number.isSafeInteger(cfg.ai.totalBudgetMs) || cfg.ai.totalBudgetMs < 0 || cfg.ai.totalBudgetMs > 600_000) {
 		throw new TypeError("dsh-codex-approval: config.ai.totalBudgetMs must be an integer in 0..600000");
 	}
@@ -686,6 +697,7 @@ export function applyConfigSettings(baseConfig, settings) {
 			timeoutMs: pick("timeoutMs", baseAi.timeoutMs),
 			maxTokens: pick("maxTokens", baseAi.maxTokens),
 			hardAskOnUnattended: pick("hardAskOnUnattended", baseAi.hardAskOnUnattended),
+			enforcedAskOnUnattended: pick("enforcedAskOnUnattended", baseAi.enforcedAskOnUnattended),
 			totalBudgetMs: pick("totalBudgetMs", baseAi.totalBudgetMs),
 			evidenceFetch: pick("evidenceFetch", baseAi.evidenceFetch),
 			evidenceMaxFiles: pick("evidenceMaxFiles", baseAi.evidenceMaxFiles),
@@ -855,14 +867,16 @@ export function makeLlmRunner(llm, configOrGetter) {
 			// A cancelled approval must not spend further judge calls.
 			if (signal?.aborted === true) break;
 			const candidate = chain[index];
-			// The whole approval shares one budget (`ai.totalBudgetMs`): the chain
-			// stops when it is spent, and each attempt is capped by what is left.
+			// The whole approval shares one budget (`ai.totalBudgetMs`), and it is a
+			// HARD ceiling: an attempt is capped by what is left, and when nothing is
+			// left the chain stops. There is deliberately no minimum restamp — a
+			// floor would let every attempt overrun the budget it was given.
 			const left = deadline === undefined ? Number.POSITIVE_INFINITY : deadline - Date.now();
 			if (left <= 0) {
 				budgetExhausted = true;
 				break;
 			}
-			const candidateTimeout = left === Number.POSITIVE_INFINITY ? timeoutMs : Math.max(MIN_CANDIDATE_TIMEOUT_MS, Math.min(timeoutMs, left));
+			const candidateTimeout = left === Number.POSITIVE_INFINITY ? timeoutMs : Math.min(timeoutMs, Math.max(1, Math.floor(left)));
 			tried.push(`${candidate.provider}/${candidate.model}`);
 			const result = await attemptJudge(llm, candidate, { messages, signal, sessionId, timeoutMs: candidateTimeout, maxTokens });
 			if (result.ok === true && parseVerdict(result.text) !== null) {
@@ -1128,8 +1142,14 @@ export async function gitConfigGuard({ root, readFile: readConfig = readFile } =
  * @param toolName - the tool that was called
  * @param argsText - the full redacted arguments text
  */
-export function actionKeyOf(toolName, argsText) {
-	return createHash("sha1").update(`${toolName}\u0000${argsText}`).digest("hex").slice(0, 16);
+export function actionKeyOf(toolName, argsText, facts) {
+	// The execution facts are part of the action's identity, not decoration: the
+	// same command in another directory, or under a wider sandbox mode, is a
+	// different action, and a human who approved one did not approve the other.
+	const parts = [];
+	if (typeof facts?.workdir === "string" && facts.workdir !== "") parts.push(`wd:${facts.workdir}`);
+	if (typeof facts?.escalationTo === "string" && facts.escalationTo !== "") parts.push(`esc:${facts.escalationTo}`);
+	return createHash("sha1").update(`${toolName}\u0000${parts.join("|")}\u0000${argsText}`).digest("hex").slice(0, 16);
 }
 
 /**
@@ -1149,10 +1169,12 @@ export function actionKeyOf(toolName, argsText) {
  *   `getCwd` optionally returns the workspace path for the transcript [W] line
  *   and for the path-guard check; `resolvePath` overrides the realpath used by
  *   that check (tests inject a pure resolver); `readFile` overrides the config
- *   reader behind `configGuard` (tests inject a pure reader).
+ *   reader behind `configGuard` and the evidence reader behind `ai.evidenceFetch`
+ *   (tests inject a pure reader); `statFile` overrides the stat behind the
+ *   evidence fetch's file-type and size checks.
  * @returns async (req, next) => ApprovalOutcome
  */
-export function createHandler({ config, record, llmRunner, getSessionMode, denialFeed, denialHistory, breakerStore, getCwd, resolvePath, readFile: readConfigFile }) {
+export function createHandler({ config, record, llmRunner, getSessionMode, denialFeed, denialHistory, breakerStore, getCwd, resolvePath, readFile: readConfigFile, statFile }) {
 	let cfg = config;
 	const feed = denialFeed ?? new Map();
 	const history = denialHistory ?? new Map();
@@ -1269,7 +1291,7 @@ export function createHandler({ config, record, llmRunner, getSessionMode, denia
 		//   - a one-shot human approval of THIS exact action, consumed here;
 		//   - a tripped rejection breaker, so a session that keeps getting denied
 		//     stops paying for judge calls it keeps losing.
-		const actionKey = actionKeyOf(req.toolName, argsText);
+		const actionKey = actionKeyOf(req.toolName, argsText, facts);
 		let gate = null;
 		if (evidenceIssue === null) {
 			rule = await resolveRule(matchReq, shapeInfo, {
@@ -1361,8 +1383,12 @@ export function createHandler({ config, record, llmRunner, getSessionMode, denia
 						root: cwd,
 						base: facts?.workdir === undefined || typeof cwd !== "string" ? cwd : resolve(cwd, facts.workdir),
 						maxBytes: cfg.ai.evidenceMaxBytes,
+						// The evidence round shares the approval's own budget: a slow
+						// read must not outlive the deadline that governs the judge.
+						deadline,
 						resolvePath,
-						readFile: readConfigFile
+						readFile: readConfigFile,
+						statFile
 					});
 					evidenceFetched = fetched.files.map((file) => ({
 						path: file.path,
@@ -1370,10 +1396,13 @@ export function createHandler({ config, record, llmRunner, getSessionMode, denia
 						...file.truncated === true ? { truncated: true } : {}
 					}));
 					evidenceRefused = fetched.refused;
-					if (fetched.files.length > 0 && req.signal?.aborted !== true) {
+					// A round that fetched nothing but refused something still tells the
+					// judge something it needs: "I could not see it" is a judgement
+					// input, not a reason to reuse a verdict formed without it.
+					if ((fetched.files.length > 0 || fetched.refused.length > 0) && req.signal?.aborted !== true) {
 						const second = await judgeWith({
 							runner: llmRunner,
-							input: { ...judgeInput, evidence: fetched.files },
+							input: { ...judgeInput, evidence: fetched.files, evidenceRefused: fetched.refused },
 							signal: req.signal,
 							allowAsk: mode !== "ai-auto",
 							allowNeeds: false,
@@ -1392,6 +1421,7 @@ export function createHandler({ config, record, llmRunner, getSessionMode, denia
 					// Which policy branch decided, so the audit says why an action
 					// was auto-approved rather than only that it was.
 					policy: decision.rule,
+					...decision.enforced === true ? { enforced: true } : {},
 					risk: answered.verdict.risk,
 					// The judge's own opinion, kept next to the policy branch that
 					// used it: without it a past decision cannot be replayed under a
@@ -1460,18 +1490,23 @@ export function createHandler({ config, record, llmRunner, getSessionMode, denia
 		// mode 3 (ai-auto): an "ask" is never routed to a human — resolve it
 		// through mode3OnAsk (default deny), regardless of its source
 		// (rule ask, AI ask over tolerance, failOpen=ask, fallback=ask).
-		// Two exceptions, deliberately:
+		// Three exceptions, deliberately, because `mode3OnAsk: allow` must not be
+		// able to grant what nobody consented to:
 		//   - evidence-incomplete: a mode switch must not turn "the operation
 		//     could not be seen" into permission;
-		//   - hardAsk red lines (publishing, credentials): an unattended switch
-		//     must not grant a consent only a human can give. They land on
-		//     `ai.hardAskOnUnattended` (default deny), never on `mode3OnAsk`.
+		//   - hardAsk red lines (publishing, credentials): a consent only a human
+		//     can give, landing on `ai.hardAskOnUnattended` (default deny);
+		//   - an enforced policy ask (`enforced`: high risk without a strong user
+		//     authorization, or an above-tolerance allow nobody asked for),
+		//     landing on `ai.enforcedAskOnUnattended` (default deny).
 		if (mode === "ai-auto" && verdict.action === "ask") {
 			const resolved = verdict.kind === "evidence-incomplete"
 				? "deny"
 				: verdict.hardAsk === true
 					? cfg.ai.hardAskOnUnattended
-					: effectiveOnAsk(mode, cfg.mode3OnAsk);
+					: verdict.enforced === true
+						? cfg.ai.enforcedAskOnUnattended
+						: effectiveOnAsk(mode, cfg.mode3OnAsk);
 			verdict = { ...verdict, action: resolved, outcome: outcomeFor(resolved), viaAskResolution: true };
 		}
 
@@ -2118,6 +2153,7 @@ export async function apply(ctx, userConfig) {
 				maxTokens: cfg.ai.maxTokens,
 				totalBudgetMs: cfg.ai.totalBudgetMs,
 				hardAskOnUnattended: cfg.ai.hardAskOnUnattended,
+				enforcedAskOnUnattended: cfg.ai.enforcedAskOnUnattended,
 				denyFeedback: cfg.denyFeedback,
 				denialBreaker: cfg.denialBreaker
 			},

@@ -11,7 +11,8 @@
 - **`configGuard`**：`git diff` / `git log` / `git status` 的自动放行要求仓库 `.git/config`（以及 `extensions.worktreeConfig` 下的 `.git/config.worktree`）里没有 `external` / `command` / `textconv` 键、没有 `gpg` 配置、没有 `[include]` / `include.path`、且 `fsmonitor` 值只为布尔 —— 这些让一条只读命令无需任何开关就执行别处指定的程序（或被包含文件里的同名键）。**配置读不出来就不放行**：只有"不存在"算干净，权限/I-O 失败视为无法核验；`.git` 是 worktree/submodule 指针文件时同样不放行。用户级 `~/.gitconfig` 不在检查范围（属使用者自己的环境）
 - **固定政策与证据分属两条消息**：判定提示是 `system` 消息，命令 / reason / 会话骨架 / 补证内容是 `user` 消息——请求文本无法冒充指令层级
 - **执行事实进判定**：`workdir`（本条命令的实际执行目录）与本次请求的提权目标 / 理由随请求进入判定与审计；提权理由是 agent 自己写的，属不可信证据，**从不作为用户授权**
-- **红条不受无人值守开关影响**：`hardAsk` 规则（发布、凭据）在 `ai-auto` 下由 `ai.hardAskOnUnattended` 决定（默认拒绝），`mode3OnAsk: allow` 放行不了它们
+- **红条不受无人值守开关影响**：`hardAsk` 规则（发布、凭据）在 `ai-auto` 下由 `ai.hardAskOnUnattended` 决定（默认拒绝），`mode3OnAsk: allow` 放行不了它们；`hardAsk` 只能标在 `ask` 规则上，标到 `allow` 上在装配期就报错（否则它会读成「人类已确认」，与原意相反）
+- **「没有用户授权」同样不受无人值守开关影响**：高风险且用户未明确要求的动作、以及 AI 放行但超出档位的动作，在 `ai-auto` 下由 `ai.enforcedAskOnUnattended` 决定（默认拒绝）——`mode3OnAsk: allow` 只能接管「裁判拿不准」，接管不了「没人授权」
 - **重构请求只改文案，不改判定**：`feedbackKind: restructure`（超长命令、混合副作用的复合命令）只影响拒绝后的更正消息，让它要求"拆分后重新提交"；判定仍是拒绝，同一条命令原样重发仍被拒，不会变成借此获得放行
 - **熔断只减少付费，不产生许可**：冷却期与同动作阈值的拒绝是 `deny`，绝不会被当作放行；`/approval-allow-once` 的授权是**人工**决定，且仍先过规则层（规则 `deny` 不可覆盖），只对一个动作生效一次
 - **补证是白名单只读**：裁判只能请求工作区内的文件——realpath 复核、拒凭据文件与二进制、超长截断并标注，拒绝原因同时进审计与第二轮判定；插件不给裁判 shell、目录列举或任意读盘能力

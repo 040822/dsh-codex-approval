@@ -110,6 +110,11 @@ const MODE3_ON_ASK = [
   { value: 'deny', label: 'deny · 拒绝（默认）' },
   { value: 'allow', label: 'allow · 放行' },
 ]
+/** Where an enforced policy ask lands when nobody can be asked (no strong user authorization). */
+const ENFORCED_ASK = [
+  { value: 'deny', label: 'deny · 拒绝（默认）' },
+  { value: 'ask', label: 'ask · 交给人（无人值守时会一直等）' },
+]
 /** Where the red lines (publishing, credentials) land when nobody can be asked. */
 const HARD_ASK = [
   { value: 'deny', label: 'deny · 拒绝（默认）' },
@@ -345,6 +350,12 @@ export function DshCodexApprovalCard({ settingsScope, loadModelCatalog }: Props)
               <select className="dsh-ca-select" value={String(value.mode3OnAsk ?? 'deny')} disabled={disabled}
                 onChange={(event) => setField('mode3OnAsk', event.target.value)}>
                 {MODE3_ON_ASK.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}
+              </select>
+            </Field>
+            <Field label="高风险无授权无人值守时" hint="高风险且用户未明确要求、或 AI 放行但超出档位时，不受「ai-auto 遇到 ask」影响；默认直接拒绝">
+              <select className="dsh-ca-select" value={String(value.enforcedAskOnUnattended ?? 'deny')} disabled={disabled}
+                onChange={(event) => setField('enforcedAskOnUnattended', event.target.value)}>
+                {ENFORCED_ASK.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}
               </select>
             </Field>
             <Field label="红条（发布/凭据）无人值守时" hint="发布与凭据目录属红条，不受上面两项开关影响；默认直接拒绝">

@@ -308,7 +308,7 @@ test("card: is a collapsed plugin card that expands into the full form", () => {
 	assert.match(text, /cpa-wx301 \/ command\/deepseek\/deepseek-v4\.1-flash → deepseek-official \/ deepseek-flash/);
 	assert.doesNotMatch(text, /undefined/, `card leaked "undefined": ${text}`);
 
-	assert.equal(collectElements(tree).filter((element) => element.type === "select").length, 6, "primary + 1 fallback + 4 policy selects");
+	assert.equal(collectElements(tree).filter((element) => element.type === "select").length, 7, "primary + 1 fallback + 5 policy selects");
 	assert.equal(byClass(tree, "dsh-ca-save").length, 1);
 	assert.equal(byClass(tree, "dsh-ca-discard").length, 1);
 	assert.equal(byClass(tree, "dsh-ca-save")[0].props.disabled, true, "save is disabled until something changes");

@@ -2040,12 +2040,17 @@ test("handler: a plain shell call carries no escalation facts", async () => {
 });
 
 /** A minimal fake workspace for the evidence-fetch path. */
-function fakeWorkspace(files, dirs = []) {
+function fakeWorkspace(files, dirs = [], kinds = {}) {
 	const known = new Set([...Object.keys(files), ...dirs]);
 	const enoent = (path) => Object.assign(new Error(`ENOENT: ${path}`), { code: "ENOENT" });
 	return {
 		resolvePath: async (path) => { if (!known.has(path)) throw enoent(path); return path; },
-		readFile: async (path) => { if (!(path in files)) throw enoent(path); return files[path]; }
+		readFile: async (path) => { if (!(path in files)) throw enoent(path); return files[path]; },
+		statFile: async (path) => {
+			if (!(path in files)) throw enoent(path);
+			const kind = kinds[path] ?? "file";
+			return { size: Buffer.byteLength(files[path], "utf8"), isFile: () => kind === "file", kind };
+		}
 	};
 }
 
@@ -2066,7 +2071,8 @@ test("handler: a judge evidence request triggers one bounded read round", async 
 		llmRunner: async (messages) => { seen.push(messages); return { ok: true, text: answers[Math.min(call++, answers.length - 1)] }; },
 		getCwd: () => "/ws",
 		resolvePath: fs.resolvePath,
-		readFile: fs.readFile
+		readFile: fs.readFile,
+		statFile: fs.statFile
 	});
 	const { outcome } = await run(handler, makeReq({ callId: "call-ev", command: "bash scripts/deploy.sh" }));
 	assert.equal(outcome, "allowed-once");
@@ -2096,16 +2102,17 @@ test("handler: an evidence request for a credential file is refused, not fetched
 		},
 		getCwd: () => "/ws",
 		resolvePath: fs.resolvePath,
-		readFile: fs.readFile
+		readFile: fs.readFile,
+		statFile: fs.statFile
 	});
 	const { outcome } = await run(handler, makeReq({ callId: "call-cred", command: "bash deploy.sh" }));
-	assert.equal(calls, 1); // refused evidence never spends a second round
+	// A round that could not fetch anything still re-judges: the judge is told what
+	// it could not see instead of reusing a verdict formed without it.
+	assert.equal(calls, 2);
 	assert.equal(outcome, "unavailable"); // ask in ai mode → next()
 	const entry = records.at(-1);
 	assert.deepEqual(entry.evidenceRefused, [{ path: ".ssh/id_rsa", reason: "credential-path" }]);
-	assert.equal(entry.evidenceRounds, 1);
-	// The request was made and refused: an empty fetch list is recorded, so the
-	// audit shows "asked, got nothing" instead of looking like "never asked".
+	assert.equal(entry.evidenceRounds, 2);
 	assert.deepEqual(entry.evidenceFetched, []);
 });
 
@@ -2123,7 +2130,8 @@ test("handler: evidenceFetch off keeps the single-round judge", async () => {
 		},
 		getCwd: () => "/ws",
 		resolvePath: fs.resolvePath,
-		readFile: fs.readFile
+		readFile: fs.readFile,
+		statFile: fs.statFile
 	});
 	const { outcome } = await run(handler, makeReq({ callId: "call-off", command: "bash deploy.sh" }));
 	assert.equal(outcome, "allowed-once");
@@ -2149,7 +2157,8 @@ test("handler: a failed evidence round keeps the first verdict and says so", asy
 		},
 		getCwd: () => "/ws",
 		resolvePath: fs.resolvePath,
-		readFile: fs.readFile
+		readFile: fs.readFile,
+		statFile: fs.statFile
 	});
 	const { outcome } = await run(handler, makeReq({ callId: "call-fail", command: "bash deploy.sh" }));
 	assert.equal(call, 2);
@@ -2508,4 +2517,181 @@ test("handler: a judge's refusal of a plain command keeps the plain directive", 
 	const { outcome } = await run(handler, makeReq({ callId: "plain1", command: "rm -rf /tmp/x" }));
 	assert.equal(outcome, "rejected");
 	assert.equal("feedbackKind" in records.at(-1), false);
+});
+
+// ---------- 独立审核（codex, round 5）的六条 findings 回归 ----------
+
+test("handler: an enforced policy ask is not resolved by mode3OnAsk (finding 1)", async () => {
+	const cfg = baseConfig({ mode: "ai-auto", mode3OnAsk: "allow", rules: [] });
+	const records = [];
+	let calls = 0;
+	const handler = createHandler({
+		config: cfg,
+		record: async (entry) => { records.push(entry); },
+		// A judge that likes the action, with no user authorization behind it.
+		llmRunner: async () => { calls += 1; return { ok: true, text: '{"risk":"high","authorization":"allow","reason":"looks routine"}' }; }
+	});
+	const { outcome } = await run(handler, makeReq({ callId: "enf1", command: "bash deploy.sh" }));
+	assert.equal(calls, 1);
+	assert.equal(outcome, "rejected", "mode3OnAsk: allow must not grant a high-risk action nobody authorized");
+	const entry = records.at(-1);
+	assert.equal(entry.policy, "high-risk-insufficient-authorization");
+	assert.equal(entry.enforced, true);
+	assert.equal(entry.viaAskResolution, true);
+});
+
+test("handler: an enforced ask still follows its own knob, not the generic one (finding 1)", async () => {
+	const cfg = baseConfig({ mode: "ai-auto", mode3OnAsk: "allow", rules: [], ai: { enforcedAskOnUnattended: "ask" } });
+	const handler = createHandler({
+		config: cfg,
+		record: async () => {},
+		llmRunner: async () => ({ ok: true, text: '{"risk":"high","authorization":"allow","reason":"x"}' })
+	});
+	const { outcome, nextCalls } = await run(handler, makeReq({ callId: "enf2", command: "bash deploy.sh" }));
+	assert.equal(outcome, "unavailable"); // deferred to the human chain
+	assert.equal(nextCalls.length, 1);
+});
+
+test("normalizeConfig: hardAsk is only meaningful on an ask rule (finding 2)", () => {
+	assert.throws(() => normalizeConfig({ rules: [{ match: "Bash(git push*)", action: "allow", hardAsk: true }] }), /hardAsk/);
+	assert.throws(() => normalizeConfig({ rules: [{ match: "Bash(x)", action: "deny", hardAsk: true }] }), /hardAsk/);
+	assert.equal(normalizeConfig({ rules: [{ match: "Bash(x)", action: "ask", hardAsk: true }] }).rules[0].hardAsk, true);
+	assert.equal(normalizeConfig({ ai: { enforcedAskOnUnattended: "deny" } }).ai.enforcedAskOnUnattended, "deny");
+	assert.throws(() => normalizeConfig({ ai: { enforcedAskOnUnattended: "allow" } }), /enforcedAskOnUnattended/);
+});
+
+test("handler: the second round is told which files were refused (finding 4)", async () => {
+	const cfg = baseConfig({ rules: [] });
+	const seen = [];
+	const records = [];
+	const fs = fakeWorkspace({ "/ws/scripts/deploy.sh": "rsync -a ./dist/ prod:/srv", "/outside/x.txt": "secret" }, ["/ws", "/ws/scripts", "/outside"]);
+	let call = 0;
+	const answers = [
+		'{"risk":"medium","authorization":"ask","needs":[{"type":"read-file","path":"scripts/deploy.sh","why":"target"},{"type":"read-file","path":"../outside/x.txt","why":"context"}],"reason":"deploy"}',
+		'{"risk":"medium","authorization":"allow","reason":"checked the script"}'
+	];
+	const handler = createHandler({
+		config: cfg,
+		record: async (entry) => { records.push(entry); },
+		llmRunner: async (messages) => { seen.push(messages); return { ok: true, text: answers[Math.min(call++, answers.length - 1)] }; },
+		getCwd: () => "/ws",
+		resolvePath: fs.resolvePath,
+		readFile: fs.readFile,
+		statFile: fs.statFile
+	});
+	const { outcome } = await run(handler, makeReq({ callId: "mix-ev", command: "bash scripts/deploy.sh" }));
+	assert.equal(outcome, "allowed-once");
+	const second = seen[1][1].content[0].text;
+	assert.match(second, /rsync -a \.\/dist/);
+	assert.match(second, /Evidence unavailable/);
+	assert.match(second, /\.\.\/outside\/x\.txt — outside-workspace/);
+	const entry = records.at(-1);
+	assert.deepEqual(entry.evidenceFetched, [{ path: "scripts/deploy.sh", bytes: Buffer.byteLength("rsync -a ./dist/ prod:/srv", "utf8") }]);
+	assert.deepEqual(entry.evidenceRefused, [{ path: "../outside/x.txt", reason: "outside-workspace" }]);
+});
+
+test("handler: a read that outlives the budget is refused, not waited on (finding 5)", async () => {
+	const cfg = baseConfig({ rules: [], ai: { totalBudgetMs: 60 } });
+	const records = [];
+	let calls = 0;
+	const hanging = () => new Promise(() => {});
+	const handler = createHandler({
+		config: cfg,
+		record: async (entry) => { records.push(entry); },
+		llmRunner: async () => { calls += 1; return { ok: true, text: '{"risk":"medium","authorization":"ask","needs":[{"type":"read-file","path":"scripts/slow.sh","why":"x"}],"reason":"deploy"}' }; },
+		getCwd: () => "/ws",
+		resolvePath: async (path) => path,
+		readFile: hanging,
+		statFile: async () => ({ size: 10, isFile: () => true })
+	});
+	const started = Date.now();
+	const { outcome } = await run(handler, makeReq({ callId: "slow-ev", command: "bash scripts/slow.sh" }));
+	const elapsed = Date.now() - started;
+	assert.ok(elapsed < 3000, `the approval must not hang on a slow read (took ${elapsed}ms)`);
+	// The stub judge does not implement the budget, so the second round still
+	// answers; what this test pins is that a read that never returns is refused
+	// at the deadline instead of hanging the approval on it.
+	assert.equal(outcome, "allowed-once");
+	assert.deepEqual(records.at(-1).evidenceRefused, [{ path: "scripts/slow.sh", reason: "deadline-exceeded" }]);
+	assert.equal(records.at(-1).evidenceRounds, 2);
+	assert.deepEqual(records.at(-1).evidenceRefused, [{ path: "scripts/slow.sh", reason: "deadline-exceeded" }]);
+	assert.ok(calls >= 1);
+});
+
+test("handler: an allow-once grant is scoped to the execution facts (finding 6)", async () => {
+	const { actionKeyOf } = await import("../index.js");
+	// The grant was recorded for the plain invocation, with no directory override
+	// and no escalation.
+	const key = actionKeyOf("bash", "bash deploy.sh");
+	const cfg = baseConfig({ rules: [], denialBreaker: { consecutive: 0, duplicate: 0, cooldownMs: 0 } });
+	const records = [];
+	const breakerStore = new Map([["sess-1", { consecutive: 0, cooledUntil: 0, actions: new Map(), oneShot: new Map([[key, 1]]) }]]);
+	const handler = createHandler({
+		config: cfg,
+		record: async (entry) => { records.push(entry); },
+		llmRunner: async () => ({ ok: true, text: '{"risk":"high","authorization":"deny","reason":"no"}' }),
+		breakerStore
+	});
+	const events = (id, args) => [{ type: "assistant/message", data: { message: { content: [{ type: "tool-call", id, name: "bash", arguments: JSON.stringify(args) }] } } }];
+
+	// Same command, but this call asks for a wider sandbox: a different action.
+	const escalated = {
+		toolName: "bash",
+		callId: "esc-1",
+		reason: "",
+		agent: { id: "a", session: { id: "sess-1", snapshotEvents: () => events("esc-1", { command: "bash deploy.sh", sandbox_permissions: "danger-full-access", justification: "x" }) } }
+	};
+	const first = await run(handler, escalated);
+	assert.equal(first.outcome, "rejected", "the grant must not cover an escalation the human never saw");
+	assert.equal(records.at(-1).manualOverride, undefined);
+	// The grant is still unspent, and covers the plain call.
+	const plain = {
+		toolName: "bash",
+		callId: "esc-2",
+		reason: "",
+		agent: { id: "a", session: { id: "sess-1", snapshotEvents: () => events("esc-2", { command: "bash deploy.sh" }) } }
+	};
+	assert.equal((await run(handler, plain)).outcome, "allowed-once");
+	assert.equal(records.at(-1).manualOverride, true);
+});
+
+test("actionKeyOf: the directory and the escalation target are part of the action (finding 6)", async () => {
+	const { actionKeyOf } = await import("../index.js");
+	const base = actionKeyOf("bash", "npm run build");
+	assert.equal(actionKeyOf("bash", "npm run build", {}), base);
+	assert.notEqual(actionKeyOf("bash", "npm run build", { workdir: "/other" }), base);
+	assert.notEqual(actionKeyOf("bash", "npm run build", { escalationTo: "danger-full-access" }), base);
+	assert.equal(actionKeyOf("bash", "npm run build", { workdir: "/a" }), actionKeyOf("bash", "npm run build", { workdir: "/a" }));
+});
+
+test("makeLlmRunner: the budget caps a slow candidate and stops the chain after it (finding 5)", async () => {
+	const calls = [];
+	const slowLlm = {
+		async prepareCall(config) {
+			calls.push(config);
+			const model = config.model;
+			return {
+				config,
+				stream: async function* ({ signal } = {}) {
+					// The primary burns the whole budget (and honours the abort the
+					// timeout raises, the way a real provider does); the fallback must
+					// never start.
+					if (model === "slow") {
+						await new Promise((resolve) => {
+							const timer = setTimeout(resolve, 300);
+							signal?.addEventListener?.("abort", () => { clearTimeout(timer); resolve(); }, { once: true });
+						});
+						if (signal?.aborted === true) throw Object.assign(new Error("aborted"), { name: "AbortError" });
+					}
+					yield { type: "text-delta", text: '{"risk":"low","authorization":"allow","reason":"x"}' };
+					yield { type: "finish", reason: { kind: "stop" } };
+				}
+			};
+		}
+	};
+	const runner = makeLlmRunner(slowLlm, { provider: "p", model: "slow", timeoutMs: 15_000, maxTokens: 7, fallbacks: [{ provider: "q", model: "fast" }] });
+	const result = await runner([], { deadline: Date.now() + 40 });
+	assert.equal(result.ok, false);
+	assert.equal(result.budgetExhausted, true);
+	assert.deepEqual(calls.map((c) => c.model), ["slow"], "no candidate may start after the budget is spent");
 });

@@ -57,7 +57,7 @@
 | `mode` | `ai` | 审批模式：`manual` 完全旁路 / `ai` 规则→AI→ask 交人类 / `ai-auto` ask 永不交人类 |
 | `mode3OnAsk` | `deny` | `ai-auto` 下 `ask` 的归宿：`deny` \| `allow`。设为 `allow` 时 AI 无法决定也会放行高风险操作，**慎用** |
 | `locale` | `auto` | `/approval-mode` 与拒绝反馈文案语言：`auto` \| `zh` \| `en`。`auto` 跟随 dsh 的 `locale.preference` |
-| `rules` | 内置默认 | 规则列表，见 [决策链与规则语法](decision-chain.md#规则语法) |
+| `rules` | 内置默认 | 规则列表，见 [决策链与规则语法](decision-chain.md#规则语法)。`ask` 规则可标 `hardAsk: true`（红条）；标在 `allow`/`deny` 上会在装配期直接报错 |
 | `fallback` | `ask` | 无规则命中且 AI 关闭时：`ask` \| `deny` \| `allow` |
 | `denyFeedback` | `true` | 拒绝后向主 agent 注入归因更正消息 |
 | `denyFeedbackMax` | `3` | 每会话未注入拒绝队列上限（1–10，超限丢最旧） |
@@ -82,6 +82,7 @@
 | `maxTokens` | `512` | 判定输出上限（含 reasoning 余量） |
 | `failOpen` | `ask` | AI 层全部候选失败时的兜底：`ask` \| `deny` \| `allow` |
 | `hardAskOnUnattended` | `deny` | **红条**（发布、凭据）在 `ai-auto` 下的归宿：`deny` \| `ask`。红条不经过 `mode3OnAsk`，`allow` 不是合法值 |
+| `enforcedAskOnUnattended` | `deny` | **策略强制人工**（高风险且无明确用户授权、AI 放行但超出档位）在 `ai-auto` 下的归宿：`deny` \| `ask`。同样不经过 `mode3OnAsk`，`allow` 不是合法值 |
 | `totalBudgetMs` | `30000` | **一次审批的总预算**：覆盖全部候选与补证轮次，单候选仍受 `timeoutMs` 限制但会被剩余预算压低（`0` 关闭） |
 | `evidenceFetch` | `read-file` | 裁判按需补证：`off` \| `read-file`（工作区内只读、最多 `evidenceMaxFiles` 个、每个 ≤ `evidenceMaxBytes`；拒凭据文件、二进制与越界路径） |
 | `evidenceMaxFiles` | `2` | 单次审批可读取的证据文件数（1–8） |
@@ -104,7 +105,7 @@
 - **熔断**（`denialBreaker`）：连续被自动拒绝达到 `consecutive` 次，本会话进入冷却（默认 10 分钟）——冷却期内**需要 AI 判定**的请求直接拒绝，不再花钱问模型；规则命中的请求不受影响（只读命令照旧放行，规则 `deny` 照旧拒绝）。同一动作被拒 `duplicate` 次后也被直接拒绝。任何非拒绝结果（放行或交人工）会把连续计数清零；熔断自身的拒绝不会延长冷却。
 - **一次性放行**（`/approval-allow-once`）：`/approval-allow-once` 列出本会话最近被拒的动作（最近在前），`/approval-allow-once 2` 授权第 2 条放行**一次**。授权只对**那一个动作**（同一工具 + 同一命令文本）生效一次，且**仍会先过规则层**——规则 `deny` 不能被授权覆盖；授权同时清除该会话的冷却。授权记录写在内存里，重启后失效。
 
-这两个开关都只影响「要不要为这次判定花钱/要不要直接拒绝」，不会把任何拒绝变成放行依据之外的许可。
+这三类「无人值守不可放行」的动作各有独立开关，且都不接受 `allow`：规则红条（`hardAskOnUnattended`）、策略强制人工（`enforcedAskOnUnattended`）、证据不足（固定拒绝）。它们只影响「拒绝还是交人工」，不会把任何拒绝变成放行依据之外的许可。
 
 ## 模型选型建议
 
