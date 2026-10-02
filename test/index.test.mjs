@@ -1770,6 +1770,8 @@ test("P2: the git config guard reads include directives, gpg and fsmonitor value
 		"[include]\n\tpath = /elsewhere/evil.config\n",
 		"[gpg]\n\tprogram = evil\n",
 		"[core]\n\tfsmonitor = /usr/bin/evil\n",
+		// a quoted value holding a semicolon is a command line, not a boolean
+		"[core]\n\tfsmonitor = \"true; echo evil\"\n",
 		// the same keys in git's legal single-line form
 		"[diff \"md\"] command = evil\n",
 		"[diff] external = evil\n",
@@ -1786,6 +1788,120 @@ test("P2: the git config guard reads include directives, gpg and fsmonitor value
 		'[remote "origin"]\n\turl = https://example.test/fsmonitor.git\n'
 	]) {
 		const { outcome } = await run(withConfig(config), makeReq({ command: "git log --oneline -5" }));
+		assert.equal(outcome, "allowed-once", `must stay auto-approved over: ${JSON.stringify(config)}`);
+	}
+});
+
+test("P2: the git config guard covers worktree config and read failures", async () => {
+	const withFiles = (files) => createHandler({
+		config: normalizeConfig({ mode: "ai" }),
+		record: async () => {},
+		llmRunner: async () => ({ ok: true, text: '{"risk":"high","authorization":"ask","reason":"runs a program"}' }),
+		getCwd: () => "/work",
+		resolvePath: async (path) => path,
+		readFile: async (file) => {
+			if (Object.hasOwn(files, file)) return files[file];
+			const error = new Error("ENOENT");
+			error.code = "ENOENT";
+			throw error;
+		}
+	});
+	const request = () => makeReq({ command: "git log --oneline -5" });
+	// extensions.worktreeConfig keeps a second config beside the main one
+	assert.notEqual((await run(withFiles({
+		"/work/.git/config": "[core]\n\trepositoryformatversion = 0\n",
+		"/work/.git/config.worktree": "[diff]\n\texternal = evil\n"
+	}), request())).outcome, "allowed-once");
+	// a config that cannot be read (permissions, I/O) is not "no config"
+	const unreadable = createHandler({
+		config: normalizeConfig({ mode: "ai" }),
+		record: async () => {},
+		llmRunner: async () => ({ ok: true, text: '{"risk":"high","authorization":"ask","reason":"x"}' }),
+		getCwd: () => "/work",
+		resolvePath: async (path) => path,
+		readFile: async () => {
+			const error = new Error("permission denied");
+			error.code = "EACCES";
+			throw error;
+		}
+	});
+	assert.notEqual((await run(unreadable, request())).outcome, "allowed-once");
+});
+
+test("P2: an inline value inside a quoted word is the path that runs", async () => {
+	// `-Path:'link'` hands PowerShell the path `link`; a decoy `/work/-Path:link`
+	// must not be what gets verified
+	const links = { "/work/link": "/etc/passwd" };
+	const handler = createHandler({
+		config: normalizeConfig({ mode: "ai" }),
+		record: async () => {},
+		llmRunner: async () => ({ ok: true, text: '{"risk":"high","authorization":"ask","reason":"outside"}' }),
+		getCwd: () => "/work",
+		resolvePath: async (path) => links[path] ?? path,
+		readFile: async () => {
+			const error = new Error("ENOENT");
+			error.code = "ENOENT";
+			throw error;
+		}
+	});
+	for (const command of ["Get-Content -Path:'link'", 'Get-Content -Path:"link"']) {
+		const { outcome } = await run(handler, makeReq({ toolName: "pwsh", command }));
+		assert.notEqual(outcome, "allowed-once", `the value is what runs: ${command}`);
+	}
+	// a wholly quoted word is one value: `'--file=link'` is the path `--file=link`,
+	// not the inline form `--file=link`
+	const decoy = links["/work/--file=link"];
+	links["/work/--file=link"] = "/etc/passwd";
+	const { outcome } = await run(handler, makeReq({ toolName: "pwsh", command: "Get-Content -LiteralPath '--file=link'" }));
+	links["/work/--file=link"] = decoy;
+	assert.notEqual(outcome, "allowed-once", "a wholly quoted word is the path as written");
+});
+
+test("P2: relative credential directories and a trailing separator still ask", async () => {
+	const entries = [];
+	const handler = defaultRuleHandler({ entries });
+	for (const command of [
+		"cat .aws/config",
+		"cat .ssh/config",
+		"tar -czf x /home/u/.aws; echo done",
+		// relative with a backslash separator, and a spliced quote plus separator
+		"Get-Content .aws\\config",
+		"Get-Content .ssh\\config",
+		'tar cf x /w/.a"w"s;echo x>y',
+		// relative dot-directories with a forward slash (the whole matrix of
+		// targets × writings is covered by the review's own enumeration)
+		"cat .dsh/profiles/web/config.yaml",
+		"cat .dsh/settings.yaml",
+		"cat .codex/auth.json"
+	]) {
+		entries.length = 0;
+		const toolName = command.startsWith("Get-Content") ? "pwsh" : "bash";
+		await run(handler, makeReq({ toolName, command }));
+		assert.equal(entries[0].kind, "rule", `a rule must claim: ${command} (${JSON.stringify(entries[0])})`);
+		assert.equal(entries[0].action, "ask", command);
+	}
+});
+
+test("P2: harmless git config values do not refuse the auto-approval", async () => {
+	const withConfig = (config) => createHandler({
+		config: normalizeConfig({ mode: "ai" }),
+		record: async () => {},
+		llmRunner: async () => ({ ok: true, text: '{"risk":"high","authorization":"ask","reason":"x"}' }),
+		getCwd: () => "/work",
+		resolvePath: async (path) => path,
+		readFile: async (file) => {
+			if (file === "/work/.git/config") return config;
+			const error = new Error("ENOENT");
+			error.code = "ENOENT";
+			throw error;
+		}
+	});
+	for (const config of [
+		'[core]\n\tfsmonitor = "false"\n',
+		'[remote "origin"]\n\turl = https://example.test/include.git\n',
+		"[core]\n\trepositoryformatversion = 0\n"
+	]) {
+		const { outcome } = await run(withConfig(config), makeReq({ command: "git status --short" }));
 		assert.equal(outcome, "allowed-once", `must stay auto-approved over: ${JSON.stringify(config)}`);
 	}
 });

@@ -202,17 +202,29 @@ export function spaceOutQuotes(text) {
 	return typeof text === "string" ? text.replace(/['"]/g, " ") : text;
 }
 
-/** Every safety-side rewrite of a surface: quote splicing, quotes-as-space, whitespace. */
+/**
+ * Replace shell punctuation with spaces, so a path that ends where the next
+ * command begins still stands alone: `tar -czf x /home/u/.aws; echo done` →
+ * `... /home/u/.aws  echo done`, which the `<dir> `-before-an-argument shape
+ * matches. Only deny/ask rules scan it.
+ * @param text - one match surface
+ */
+export function spaceOutPunctuation(text) {
+	return typeof text === "string" ? text.replace(/[;|&()<>{}]+/g, " ") : text;
+}
+
+/**
+ * Every safety-side rewrite of a surface. The rewrites compose — a command can
+ * splice a quote **and** hide behind a separator (`/w/.a"w"s;echo x>y`), so a
+ * single pass is not enough: apply each rewrite to the original and then to the
+ * result of every other rewrite, and finally normalize the whitespace of each
+ * variant. Everything is a pure text rewrite used only by deny/ask rules.
+ */
 function safetyFolds(text) {
-	const folded = foldQuotedLiterals(text);
-	const spaced = spaceOutQuotes(text);
-	return [
-		folded,
-		spaced,
-		collapseWhitespace(text),
-		collapseWhitespace(folded),
-		collapseWhitespace(spaced)
-	];
+	const passes = [foldQuotedLiterals, spaceOutQuotes, spaceOutPunctuation];
+	const first = passes.map((apply) => apply(text));
+	const second = first.flatMap((variant) => passes.map((apply) => apply(variant)));
+	return unique([text, ...first, ...second].flatMap((variant) => [variant, collapseWhitespace(variant)]));
 }
 
 /** De-duplicate surfaces while keeping their order. */
@@ -267,7 +279,7 @@ function matchesStructured(rule, req, opts) {
 	}
 	if (forbiddenOptionHit(argv, rule.forbidOptions) !== null) return false;
 	if (rule.pathGuard === "workspace-relative") {
-		const args = positionalArgs(argv, rule.pattern.length, opts?.quoted);
+		const args = positionalArgs(argv, rule.pattern.length, opts);
 		if (!args.every((arg) => isWorkspaceRelativePath(arg))) return false;
 	}
 	return true;

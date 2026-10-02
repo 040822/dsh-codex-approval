@@ -69,9 +69,9 @@ approval/request 到达（toolName + callId + reason）
   configGuard: git-clean        # 仓库 git 配置里没有可执行外部程序的名字才命中
 ```
 
-`pathGuard` 的判定是静态检查 + `realpath` 复核，避免符号链接逃逸。"路径参数"包括 `--` 终止符之后的每一项（`cat -- -x` 的 `-x` 是路径，不是选项），也包括内联在选项里的值（`-Path:..\secret`、`--file=/etc/passwd`）——PowerShell 的参数名与值可以用空格或冒号分隔，两种写法等价。**不以 `-` 开头的不一定是路径、以 `-` 开头的也不一定是选项**：只有形如 `-n` / `--output` / `-Path` 的选项**名**会被跳过，`'-/../../x'` 这种带引号的参数值、裸 `-` 都会照常送检；纯数字/布尔的开关值（`-ReadCount:0`）不算路径。
+`pathGuard` 的判定是静态检查 + `realpath` 复核，避免符号链接逃逸。"路径参数"包括 `--` 终止符之后的每一项（`cat -- -x` 的 `-x` 是路径，不是选项），也包括内联在选项里的值（`-Path:..\secret`、`--file=/etc/passwd`）——PowerShell 的参数名与值可以用空格或冒号分隔，两种写法等价。**不以 `-` 开头的不一定是路径、以 `-` 开头的也不一定是选项**：只有形如 `-n` / `--output` / `-Path` 的选项**名**会被跳过，`'-/../../x'` 这种带引号的参数值、裸 `-` 都会照常送检；内联值里只有具名计数开关（`-ReadCount:`/`-TotalCount:`/`-Tail:` + 数字或布尔）不算路径。引号的位置同样有语义：`-Path:'link'` 里引号紧跟选项名与分隔符，真正的值是 `link`；`'--file=link'` 整词被引号包裹，整串就是路径——两者分别按各自的值去送 realpath。
 
-`configGuard: "git-clean"` 读取 `<工作区>/.git/config`，命中任一条就不放行：`external` / `command` / `textconv` 键（行首）、`gpg`（`gpg.program`，签名校验时执行）、`[include]` / `[includeIf]`（被包含的文件读不到，无法核验）、`fsmonitor` 的值不是 `true`/`false`/`0`（非布尔即路径或命令行）。这些键让一条只读命令**无需任何开关**就执行别处指定的程序；`.git` 是 worktree/submodule 的指针文件时同样不放行（配置在读不到的地方）。用户级 `~/.gitconfig` 不在检查范围：那是使用者自己的环境，不是请求能影响的东西。
+`configGuard: "git-clean"` 读取 `<工作区>/.git/config` 与 `.git/config.worktree`（`extensions.worktreeConfig` 开启时的第二份配置），命中任一条就不放行：`external` / `command` / `textconv` 键（段头独占一行或与键同行的写法都算）、`gpg`（`gpg.program`，签名校验时执行）、`[include]` / `[includeIf]` / `include.path`（被包含的文件读不到，无法核验）、`fsmonitor` 的值不是 `true`/`false`/`0`（非布尔即路径或命令行；值按引号语法解析——`"false"` 是布尔，`"true; exec evil"` 是命令行）。**读不出来就不放行**：只有 `ENOENT`/`ENOTDIR` 才算"没有配置"，权限或 I/O 失败一律视为无法核验。这些键让一条只读命令**无需任何开关**就执行别处指定的程序；`.git` 是 worktree/submodule 的指针文件时同样不放行（配置在读不到的地方）。用户级 `~/.gitconfig` 不在检查范围：那是使用者自己的环境，不是请求能影响的东西。
 
 ### 形状闸门（allow 专属，安全关键）
 

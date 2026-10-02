@@ -8,7 +8,7 @@
 - **形状闸门**：命令文本不是"单条纯命令"就绝不被 allow 规则放行（复合命令 / 重定向 / 命令替换 / 变量 / 通配 / 控制流全部交 AI 或人类）
 - **路径参数完整**：`--` 终止符之后的每一项、以及内联在选项里的值（`-Path:..\secret` / `--file=/etc/passwd`）都算路径参数，不能靠"看起来像选项"躲过 `pathGuard`
 - **规则扫还原面**：除原始文本外还匹配"裸参数文本"、"重建 argv"与（deny/ask 专用的）"折叠紧贴引号 + 规范化空白"，`npm  publish`、`rm -r"f" /tmp/x`、`npm<TAB>publish 2>log` 与它们的常规写法同样命中（见[决策链与规则语法](decision-chain.md#规则语法)）
-- **`configGuard`**：`git diff` / `git log` / `git status` 的自动放行要求仓库 `.git/config` 里没有 `external` / `command` / `textconv` 键、没有 `gpg` 配置、没有 `[include]`、且 `fsmonitor` 值只为布尔 —— 这些让一条只读命令无需任何开关就执行别处指定的程序（或被包含文件里的同名键）；`.git` 是 worktree/submodule 指针文件时同样不放行（配置无法核验）。用户级 `~/.gitconfig` 不在检查范围（属使用者自己的环境）
+- **`configGuard`**：`git diff` / `git log` / `git status` 的自动放行要求仓库 `.git/config`（以及 `extensions.worktreeConfig` 下的 `.git/config.worktree`）里没有 `external` / `command` / `textconv` 键、没有 `gpg` 配置、没有 `[include]` / `include.path`、且 `fsmonitor` 值只为布尔 —— 这些让一条只读命令无需任何开关就执行别处指定的程序（或被包含文件里的同名键）。**配置读不出来就不放行**：只有"不存在"算干净，权限/I-O 失败视为无法核验；`.git` 是 worktree/submodule 指针文件时同样不放行。用户级 `~/.gitconfig` 不在检查范围（属使用者自己的环境）
 - **固定政策与证据分属两条消息**：判定提示是 `system` 消息，命令 / reason / 会话骨架是 `user` 消息——请求文本无法冒充指令层级
 - **原文进判**：规则与 AI 看到的是完整命令；截断只用于日志与 UI 预览
 - **证据门槛**：参数缺失 / 无法解析 / 命令超预算 → 不问 AI，直接交人类（`ai-auto` 下直接拒绝），审计标 `evidenceIncomplete`。这是"没看到操作"，不是"AI 判定不确定"，因此不受 `mode3OnAsk` 影响

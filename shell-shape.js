@@ -178,6 +178,9 @@ function classifyBash(command) {
  */
 function classifyPwsh(command) {
 	const argv = [];
+	// Parallel to argv: the value a quoted word carries when the quote opened
+	// right after an option name (`-Path:'link'`), else null — see pushToken.
+	const inline = [];
 	// Parallel to argv: was this word written as a quoted string? PowerShell binds
 	// a **quoted** token as a value, never as a parameter name (`-Path '-x'` is
 	// the path `-x`), and the word itself no longer shows that once the quotes are
@@ -186,14 +189,21 @@ function classifyPwsh(command) {
 	let token = "";
 	// see classifyBash: an empty quoted string is still one argument
 	let tokenQuoted = false;
+	// offset inside the current word where its first quote opened, or -1. Only a
+	// quote that opens *after* an option name is an inline value
+	// (`-Path:'link'` → the path is `link`); a word that starts with a quote is
+	// the whole value (`'--file=link'` → the path is `--file=link`).
+	let tokenQuoteAt = -1;
 	let inSingle = false;
 	let inDouble = false;
 	const pushToken = () => {
 		if (token !== "" || tokenQuoted) {
 			argv.push(token);
 			quoted.push(tokenQuoted);
+			inline.push(inlineValueAt(token, tokenQuoteAt));
 			token = "";
 			tokenQuoted = false;
+			tokenQuoteAt = -1;
 		}
 	};
 	for (let i = 0; i < command.length; i += 1) {
@@ -215,11 +225,13 @@ function classifyPwsh(command) {
 		if (ch === "'") {
 			inSingle = true;
 			tokenQuoted = true;
+			if (tokenQuoteAt === -1) tokenQuoteAt = token.length;
 			continue;
 		}
 		if (ch === '"') {
 			inDouble = true;
 			tokenQuoted = true;
+			if (tokenQuoteAt === -1) tokenQuoteAt = token.length;
 			continue;
 		}
 		if (ch === " " || ch === "\t") {
@@ -239,7 +251,22 @@ function classifyPwsh(command) {
 	if (inSingle || inDouble) return opaque("unterminated-quote");
 	pushToken();
 	if (argv.length === 0) return opaque("empty-command");
-	return { shape: "simple", argv, quoted, parts: [argv], reason: null };
+	return { shape: "simple", argv, quoted, inline, parts: [argv], reason: null };
+}
+
+/**
+ * The value inside a quoted word when the quote opens right after an option
+ * name or its separator (`-Path:` / `-Path=`), else null. `'-x'` and
+ * `'--file=link'` are wholly quoted words: PowerShell hands the *entire*
+ * string to the parameter, so the whole word is the path.
+ * @param word - the assembled word
+ * @param quoteAt - offset where the first quote opened, or -1
+ */
+function inlineValueAt(word, quoteAt) {
+	if (quoteAt <= 0) return null;
+	if (!/^-{1,2}[A-Za-z][A-Za-z0-9_-]*[:=]$/.test(word.slice(0, quoteAt))) return null;
+	const value = word.slice(quoteAt);
+	return value === "" ? null : value;
 }
 
 /**
@@ -300,10 +327,12 @@ const NON_PATH_INLINE = /^-(?:ReadCount|TotalCount|Tail):(?:\d+|true|false)$/i;
  * the workspace root.
  * @param argv - the command's argv (simple shape only)
  * @param skip - how many leading argv entries the rule's prefix consumed
- * @param quoted - optional per-word flags from classifyCommand (pwsh only)
+ * @param flags - optional `{ quoted, inline }` from classifyCommand (pwsh only)
  */
-export function positionalArgs(argv, skip = 1, quoted = undefined) {
+export function positionalArgs(argv, skip = 1, flags = undefined) {
 	if (!Array.isArray(argv)) return [];
+	const quoted = flags?.quoted;
+	const inline = flags?.inline;
 	const args = [];
 	let afterTerminator = false;
 	for (let i = Math.max(0, skip); i < argv.length; i += 1) {
@@ -314,7 +343,11 @@ export function positionalArgs(argv, skip = 1, quoted = undefined) {
 			continue;
 		}
 		if (Array.isArray(quoted) && quoted[i] === true) {
-			args.push(arg);
+			// a quoted word is a value. `-Path:'link'` carries the path `link`
+			// (inline[i]); a wholly quoted word (`'--file=link'`) is the path as
+			// written, so the whole word is checked.
+			const value = Array.isArray(inline) ? inline[i] : null;
+			args.push(value === null || value === undefined ? arg : value);
 			continue;
 		}
 		if (arg === "--") {

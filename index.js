@@ -158,27 +158,53 @@ export const DEFAULT_CONFIG = {
 		{ match: "*/.ssh/*", action: "ask" },
 		{ match: "*/.ssh", action: "ask" },
 		{ match: "*/.ssh *", action: "ask" },
+		// the same directory written relative to the workspace, with either
+		// separator (`.ssh/config`, `.ssh\\config`, `x\\.ssh\\config`)
+		{ match: "*.ssh/*", action: "ask" },
+		{ match: "*.ssh", action: "ask" },
+		{ match: "*.ssh *", action: "ask" },
+		{ match: "*.ssh\\*", action: "ask" },
+		{ match: "*.ssh\\", action: "ask" },
+		{ match: "*.ssh\\ *", action: "ask" },
 		{ match: "*\\.ssh\\*", action: "ask" },
 		{ match: "*\\.ssh", action: "ask" },
 		{ match: "*\\.ssh *", action: "ask" },
 		{ match: "*/.aws/*", action: "ask" },
 		{ match: "*/.aws", action: "ask" },
 		{ match: "*/.aws *", action: "ask" },
+		{ match: "*.aws/*", action: "ask" },
+		{ match: "*.aws", action: "ask" },
+		{ match: "*.aws *", action: "ask" },
+		{ match: "*.aws\\*", action: "ask" },
+		{ match: "*.aws\\", action: "ask" },
+		{ match: "*.aws\\ *", action: "ask" },
 		{ match: "*\\.aws\\*", action: "ask" },
 		{ match: "*\\.aws", action: "ask" },
 		{ match: "*\\.aws *", action: "ask" },
 		{ match: "*/.codex/auth.json*", action: "ask" },
 		{ match: "*\\.codex\\auth.json*", action: "ask" },
+		{ match: "*.codex/auth.json*", action: "ask" },
+		{ match: "*.codex\\auth.json*", action: "ask" },
 		{ match: "*/.dsh/profiles/*", action: "ask" },
 		{ match: "*/.dsh/profiles", action: "ask" },
 		{ match: "*/.dsh/profiles *", action: "ask" },
+		{ match: "*.dsh/profiles/*", action: "ask" },
+		{ match: "*.dsh/profiles", action: "ask" },
+		{ match: "*.dsh/profiles *", action: "ask" },
 		{ match: "*\\.dsh\\profiles\\*", action: "ask" },
+		{ match: "*.dsh\\profiles\\*", action: "ask" },
+		{ match: "*.dsh\\profiles\\", action: "ask" },
+		{ match: "*.dsh\\profiles\\ *", action: "ask" },
 		{ match: "*\\.dsh\\profiles", action: "ask" },
 		{ match: "*\\.dsh\\profiles *", action: "ask" },
 		{ match: "*/.dsh/settings.yaml*", action: "ask" },
 		{ match: "*\\.dsh\\settings.yaml*", action: "ask" },
+		{ match: "*.dsh/settings.yaml*", action: "ask" },
+		{ match: "*.dsh\\settings.yaml*", action: "ask" },
 		{ match: "*/.dsh/logs/approval.jsonl*", action: "ask" },
 		{ match: "*\\.dsh\\logs\\approval.jsonl*", action: "ask" },
+		{ match: "*.dsh/logs/approval.jsonl*", action: "ask" },
+		{ match: "*.dsh\\logs\\approval.jsonl*", action: "ask" },
 		{ match: "*/.dsh-codex-approval/*", action: "ask" },
 		// the agent's own justification (`reason:`) can only raise strictness,
 		// never grant: these patterns only ever add an ask
@@ -818,17 +844,47 @@ const GIT_EXEC_CONFIG = [
 	/^\s*(?:\[[^\]]*\]\s*)?command\s*=/im, // [diff "<driver>"] command = <command>
 	/^\s*(?:\[[^\]]*\]\s*)?textconv\s*=/im, // [diff "<driver>"] textconv = <command>
 	/\bgpg\b/i, // [gpg] program = <command> (runs on a signature-verified log)
-	/\binclude(?:if)?\b/i // an included file we cannot read (`[include] path`, `include.path`)
+	/^\s*\[include(?:if)?\b/im, // [include] / [includeIf "..."] sections
+	/^\s*include(?:if)?\s*\.\s*path\s*=/im // `include.path = <file>` in dotted form
 ];
 
 /** `core.fsmonitor = <value>`; only a boolean/empty value runs no program. */
-const GIT_FSMONITOR = /^\s*(?:\[[^\]]*\]\s*)?fsmonitor\s*=\s*([^\n#;]*)/gim;
+const GIT_FSMONITOR = /^\s*(?:\[[^\]]*\]\s*)?fsmonitor\s*=\s*(.*)$/gim;
+
+/**
+ * A git config value with its quoting honoured: a `;` or `#` **inside** quotes
+ * belongs to the value, not to a comment — git reads
+ * `fsmonitor = "true; exec evil"` as that command line, not as the boolean
+ * `true`, and happily runs it.
+ * @param raw - everything after the `=`, up to the end of the line
+ */
+function gitConfigValue(raw) {
+	let out = "";
+	let quote = null;
+	for (const ch of raw) {
+		if (quote !== null) {
+			if (ch === quote) quote = null;
+			out += ch;
+			continue;
+		}
+		if (ch === '"' || ch === "'") {
+			quote = ch;
+			out += ch;
+			continue;
+		}
+		if (ch === "#" || ch === ";") break;
+		out += ch;
+	}
+	return out.trim();
+}
 
 /** Whether a git config text names a program a read-only command would run. */
 function gitConfigNamesProgram(text) {
 	if (GIT_EXEC_CONFIG.some((pattern) => pattern.test(text))) return true;
 	for (const match of text.matchAll(GIT_FSMONITOR)) {
-		const value = match[1].trim().toLowerCase();
+		// git accepts a quoted boolean (`fsmonitor = "false"`), but only when the
+		// quotes wrap the boolean and nothing else
+		const value = gitConfigValue(match[1]).toLowerCase().replace(/^["']|["']$/g, "");
 		// `true` uses git's built-in daemon and `false`/empty disable it; anything
 		// else is a path or command line
 		if (value !== "" && value !== "true" && value !== "false" && value !== "0") return true;
@@ -857,19 +913,33 @@ function gitConfigNamesProgram(text) {
  */
 export async function gitConfigGuard({ root, readFile: readConfig = readFile } = {}) {
 	if (typeof root !== "string" || root === "") return false;
+	// Only "there is nothing there" may pass. A permission or I/O failure means
+	// the config could not be verified, and an unverified config is never a reason
+	// to auto-approve.
 	const read = async (file) => {
 		try {
 			const value = await readConfig(file, "utf8");
 			return typeof value === "string" ? value : null;
-		} catch {
-			return null;
+		} catch (error) {
+			const code = error?.code;
+			if (code === "ENOENT" || code === "ENOTDIR" || code === "EISDIR") return null;
+			throw error;
 		}
 	};
-	// a gitdir pointer file means the config is not where we can read it
-	if ((await read(join(root, ".git"))) !== null) return false;
-	const text = await read(join(root, ".git", "config"));
-	if (text === null) return true;
-	return !gitConfigNamesProgram(text);
+	try {
+		// a gitdir pointer file means the config is not where we can read it
+		if ((await read(join(root, ".git"))) !== null) return false;
+		// `extensions.worktreeConfig` puts a second, per-worktree config next to
+		// the main one; it can name a program just as well
+		for (const file of [join(root, ".git", "config"), join(root, ".git", "config.worktree")]) {
+			const text = await read(file);
+			if (text === null) continue;
+			if (gitConfigNamesProgram(text)) return false;
+		}
+		return true;
+	} catch {
+		return false;
+	}
 }
 
 /**
@@ -921,7 +991,7 @@ export function createHandler({ config, record, llmRunner, getSessionMode, denia
 			if (match === null) return null;
 			if (match.action !== "allow") return match;
 			const pathsOk = match.pathGuard === "workspace-relative"
-				? await pathGuardAllows(positionalArgs(shapeInfo.argv, match.pattern.length, shapeInfo.quoted), guardOpts.path)
+				? await pathGuardAllows(positionalArgs(shapeInfo.argv, match.pattern.length, shapeInfo), guardOpts.path)
 				: true;
 			const configOk = match.configGuard === "git-clean"
 				? await gitConfigGuard({ ...guardOpts.config, readFile: readConfigFile })
