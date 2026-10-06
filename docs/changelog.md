@@ -4,9 +4,9 @@
 
 ---
 
-## 未发布 — 决策语义与证据补齐（版本号待定）
+## v0.4.6 — 2026-10-06
 
-**两处语义变更：放行由程序按规则算，红条不再受无人值守开关影响。**
+**决策语义、删除族规则与评测闭环。两处语义变更：放行由程序按规则算，红条不再受无人值守开关影响。**
 
 - **策略层 `decidePolicy` 取代旧的容忍度映射**：裁判只给风险、处理意见与**用户授权强度**（`none` / `weak` / `strong`），最终动作由固定分支表算出，命中的分支名进审计（`policy`）。行为变化：裁判判 `allow` 不再自动越过 `riskTolerance`——超档放行需要用户明确要求过这条动作；**风险 high 且授权不是 strong 时一律交人工**，容忍度管不了它
 - **红条 `hardAsk`**：发布（npm / pnpm / yarn / bun publish、npm unpublish、twine upload、cargo publish、docker push、gh release create、git push）与凭据路径（`.ssh` / `.aws` / `.codex/auth.json` / `id_rsa` / `id_ed25519`）标为红条。`ai-auto` 下不走 `mode3OnAsk`，改由 `ai.hardAskOnUnattended` 决定（默认**拒绝**）；`.dsh/*` 保持普通 `ask`。`ai.hardAskOnUnattended` 不接受 `allow`
@@ -33,7 +33,7 @@
 - **规则层新增「删除」一整族，判定从文本升到 argv**：① **递归删除一律询问**——新增语义 guard `flagGuard: "recursive-delete"`（无 `pattern`，按 argv 判定，见 [决策链](decision-chain.md#规则语法)）：把短选项打包拆开找递归开关，于是 `rm -rf` / `rm -fr` / `rm -r -f` / `rm -rvf` / `rm -vrf` / `rm --recursive --force` / `/bin/rm -rvf` / `cd pkg && rm -rvf dist` 命中同一条规则，pwsh 的 `Remove-Item -Recurse`（含 `rm` / `rd` / `rmdir` / `ri` / `del` / `erase` 别名）亦然；`rm -r`（不带 `-f`）同样算——对可写目录树它与 `-rf` 没有区别。opaque 命令没有 argv，由旁边的字面规则 `Bash(*rm -rf*)` 一类兜住。② **内容销毁询问**：`truncate` / `shred` / `unlink` / `cp /dev/null` / `dd … of=<文件>` / 无命令的截断重定向（`> f`、`: > f`）/ `find … -delete` / `rsync --delete` / `git stash drop` / `userdel -r` / `DROP TABLE` / `DROP DATABASE` / `FLUSHALL` / pwsh `Clear-Content` 与 cmd 风格 `rd /s`、`rmdir /s`、`del /s`。③ **整体状态删除直接拒绝**：`git clean -f*` / `git reset --hard` / `git checkout -- …` / `git restore` / `git stash clear` / `git branch -D` / `git worktree remove`、`docker system prune` / `docker volume rm` / `docker volume prune` / `docker compose down -v`、`kubectl delete ns|namespace|pvc|pv` 与 `kubectl delete … --all`、`rclone purge`、`aws s3 rm --recursive`、`wipefs -a` / `--all`——这些删掉的状态在别处没有副本。④ **日常正当形态不落在 deny 档**（`deny` 是 `/approval-allow-once` 也解不开的机器独断）：为 glob 规则新增两个选项——`caseSensitive: true`（`git branch -D` 丢弃未合并提交、`git branch -d` git 自己会拒绝，默认折叠会把两者合成一条；带此选项的规则要锚在命令文本上，`Bash(` 前缀靠折叠才成立）与 `unless: <模式>`（规则自己的例外，只能让 deny/ask 变窄，标在 `allow` 上或与结构化规则同用会装配期报错）。据此 `git branch -d`、`git restore --staged`（`--staged --worktree` 仍拒，那条窄规则写在它前面，同优先级按列表顺序取首个）、`kubectl delete pod|<kind>` 回到 AI 判定；`wipefs -n` / `--no-act`（dry run，只签名不写）成为 `allow` 规则，`wipefs /dev/sdX`（不带 `-n`，真擦）为 `ask`——wipefs 的 deny/ask 模式因此重写成不匹配 `-n`，否则 deny > ask > allow 会把 allow 吃掉。规则匹配大小写不敏感仍是默认（`RM -RF x` 与 `rm -rf x` 同一条规则）
 - 不变：规则优先级（deny > ask > allow）、证据门槛、`denyFeedback`、`transcript`、审计日志格式与轮转、候选链语义
 
-验证：`node --test` 全绿。
+验证：`node --test` 387 用例全绿（v0.4.5 为 282）；双平面检查 `node scripts/check-planes.mjs` 全绿（schemastery 3.18.2 跳 4 条 volatile-only、3.18.4 全跑）；`node scripts/build-client.mjs` 重建后无差异。
 
 ---
 
