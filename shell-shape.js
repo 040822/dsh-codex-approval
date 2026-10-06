@@ -407,3 +407,86 @@ export function forbiddenOptionHit(argv, options) {
 	}
 	return null;
 }
+
+/** Programs that delete through PowerShell's `Remove-Item` and its aliases. */
+const PWSH_DELETE_PROGRAMS = Object.freeze(["remove-item", "rm", "rd", "rmdir", "ri", "del", "erase"]);
+
+/** `-Recurse` as PowerShell accepts it — any unique prefix counts. */
+const PWSH_RECURSE = /^-(?:r|re|rec|recu|recur|recurs|recurse)$/i;
+
+/** `-Force` likewise (`-f` alone is ambiguous with `-Filter`; asking is harmless). */
+const PWSH_FORCE = /^-(?:f|fo|for|forc|force)$/i;
+
+/**
+ * A bundled short option split into its letters: `-rvf` → `["r","v","f"]`.
+ * `--recursive`, `-`, `-x=1` and a path are not bundles.
+ * @param arg - one argv entry
+ */
+function shortOptionBundle(arg) {
+	if (!/^-[A-Za-z]+$/.test(arg)) return null;
+	return [...arg.slice(1)];
+}
+
+/** The program name of an argv entry, with either directory separator stripped. */
+function programName(entry) {
+	return String(entry ?? "").split(/[\\/]/).pop().toLowerCase();
+}
+
+/**
+ * Whether one argv is a *recursive deletion*, and whether it forces it.
+ *
+ * This is the check a text rule cannot make. `rm -rf`, `rm -fr`, `rm -r -f` and
+ * `rm -rvf` are one command with one meaning, but as text they are four
+ * different strings — a glob list has to enumerate the letters of every bundle
+ * in every order, and loses as soon as a fifth letter appears (`-rvif`). The
+ * recognizer already has the argv: split the bundle, look for the switches.
+ *
+ * Recursive is the predicate that matters: `rm -r dir` deletes a whole tree
+ * without a prompt of its own, and `-f` only decides whether read-only files
+ * stop it. `force` is reported alongside so a rule can be written for the
+ * narrower "recursive **and** forced" case if a deployment wants that.
+ *
+ * PowerShell is the same question with other spellings: `Remove-Item` (or its
+ * `rm` / `rd` / `rmdir` / `ri` / `del` / `erase` aliases) carrying `-Recurse`,
+ * where PowerShell accepts any unique prefix of the parameter name.
+ *
+ * @param argv - one command's argv (from classifyCommand's `parts`)
+ * @param toolName - "bash" | "pwsh"
+ * @returns `{ recursive, force }`, or null when this is not a deletion program
+ */
+export function recursiveDeleteFlags(argv, toolName) {
+	if (!Array.isArray(argv) || argv.length === 0) return null;
+	const program = programName(argv[0]);
+	const tool = String(toolName ?? "").toLowerCase();
+	const flags = { recursive: false, force: false };
+	if (tool === "bash") {
+		if (program !== "rm") return null;
+		for (const arg of argv.slice(1)) {
+			if (typeof arg !== "string") continue;
+			if (arg === "--") break; // everything after it is a path, even `-r`
+			if (arg === "--recursive") {
+				flags.recursive = true;
+				continue;
+			}
+			if (arg === "--force") {
+				flags.force = true;
+				continue;
+			}
+			const letters = shortOptionBundle(arg);
+			if (letters === null) continue;
+			if (letters.includes("r") || letters.includes("R")) flags.recursive = true;
+			if (letters.includes("f")) flags.force = true;
+		}
+		return flags;
+	}
+	if (tool === "pwsh") {
+		if (!PWSH_DELETE_PROGRAMS.includes(program)) return null;
+		for (const arg of argv.slice(1)) {
+			if (typeof arg !== "string") continue;
+			if (PWSH_RECURSE.test(arg)) flags.recursive = true;
+			else if (PWSH_FORCE.test(arg)) flags.force = true;
+		}
+		return flags;
+	}
+	return null;
+}

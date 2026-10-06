@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { wildcardMatch, matchableText, evaluateRules, foldQuotedLiterals, classifyRequest } from "../rules.js";
+import { wildcardMatch, matchableText, evaluateRules, foldQuotedLiterals, classifyRequest, isStructuredRule, ruleLabel } from "../rules.js";
 
 test("wildcardMatch: basic cases", () => {
 	assert.equal(wildcardMatch("Bash(git *)", "Bash(git status --short)"), true);
@@ -140,4 +140,116 @@ test("evaluateRules: spliced-token rewrites still reach the safety rules", () =>
 		evaluateRules([{ match: "Bash(git status)", action: "allow" }], { toolName: "bash", argsText: 'git "status"', reason: "" }, classifyRequest("bash", 'git "status"'))?.action,
 		"allow"
 	);
+});
+
+// ---- flagGuard rules (2026-10-06) -----------------------------------------
+
+const GUARD = [{ tool: "bash", flagGuard: "recursive-delete", action: "ask" }];
+
+test("flagGuard: a semantic rule matches on argv, not on a text prefix", () => {
+	const hit = (command, toolName = "bash", rules = GUARD) => {
+		const shape = classifyRequest(toolName, command);
+		return evaluateRules(rules, { toolName, argsText: command, reason: "" }, shape)?.action;
+	};
+	// every spelling a glob list cannot enumerate — one rule
+	for (const command of [
+		"rm -rf ./dist",
+		"rm -rvf ./dist",
+		"rm -vrf ./dist",
+		"rm -r -f ./dist",
+		"rm --recursive --force ./dist",
+		"/bin/rm -rvf ./dist",
+		"rm -R ./dist",
+		"cd packages/app && rm -rvf node_modules"
+	]) {
+		assert.equal(hit(command), "ask", command);
+	}
+	// not a recursive delete: the rule says nothing about it
+	assert.equal(hit("rm ./dist"), undefined);
+	assert.equal(hit("rm -f ./dist"), undefined);
+	assert.equal(hit("cp -rf a b"), undefined);
+});
+
+test("flagGuard: an opaque command has no argv, so only the text rules can fire", () => {
+	// `$DIR` makes the command opaque — the argv never exists, and the guard
+	// deliberately stays silent rather than guessing
+	assert.equal(evaluateRules(GUARD, { toolName: "bash", argsText: "rm -rf $DIR/x", reason: "" }, classifyRequest("bash", "rm -rf $DIR/x")), null);
+	// `{}` in a `find -exec` is grouping to the recognizer, so that command is
+	// opaque too — the literal in the text is what catches it
+	const findExec = "find . -type d -exec rm -rf {} +";
+	assert.equal(evaluateRules(GUARD, { toolName: "bash", argsText: findExec, reason: "" }, classifyRequest("bash", findExec)), null);
+	for (const command of ["rm -rf $DIR/x", findExec]) {
+		const withTextRule = [...GUARD, { match: "Bash(*rm -rf*)", action: "ask" }];
+		assert.equal(
+			evaluateRules(withTextRule, { toolName: "bash", argsText: command, reason: "" }, classifyRequest("bash", command))?.action,
+			"ask",
+			command
+		);
+	}
+});
+
+test("flagGuard: the rule only ever speaks for its own tool", () => {
+	const rules = [{ tool: "pwsh", flagGuard: "recursive-delete", action: "ask" }];
+	assert.equal(evaluateRules(rules, { toolName: "bash", argsText: "rm -rf x", reason: "" }, classifyRequest("bash", "rm -rf x")), null);
+	assert.equal(
+		evaluateRules(rules, { toolName: "pwsh", argsText: "Remove-Item -Recurse -Force C:\\x", reason: "" }, classifyRequest("pwsh", "Remove-Item -Recurse -Force C:\\x"))?.action,
+		"ask"
+	);
+});
+
+test("isStructuredRule / ruleLabel: the flagGuard form is a structured rule and labels itself", () => {
+	const rule = { tool: "bash", flagGuard: "recursive-delete", action: "ask" };
+	assert.equal(isStructuredRule(rule), true);
+	assert.equal(ruleLabel(rule), "Bash(flagGuard:recursive-delete)");
+	assert.equal(ruleLabel({ tool: "pwsh", flagGuard: "recursive-delete", action: "ask" }), "Pwsh(flagGuard:recursive-delete)");
+	// a pattern rule keeps its old label
+	assert.equal(ruleLabel({ tool: "bash", pattern: ["rm"], action: "ask" }), "Bash(rm*)");
+});
+
+// ---- glob options: caseSensitive / unless (2026-10-06) --------------------
+
+test("wildcardMatch: caseSensitive stops the folding that makes -D and -d one rule", () => {
+	assert.equal(wildcardMatch("*git branch -D *", "git branch -D feature"), true);
+	assert.equal(wildcardMatch("*git branch -D *", "git branch -d feature"), true, "folds by default");
+	assert.equal(wildcardMatch("*git branch -D *", "git branch -d feature", true), false);
+	assert.equal(wildcardMatch("*git branch -D *", "git branch -D feature", true), true);
+	// folding is still the default for everything else
+	assert.equal(wildcardMatch("RM -RF *", "rm -rf /x"), true);
+});
+
+test("evaluateRules: unless exempts a request from the rule that matched it", () => {
+	const rules = [{ match: "Bash(*git restore*)", action: "deny", unless: "Bash(*git restore --staged*)" }];
+	const hit = (command) => {
+		const shape = classifyRequest("bash", command);
+		return evaluateRules(rules, { toolName: "bash", argsText: command, reason: "" }, shape)?.action;
+	};
+	assert.equal(hit("git restore ."), "deny");
+	assert.equal(hit("git restore src/app.js"), "deny");
+	// the exempted form is not claimed by anything, so it falls through to the
+	// judge rather than being refused
+	assert.equal(hit("git restore --staged ."), undefined);
+	assert.equal(hit("git restore --staged src/app.js"), undefined);
+	// a list of patterns works, and the exemption is evaluated on the same
+	// surfaces the rule matched (a spliced spelling included)
+	const listed = [{ match: "*git restore*", action: "deny", unless: ["*--staged*"] }];
+	const bare = "git restore --staged .";
+	assert.equal(evaluateRules(listed, { toolName: "bash", argsText: bare, reason: "" }, classifyRequest("bash", bare)), null);
+	// the exemption does not leak: another rule with no `unless` still refuses it
+	const both = [{ match: "*git restore*", action: "deny", unless: "*--staged*" }, { match: "*staged*", action: "deny" }];
+	assert.equal(evaluateRules(both, { toolName: "bash", argsText: bare, reason: "" }, classifyRequest("bash", bare))?.action, "deny");
+});
+
+test("evaluateRules: same-action rules keep list order, which is how a narrower deny wins", () => {
+	// the restored-with-worktree form must be named before the `unless` rule,
+	// otherwise the exemption would swallow it
+	const rules = [
+		{ match: "Bash(*git restore*--worktree*)", action: "deny" },
+		{ match: "Bash(*git restore*)", action: "deny", unless: "Bash(*git restore --staged*)" }
+	];
+	const hit = (command) => {
+		const shape = classifyRequest("bash", command);
+		return evaluateRules(rules, { toolName: "bash", argsText: command, reason: "" }, shape)?.match;
+	};
+	assert.equal(hit("git restore --staged --worktree ."), "Bash(*git restore*--worktree*)");
+	assert.equal(hit("git restore --staged ."), undefined);
 });

@@ -5,7 +5,8 @@ import {
 	forbiddenOptionHit,
 	isShellTool,
 	isWorkspaceRelativePath,
-	positionalArgs
+	positionalArgs,
+	recursiveDeleteFlags
 } from "../shell-shape.js";
 
 /**
@@ -134,4 +135,61 @@ test("forbiddenOptionHit: long, attached and short option forms are all caught",
 	assert.equal(forbiddenOptionHit(["git", "diff", "-O/tmp/order"], ["-O"]), "-O/tmp/order");
 	assert.equal(forbiddenOptionHit(["git", "diff"], ["--output", "-O"]), null);
 	assert.equal(forbiddenOptionHit(["git", "diff", "--outline"], ["--output"]), null);
+});
+
+// ---- recursiveDeleteFlags (2026-10-06) ------------------------------------
+
+test("recursiveDeleteFlags: every bundled spelling of `rm -rf` is one command", () => {
+	const recursive = { recursive: true, force: true };
+	for (const argv of [
+		["rm", "-rf", "x"],
+		["rm", "-rfv", "x"],
+		["rm", "-rvf", "x"],
+		["rm", "-vrf", "x"],
+		["rm", "-fr", "x"],
+		["rm", "-fvr", "x"],
+		["rm", "-r", "-f", "x"],
+		["rm", "-f", "-r", "x"],
+		["rm", "-rf", "-v", "x"],
+		["rm", "--recursive", "--force", "x"],
+		["/bin/rm", "-rvf", "x"],
+		["rm", "-r", "-v", "-i", "-f", "x"]
+	]) {
+		assert.deepEqual(recursiveDeleteFlags(argv, "bash"), recursive, JSON.stringify(argv));
+	}
+});
+
+test("recursiveDeleteFlags: recursive without force still counts, and `-f` alone does not", () => {
+	// `rm -r dir` takes the whole tree without prompting for the writable ones:
+	// the switch a rule has to see is `-r`, not `-f`
+	assert.deepEqual(recursiveDeleteFlags(["rm", "-r", "dir"], "bash"), { recursive: true, force: false });
+	assert.deepEqual(recursiveDeleteFlags(["rm", "-R", "dir"], "bash"), { recursive: true, force: false });
+	assert.deepEqual(recursiveDeleteFlags(["rm", "--recursive", "dir"], "bash"), { recursive: true, force: false });
+	assert.deepEqual(recursiveDeleteFlags(["rm", "-f", "file"], "bash"), { recursive: false, force: true });
+	// `--` ends option parsing: a later `-rf` is a path
+	assert.deepEqual(recursiveDeleteFlags(["rm", "--", "-rf"], "bash"), { recursive: false, force: false });
+});
+
+test("recursiveDeleteFlags: programs that are not a deletion, or not `rm`, are null", () => {
+	assert.deepEqual(recursiveDeleteFlags(["rm", "file.txt"], "bash"), { recursive: false, force: false });
+	assert.equal(recursiveDeleteFlags(["cp", "-rf", "a", "b"], "bash"), null);
+	assert.equal(recursiveDeleteFlags(["rmdir", "-p", "a/b"], "bash"), null);
+	assert.equal(recursiveDeleteFlags(["find", ".", "-delete"], "bash"), null);
+	assert.equal(recursiveDeleteFlags([], "bash"), null);
+	assert.equal(recursiveDeleteFlags(null, "bash"), null);
+	// a non-shell tool never reaches this judgement, even with rm-looking argv
+	assert.equal(recursiveDeleteFlags(["rm", "-rf", "x"], "write"), null);
+});
+
+test("recursiveDeleteFlags: pwsh Remove-Item and its aliases count `-Recurse`", () => {
+	assert.deepEqual(recursiveDeleteFlags(["Remove-Item", "-Recurse", "-Force", "C:\\x"], "pwsh"), { recursive: true, force: true });
+	// PowerShell accepts any unique prefix of the parameter name
+	assert.deepEqual(recursiveDeleteFlags(["Remove-Item", "-r", "C:\\x"], "pwsh"), { recursive: true, force: false });
+	assert.deepEqual(recursiveDeleteFlags(["Remove-Item", "-Force", "C:\\x"], "pwsh"), { recursive: false, force: true });
+	for (const program of ["rm", "rd", "rmdir", "ri", "del", "erase"]) {
+		assert.deepEqual(recursiveDeleteFlags([program, "-Recurse", "x"], "pwsh"), { recursive: true, force: false }, program);
+	}
+	assert.deepEqual(recursiveDeleteFlags(["Remove-Item", "C:\\x"], "pwsh"), { recursive: false, force: false });
+	assert.equal(recursiveDeleteFlags(["Get-ChildItem", "-Recurse"], "pwsh"), null);
+	assert.equal(recursiveDeleteFlags(["Remove-Item", "-Recurse"], "bash"), null);
 });

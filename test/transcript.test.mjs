@@ -93,6 +93,23 @@ test("collect: streaming chunks and plugin messages are excluded", () => {
 	assert.equal(items[2].text, "real user intent");
 });
 
+test("collect: v4 plugin:<name> injections are excluded like historical plugin sources", () => {
+	const events = [
+		userEv("real user intent"),
+		{
+			type: "user/message",
+			time: 1,
+			data: {
+				content: [{ type: "text", text: "injected denial feedback" }],
+				source: { kind: "plugin:dsh-codex-approval", form: "instructions" }
+			}
+		}
+	];
+	const items = collectSemanticItems(events);
+	assert.deepEqual(items.map((i) => i.kind), ["user"]);
+	assert.equal(items[0].text, "real user intent");
+});
+
 test("collect: returns newest-first semantic order", () => {
 	const events = [userEv("old"), toolEv("pwsh", "git old"), userEv("newest")];
 	const items = collectSemanticItems(events);

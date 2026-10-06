@@ -79,10 +79,10 @@ test("applyConfigSettings: projects UI settings onto the runtime config", () => 
 		model: "codex/gpt-5.6-luna",
 		riskTolerance: "low",
 		failOpen: "deny",
-		mode3OnAsk: "allow",
 		timeoutMs: 7000,
 		maxTokens: 256,
-		hardAskOnUnattended: "ask",
+		transcript: "short",
+		transcriptMaxChars: 2000,
 		evidenceFetch: "off",
 		evidenceMaxFiles: 4,
 		evidenceMaxBytes: 8192,
@@ -92,14 +92,34 @@ test("applyConfigSettings: projects UI settings onto the runtime config", () => 
 	assert.equal(cfg.ai.model, "codex/gpt-5.6-luna");
 	assert.equal(cfg.ai.riskTolerance, "low");
 	assert.equal(cfg.ai.failOpen, "deny");
-	assert.equal(cfg.mode3OnAsk, "allow");
 	assert.equal(cfg.ai.timeoutMs, 7000);
 	assert.equal(cfg.ai.maxTokens, 256);
-	assert.equal(cfg.ai.hardAskOnUnattended, "ask");
+	assert.equal(cfg.transcript, "short");
+	assert.equal(cfg.transcriptMaxChars, 2000);
 	assert.equal(cfg.ai.evidenceFetch, "off");
 	assert.equal(cfg.ai.evidenceMaxFiles, 4);
 	assert.equal(cfg.ai.evidenceMaxBytes, 8192);
 	assert.equal(cfg.denyFeedback, false);
+});
+
+test("applyConfigSettings: the three unattended red lines stay deny whatever the settings document says", () => {
+	// 旧 settings 文档 / 旧 patch 里可能残留 allow|ask。它们是写死的红线：一次
+	// 「读旧文档」不得把它变成放行（即文档里那类静默放宽的来源）。
+	const cfg = applyConfigSettings(normalizeConfig({}), {
+		mode3OnAsk: "allow",
+		hardAskOnUnattended: "ask",
+		enforcedAskOnUnattended: "ask"
+	});
+	assert.equal(cfg.mode3OnAsk, "deny");
+	assert.equal(cfg.ai.hardAskOnUnattended, "deny");
+	assert.equal(cfg.ai.enforcedAskOnUnattended, "deny");
+	// 旧形态（`ai.*` 嵌套）不是 entry Config 的声明键，schema 不会拒它——所以必须在
+	// 装配期压回 deny，否则一次「读旧文档」就把红线放开了。
+	const nested = applyConfigSettings(normalizeConfig({}), {
+		ai: { hardAskOnUnattended: "ask", enforcedAskOnUnattended: "ask" }
+	});
+	assert.equal(nested.ai.hardAskOnUnattended, "deny");
+	assert.equal(nested.ai.enforcedAskOnUnattended, "deny");
 });
 
 test("normalizeConfig: rejects invalid values loudly", () => {
@@ -123,7 +143,9 @@ test("normalizeConfig: denyFeedback defaults and validation", () => {
 
 test("normalizeConfig: transcript defaults and validation", () => {
 	const cfg = normalizeConfig({});
-	assert.equal(cfg.transcript, "off");
+	// 默认 short（2026-10-06 起）：判定模型默认能看到会话骨架。off 仍是合法取值，
+	// 想回到零上下文判定就显式写 off。
+	assert.equal(cfg.transcript, "short");
 	assert.equal(cfg.transcriptMaxChars, 4000);
 	assert.throws(() => normalizeConfig({ transcript: "full" }), TypeError);
 	assert.throws(() => normalizeConfig({ transcriptMaxChars: 99 }), TypeError);
@@ -135,7 +157,12 @@ test("DEFAULT_CONFIG: includes Pwsh read-only allow rules for Windows", () => {
 	const cfg = normalizeConfig({});
 	const pwshRules = cfg.rules.filter((r) => typeof r.tool === "string" && r.tool.toLowerCase() === "pwsh");
 	assert.ok(pwshRules.length >= 8, `expected Pwsh rules, got ${pwshRules.length}`);
-	assert.ok(pwshRules.every((r) => r.action === "allow"));
+	// the read-only family is an allow family; the deletion guards on the same
+	// tool are the strictness side and are not part of it
+	const readOnly = pwshRules.filter((r) => r.flagGuard === void 0);
+	assert.ok(readOnly.length >= 8, `expected Pwsh read-only rules, got ${readOnly.length}`);
+	assert.ok(readOnly.every((r) => r.action === "allow"));
+	assert.ok(pwshRules.filter((r) => r.flagGuard !== void 0).every((r) => r.action === "ask"));
 	const bashRules = cfg.rules.filter((r) => typeof r.tool === "string" && r.tool.toLowerCase() === "bash");
 	assert.ok(bashRules.length > 0, "Bash family must remain for Linux/Raspberry Pi");
 });
@@ -550,11 +577,15 @@ test("handler: ai-auto resolves rule-ask via mode3OnAsk=deny without next", asyn
 	assert.equal(entries[0].action, "deny");
 });
 
-test("handler: ai-auto resolves rule-ask via mode3OnAsk=allow", async () => {
-	const cfg = modeConfig({ mode: "ai-auto", mode3OnAsk: "allow" });
+test("handler: ai-auto rule-ask can no longer be resolved by configuring mode3OnAsk", async () => {
+	// `mode3OnAsk` 是写死的红线（只接受 deny）。以前这里断言的是「配成 allow 时
+	// 放行」，那是把「无人值守 + 本次 ask」变成完全权限的开关；现在它在装配期就被拒绝，
+	// 要放开权限只能改宿主权限层。
+	assert.throws(() => modeConfig({ mode: "ai-auto", mode3OnAsk: "allow" }), TypeError);
+	const cfg = modeConfig({ mode: "ai-auto" });
 	const handler = createHandler({ config: cfg, record: async () => {}, llmRunner: async () => ({ ok: true, text: "{}" }) });
 	const { outcome, nextCalls } = await runWith(handler, makeReq({ command: "askme something" }));
-	assert.equal(outcome, "allowed-once");
+	assert.equal(outcome, "rejected");
 	assert.equal(nextCalls.length, 0);
 });
 
@@ -613,9 +644,11 @@ test("handler: record carries the effective mode", async () => {
 test("normalizeConfig: mode defaults and validation", () => {
 	assert.equal(normalizeConfig({}).mode, "ai");
 	assert.equal(normalizeConfig({}).mode3OnAsk, "deny");
-	assert.equal(normalizeConfig({ mode: "ai-auto", mode3OnAsk: "allow" }).mode3OnAsk, "allow");
+	assert.equal(normalizeConfig({ mode: "ai-auto", mode3OnAsk: "deny" }).mode3OnAsk, "deny");
 	assert.throws(() => normalizeConfig({ mode: "auto" }), TypeError);
+	// 写死 deny：allow 与 ask 都在装配期被拒（不是被静默改成 deny）。
 	assert.throws(() => normalizeConfig({ mode3OnAsk: "ask" }), TypeError);
+	assert.throws(() => normalizeConfig({ mode3OnAsk: "allow" }), TypeError);
 });
 
 test("makeModeStore: memory-only when settings service is absent", async () => {
@@ -915,8 +948,8 @@ test("P0: unrecoverable arguments are never auto-approved and never judged", asy
 	assert.equal(entries[0].evidenceIncomplete, "arguments-unavailable");
 });
 
-test("P0: ai-auto denies evidence-incomplete even when mode3OnAsk=allow", async () => {
-	const cfg = normalizeConfig({ mode: "ai-auto", mode3OnAsk: "allow" });
+test("P0: ai-auto denies evidence-incomplete (a mode switch cannot grant what could not be seen)", async () => {
+	const cfg = normalizeConfig({ mode: "ai-auto" });
 	const handler = createHandler({
 		config: cfg,
 		record: async () => {},
@@ -1002,6 +1035,9 @@ test("P0: credentials are redacted in the judge input, the audit record and the 
 	const { outcome } = await run(handler, makeReq({ command, reason: "apiKey=hidden-value" }));
 	assert.equal(outcome, "rejected");
 	assert.doesNotMatch(prompts[0], /super-secret-token|hidden-value|query-secret/);
+	// 默认 short 下会话骨架（Context 块）也进 prompt —— 这条同时钉住骨架里的
+	// `[T]` 行同样过脱敏边界；否则把 transcript 关掉就能让上面的断言静默通过。
+	assert.match(prompts[0], /Context:/);
 	// and the request really did reach the judge, with the values redacted in place
 	assert.match(prompts[0], /"command":/);
 	assert.match(prompts[0], /\[REDACTED\]/);
@@ -1258,6 +1294,32 @@ test("Config: 标量未配置是 undefined；null 原样保留（由装配期与
 	// 数组相反：保留 default，否则「显式清空 []」与「没配过」分不开
 	assert.deepEqual(readRef(Config({}).fallbacks), DEFAULT_CONFIG.ai.fallbacks);
 	assert.deepEqual(readRef(Config({ fallbacks: [] }).fallbacks), []);
+	// `mode` 是唯一的例外：它带 default（设置页那一行要有值可显示），但它从不参与
+	// 读旧嵌套 `ai.*` 的回退，所以默认值不会遮蔽任何旧配置。
+	assert.equal(readRef(Config({}).mode), DEFAULT_CONFIG.mode);
+});
+
+test("默认审批模式：设置值覆盖配置默认，且经 live 通道热生效", { skip: VOLATILE_ONLY }, async () => {
+	const { Config, DEFAULT_CONFIG, applyConfigSettings, normalizeConfig } = await import("../index.js");
+	// 0.1.x 路径：设置命名空间里的 `mode` 与运行配置顶层键同名，按「有值即覆盖」投影。
+	const base = normalizeConfig(DEFAULT_CONFIG);
+	assert.equal(applyConfigSettings(base, { mode: "manual" }).mode, "manual");
+	assert.equal(applyConfigSettings(base, {}).mode, DEFAULT_CONFIG.mode, "没传的字段保持原值");
+
+	// 0.2.0 路径：设置页写的是 entry config 的 `mode`。它**必须**是 volatile——宿主按
+	// `isVolatilePath()` 逐路径校验，非 volatile 字段的写入会被直接拒绝——并由
+	// `installLiveGetters` 接成 getter，改动不重载插件就生效。
+	const { source, cfg } = await buildCfg({ mode: "manual" });
+	assert.equal(cfg.mode, "manual");
+	const next = Config({ mode: "ai-auto" });
+	writeRef(source.mode, next.mode.get());
+	assert.equal(cfg.mode, "ai-auto", "热更新后 cfg.mode 立即是新值（resolveMode 每次请求都读它）");
+});
+
+test("CONFIG_SETTINGS_SCHEMA: 默认审批模式是 0.1.x 设置页的字段之一", async () => {
+	const { CONFIG_SETTINGS_SCHEMA, DEFAULT_CONFIG } = await import("../index.js");
+	assert.equal(CONFIG_SETTINGS_SCHEMA({}).mode, DEFAULT_CONFIG.mode, "未配置时落在 ai");
+	assert.equal(CONFIG_SETTINGS_SCHEMA({ mode: "manual" }).mode, "manual");
 });
 
 test("applyConfigSettings: 0.1.x 的 namespace 更新直接按实际值覆盖", async () => {
@@ -1729,6 +1791,270 @@ test("P2: folding never reaches inside a quoted argument, so an echo is not deni
 	assert.equal(entries[0].action, "allow", JSON.stringify(entries[0]));
 });
 
+// ---- third pass (2026-10-06): deletion ------------------------------------
+
+test("P1: every rm -rf asks the human, however the switches are spelled", async () => {
+	// The point of the rule is that a recursive delete is never auto-approved, so
+	// the spelling must not be a way past it: glued quotes, a doubled space, a
+	// tab, extra switches, a path prefix and a `cd &&` chain are all the same
+	// command to the shell. The bundled spellings that a glob list cannot
+	// enumerate (`-rvf`, `-vrf`, `--recursive --force`) are caught by the
+	// `flagGuard: "recursive-delete"` rule on the argv; the literal ones also
+	// reach the text rules, which is what covers an opaque command.
+	const entries = [];
+	const handler = defaultRuleHandler({ entries });
+	for (const command of [
+		"rm -rf ./dist",
+		"rm -rf dist build",
+		"cd packages/app && rm -rf node_modules",
+		"rm  -rf ./dist",
+		"rm\t-rf ./dist",
+		'rm -r"f" ./dist',
+		"rm -rfv ./build",
+		"rm -Rf ./build",
+		"rm -fr ./build",
+		"rm -r -f ./dist",
+		"rm -f -r ./dist",
+		"/bin/rm -rf ./tmp",
+		// the bundled spellings and the long options: argv-only, no glob can see them
+		"rm -rvf ./build",
+		"rm -vrf ./build",
+		"rm --recursive --force ./dist",
+		// recursive without `-f`: `rm -r dir` takes the whole writable tree too
+		"rm -r ./src",
+		"rm -R ./src",
+		// an absolute path in a spelling the deny globs cannot see (`*rm -rf /*`
+		// matches the literal, not the bundle): the guard still asks a human, so
+		// it is never auto-approved — only `rm -rf /…` is refused outright
+		"rm -rvf /work/dist",
+		"rm --recursive --force /work/dist",
+		// outside the workspace but written relatively: still one confirmation
+		// (the absolute spellings are denied outright, see the next test)
+		"cd /tmp && rm -rf scratch"
+	]) {
+		entries.length = 0;
+		const { outcome } = await run(handler, makeReq({ command }));
+		assert.equal(outcome, "unavailable", `a human must confirm: ${command}`);
+		assert.equal(entries[0].kind, "rule", `${command}: ${JSON.stringify(entries[0])}`);
+		assert.equal(entries[0].action, "ask", command);
+	}
+});
+
+test("P1: the same recursive delete in pwsh asks a human", async () => {
+	// Windows spells it `Remove-Item -Recurse` (and PowerShell accepts any unique
+	// prefix of the parameter name); `rm` / `rd` / `del` are its aliases, and
+	// `/s` is what the cmd-style spelling uses
+	const entries = [];
+	const handler = defaultRuleHandler({ entries });
+	for (const command of [
+		"Remove-Item -Recurse -Force C:\\proj",
+		"Remove-Item -r C:\\proj",
+		"Remove-Item C:\\proj -Recurse",
+		"rm -Recurse build",
+		"rd -Recurse C:\\proj",
+		"del -Recurse C:\\proj",
+		"rd /s /q C:\\proj",
+		"rd /q /s C:\\proj",
+		"rmdir /s C:\\proj",
+		"del /s /q C:\\proj\\*",
+		"del /f /s /q C:\\proj\\*",
+		"Clear-Content C:\\proj\\a.txt"
+	]) {
+		entries.length = 0;
+		const { outcome } = await run(handler, makeReq({ toolName: "pwsh", command }));
+		assert.equal(outcome, "unavailable", `a human must confirm: ${command}`);
+		assert.equal(entries[0].kind, "rule", command);
+		assert.equal(entries[0].action, "ask", command);
+	}
+	// deleting one file without -Recurse is not this rule's business
+	entries.length = 0;
+	await run(handler, makeReq({ toolName: "pwsh", command: "Remove-Item C:\\proj\\a.txt" }));
+	assert.notEqual(entries[0].kind, "rule", JSON.stringify(entries[0]));
+});
+
+test("P1: the rm -rf ask never outranks the deny rules it sits under", async () => {
+	// deny outranks ask: root, home, sudo-prefixed and **absolute-path**
+	// deletions stay outright refusals — the human is not asked, and the new
+	// ask rules cannot soften them (deny > ask, regardless of list order).
+	// `rm -rf /work/dist` and `rm -rf /tmp/scratch` are both in here on purpose:
+	// EVERY absolute-path spelling lands on `*rm -rf /*` (the rule was written
+	// for `rm -rf /`, and `/tmp/x` starts with the same characters), so the
+	// inside-workspace case is covered twice over — this deny for the literal
+	// form, the ask above for everything else. `rm -rvf /work/dist` is NOT in
+	// this list: the deny rules match text, so a bundled spelling falls to the
+	// ask guard (see the test above) rather than being refused.
+	const entries = [];
+	const handler = defaultRuleHandler({ entries });
+	for (const command of ["rm -rf /", "rm -rf /work/dist", "rm -rf /tmp/scratch", "rm -rf ~/Documents", "sudo rm -rf /var/www/html", "rm -fr /etc/nginx"]) {
+		entries.length = 0;
+		const { outcome } = await run(handler, makeReq({ command }));
+		assert.equal(outcome, "rejected", `must stay denied: ${command}`);
+		assert.equal(entries[0].kind, "rule", command);
+		assert.equal(entries[0].action, "deny", command);
+	}
+});
+
+test("P1: a non-shell tool that only mentions rm -rf is not a deletion", async () => {
+	// The rules carry a `Bash(` prefix for this: a file whose *contents* say
+	// `rm -rf` (a write, a patch, a page of documentation) is not a command,
+	// and a bare-text surface must not turn it into an approval prompt. The
+	// flagGuard rules are scoped by tool for the same reason.
+	const entries = [];
+	const handler = defaultRuleHandler({ entries });
+	for (const [toolName, command] of [["write", "rm -rf ./dist"], ["write", "rm -rvf ./dist"], ["patch", "Remove-Item -Recurse -Force C:\\x"]]) {
+		entries.length = 0;
+		await run(handler, makeReq({ toolName, command }));
+		assert.notEqual(entries[0].kind, "rule", `${toolName}: ${JSON.stringify(entries[0])}`);
+	}
+});
+
+test("P1: whole-state deletions are denied outright", async () => {
+	// Unstaged work, a dropped stash, a deleted branch's commits, a volume, an
+	// object-store prefix: nothing backed them up, and an allow-once could not
+	// bring them back — so these are refused, not asked.
+	const entries = [];
+	const handler = defaultRuleHandler({ entries });
+	for (const command of [
+		"git clean -fdx",
+		"git clean -fd",
+		"git clean --force -d",
+		"git reset --hard HEAD~3",
+		"git checkout -- .",
+		"git restore .",
+		"git restore --worktree src/",
+		"git restore --staged --worktree .", // discards the working tree as well
+		"git stash clear",
+		"git branch -D feature",
+		"cd repo && git branch -D feature",
+		"git worktree remove --force ../wt",
+		"docker system prune -af --volumes",
+		"docker volume rm data",
+		"docker compose down -v",
+		"kubectl delete ns prod",
+		"kubectl delete namespace prod",
+		"kubectl delete pvc data-0",
+		"kubectl delete pod --all",
+		"rclone purge remote:bucket",
+		"aws s3 rm s3://bucket --recursive",
+		"aws s3 rm --recursive s3://bucket",
+		"wipefs -a /dev/sdb"
+	]) {
+		entries.length = 0;
+		const { outcome } = await run(handler, makeReq({ command }));
+		assert.equal(outcome, "rejected", `must be denied: ${command}`);
+		assert.equal(entries[0].kind, "rule", `${command}: ${JSON.stringify(entries[0])}`);
+		assert.equal(entries[0].action, "deny", command);
+	}
+	// A fresh handler for what must NOT be denied: the twenty-one refusals above
+	// have tripped the denial breaker, which would deny anything that needs the
+	// judge and make these assertions say nothing.
+	const fresh = defaultRuleHandler();
+	assert.notEqual((await run(fresh, makeReq({ command: "git clean -n" }))).outcome, "rejected");
+});
+
+test("P1: the everyday spellings of those commands are not refused", async () => {
+	// The deny family names the shape that deletes. These are the same commands
+	// in the form people actually run all day, and each one is left to the judge
+	// (which sees the user's own instruction) instead of being machine-refused —
+	// a `deny` is not something `/approval-allow-once` can undo.
+	const cases = [
+		["git branch -d merged", "`-d` refuses to drop unmerged commits, git enforces it"],
+		["git branch -d feature", "same rule, another name"],
+		["git restore --staged .", "index only — nothing leaves the working tree"],
+		["git restore --staged src/app.js", "same, one path"],
+		["kubectl delete pod web", "this is how a pod is restarted"],
+		["kubectl delete deployment api", "a deployment is recreated from its manifest"]
+	];
+	for (const [command, why] of cases) {
+		const entries = [];
+		const { outcome } = await run(defaultRuleHandler({ entries }), makeReq({ command }));
+		assert.notEqual(outcome, "rejected", `must not be refused (${why}): ${command}`);
+		assert.notEqual(entries[0].kind, "rule", `${command}: ${JSON.stringify(entries[0])}`);
+	}
+	// the case-sensitive rule really is case-sensitive: `-D` still refuses, and
+	// the difference is not lost to the default case folding
+	assert.equal((await run(defaultRuleHandler(), makeReq({ command: "git branch -D feature" }))).outcome, "rejected");
+});
+
+test("P1: wipefs is graded — dry run allowed, plain wipe asked, -a refused", async () => {
+	// `wipefs -n` writes nothing at all, so it is an allow rule (the deny/ask
+	// patterns for wipefs are written to fall past it).
+	assert.equal((await run(defaultRuleHandler(), makeReq({ command: "wipefs -n /dev/sdb" }))).outcome, "allowed-once");
+	assert.equal((await run(defaultRuleHandler(), makeReq({ command: "wipefs --no-act /dev/sdb" }))).outcome, "allowed-once");
+	// a plain wipe erases signatures and asks; `-a` erases every one it can find
+	const asked = [];
+	const askRun = await run(defaultRuleHandler({ entries: asked }), makeReq({ command: "wipefs /dev/sdb" }));
+	assert.equal(askRun.outcome, "unavailable");
+	assert.equal(asked[0].action, "ask", JSON.stringify(asked[0]));
+	for (const command of ["wipefs -a /dev/sdb", "wipefs --all /dev/sdb"]) {
+		const { outcome } = await run(defaultRuleHandler(), makeReq({ command }));
+		assert.equal(outcome, "rejected", `must be denied: ${command}`);
+	}
+});
+
+test("P1: content destruction asks a human", async () => {
+	// Irreversible for the bytes, but no subtree goes with it, so a human
+	// decides rather than the request being refused.
+	const entries = [];
+	const handler = defaultRuleHandler({ entries });
+	for (const [toolName, command] of [
+		["bash", "truncate -s 0 data.db"],
+		["bash", "shred -u secret.key"],
+		["bash", "unlink file.txt"],
+		["bash", "cp /dev/null data.db"],
+		["bash", "dd if=/dev/zero of=data.db bs=1M count=1"],
+		["bash", "> data.db"],
+		["bash", ": > data.db"],
+		["bash", "find . -name '*.log' -delete"],
+		["bash", "rsync -a --delete ./src/ /mnt/backup/"],
+		["bash", "git stash drop"],
+		["bash", 'psql -c "DROP TABLE users"'],
+		["bash", "redis-cli FLUSHALL"],
+		["bash", "userdel -r olduser"]
+	]) {
+		entries.length = 0;
+		const { outcome } = await run(handler, makeReq({ toolName, command }));
+		assert.equal(outcome, "unavailable", `a human must confirm: ${command}`);
+		assert.equal(entries[0].kind, "rule", `${command}: ${JSON.stringify(entries[0])}`);
+		assert.equal(entries[0].action, "ask", command);
+	}
+	// a plain write through a redirection is not a truncation
+	entries.length = 0;
+	await run(handler, makeReq({ command: "echo done > build.log" }));
+	assert.notEqual(entries[0].kind, "rule", JSON.stringify(entries[0]));
+});
+
+test("normalizeConfig: flagGuard is a strictness guard and takes no pattern", () => {
+	// it can only ever add strictness: on an `allow` it would authorize the very
+	// shape it exists to catch
+	assert.throws(() => normalizeConfig({ rules: [{ tool: "bash", flagGuard: "recursive-delete", action: "allow" }] }), /flagGuard is a strictness guard/);
+	assert.throws(() => normalizeConfig({ rules: [{ tool: "bash", flagGuard: "recursive-delete", pattern: ["rm"], action: "ask" }] }), /takes no pattern/);
+	assert.throws(() => normalizeConfig({ rules: [{ tool: "bash", flagGuard: "nonsense", action: "ask" }] }), /flagGuard must be one of/);
+	assert.throws(() => normalizeConfig({ rules: [{ tool: "bash", flagGuard: "recursive-delete", pathGuard: "workspace-relative", action: "ask" }] }), /does not combine/);
+	// the shape the default rules use is accepted
+	assert.ok(normalizeConfig({ rules: [{ tool: "bash", flagGuard: "recursive-delete", action: "ask" }] }).rules.length > 0);
+});
+
+test("normalizeConfig: caseSensitive and unless are glob options with a direction", () => {
+	// both tune a glob rule; neither may widen an approval or reach a structured
+	// rule, whose argv comparison is already exact
+	assert.throws(() => normalizeConfig({ rules: [{ match: "*x*", action: "deny", caseSensitive: "yes" }] }), /caseSensitive must be a boolean/);
+	assert.throws(() => normalizeConfig({ rules: [{ match: "*x*", action: "allow", unless: "*y*" }] }), /can only narrow a deny\/ask rule/);
+	assert.throws(() => normalizeConfig({ rules: [{ match: "*x*", action: "deny", unless: [] }] }), /unless must be a non-empty string/);
+	assert.throws(() => normalizeConfig({ rules: [{ match: "*x*", action: "deny", unless: [1] }] }), /unless must be a non-empty string/);
+	assert.throws(() => normalizeConfig({ rules: [{ tool: "bash", pattern: ["ls"], action: "deny", unless: "*y*" }] }), /does not apply to a structured rule/);
+	assert.throws(() => normalizeConfig({ rules: [{ tool: "bash", pattern: ["ls"], action: "deny", caseSensitive: true }] }), /does not apply to a structured rule/);
+	// the accepted shapes keep their fields through normalization
+	const cfg = normalizeConfig({
+		rules: [
+			{ match: "*git branch -D *", action: "deny", caseSensitive: true },
+			{ match: "*git restore*", action: "deny", unless: ["*--staged*"] }
+		]
+	});
+	assert.equal(cfg.rules[0].caseSensitive, true);
+	assert.deepEqual(cfg.rules[1].unless, ["*--staged*"]);
+});
+
 test("P2: an inline numeric switch value is not mistaken for a path", async () => {
 	for (const command of ["Get-Content -ReadCount:0 README.md", "Get-Content -Tail:5 README.md"]) {
 		const { outcome } = await run(defaultRuleHandler(), makeReq({ toolName: "pwsh", command }));
@@ -1942,7 +2268,8 @@ test("P2: sudo option forms and the remaining raw devices are covered", async ()
 
 
 test("handler: a bash escalation reaches the judge and the audit with cwd, workdir and escalation", async () => {
-	const cfg = baseConfig({ rules: [] });
+	// 显式 off：这条断言的是请求 JSON 本体，默认 short 会在前面加 Context 块。
+	const cfg = baseConfig({ rules: [], transcript: "off" });
 	const records = [];
 	const seen = [];
 	const events = [{
@@ -1985,7 +2312,7 @@ test("handler: a bash escalation reaches the judge and the audit with cwd, workd
 });
 
 test("handler: the agent's escalation justification is redacted before the judge sees it", async () => {
-	const cfg = baseConfig({ rules: [] });
+	const cfg = baseConfig({ rules: [], transcript: "off" });
 	const seen = [];
 	const events = [{
 		type: "assistant/message",
@@ -2019,7 +2346,7 @@ test("handler: the agent's escalation justification is redacted before the judge
 });
 
 test("handler: a plain shell call carries no escalation facts", async () => {
-	const cfg = baseConfig({ rules: [] });
+	const cfg = baseConfig({ rules: [], transcript: "off" });
 	const records = [];
 	const seen = [];
 	const req = makeReq({ callId: "call-plain", command: "ls -la" });
@@ -2171,8 +2498,8 @@ test("handler: a failed evidence round keeps the first verdict and says so", asy
 
 test("handler: a hardAsk rule marks the verdict and ai-auto cannot resolve it", async () => {
 	const records = [];
-	// ai-auto is configured to allow every ask — the red line must ignore that.
-	const cfg = baseConfig({ mode: "ai-auto", mode3OnAsk: "allow", rules: [{ match: "Bash(git push*)", action: "ask", hardAsk: true }], ai: { enabled: false } });
+	// 无人值守下红条一律 deny：`mode3OnAsk` 与 `hardAskOnUnattended` 都已写死 deny。
+	const cfg = baseConfig({ mode: "ai-auto", rules: [{ match: "Bash(git push*)", action: "ask", hardAsk: true }], ai: { enabled: false } });
 	const handler = createHandler({ config: cfg, record: async (entry) => { records.push(entry); }, llmRunner: async () => ({ ok: false, error: "AI must not run" }) });
 	const { outcome } = await run(handler, makeReq({ callId: "call-hard", command: "git push origin main" }));
 	assert.equal(outcome, "rejected");
@@ -2182,12 +2509,12 @@ test("handler: a hardAsk rule marks the verdict and ai-auto cannot resolve it", 
 	assert.equal(entry.viaAskResolution, true);
 });
 
-test("handler: the same ai-auto config does resolve a plain ask rule", async () => {
+test("handler: a plain ask rule lands on the same deny in ai-auto, without the red-line marker", async () => {
 	const records = [];
-	const cfg = baseConfig({ mode: "ai-auto", mode3OnAsk: "allow", rules: [{ match: "Bash(git status*)", action: "ask" }], ai: { enabled: false } });
+	const cfg = baseConfig({ mode: "ai-auto", rules: [{ match: "Bash(git status*)", action: "ask" }], ai: { enabled: false } });
 	const handler = createHandler({ config: cfg, record: async (entry) => { records.push(entry); }, llmRunner: async () => ({ ok: false, error: "AI must not run" }) });
 	const { outcome } = await run(handler, makeReq({ callId: "call-plain-ask", command: "git status" }));
-	assert.equal(outcome, "allowed-once"); // mode3OnAsk: allow
+	assert.equal(outcome, "rejected"); // mode3OnAsk 写死 deny
 	const entry = records.at(-1);
 	assert.equal("hardAsk" in entry, false);
 });
@@ -2202,12 +2529,14 @@ test("handler: in ai mode a hardAsk rule still asks the human", async () => {
 	assert.equal(records.at(-1).hardAsk, true);
 });
 
-test("handler: hardAskOnUnattended can keep a red line waiting for a human", async () => {
+test("handler: a red line is denied in ai-auto and hardAskOnUnattended is not configurable", async () => {
 	const records = [];
-	const cfg = baseConfig({ mode: "ai-auto", mode3OnAsk: "allow", rules: [{ match: "Bash(git push*)", action: "ask", hardAsk: true }], ai: { enabled: false, hardAskOnUnattended: "ask" } });
+	// 写死 deny：显式配 deny 合法，配 ask/allow 会在装配期抛错（见 normalizeConfig 测试）。
+	assert.throws(() => baseConfig({ mode: "ai-auto", ai: { hardAskOnUnattended: "ask" } }), TypeError);
+	const cfg = baseConfig({ mode: "ai-auto", rules: [{ match: "Bash(git push*)", action: "ask", hardAsk: true }], ai: { enabled: false, hardAskOnUnattended: "deny" } });
 	const handler = createHandler({ config: cfg, record: async (entry) => { records.push(entry); }, llmRunner: async () => ({ ok: false, error: "AI must not run" }) });
 	const { outcome } = await run(handler, makeReq({ callId: "call-hard-wait", command: "git push" }));
-	assert.equal(outcome, "unavailable");
+	assert.equal(outcome, "rejected");
 	assert.equal(records.at(-1).hardAsk, true);
 });
 
@@ -2224,10 +2553,12 @@ test("default rules: publishing and credential paths are red lines, .dsh is not"
 	}
 });
 
-test("normalizeConfig: hardAskOnUnattended only accepts deny/ask", () => {
+test("normalizeConfig: hardAskOnUnattended only accepts deny (fixed red line)", () => {
 	assert.equal(normalizeConfig({}).ai.hardAskOnUnattended, "deny");
-	assert.equal(normalizeConfig({ ai: { hardAskOnUnattended: "ask" } }).ai.hardAskOnUnattended, "ask");
-	// "allow" is not a legal value anywhere: a red line is never auto-granted.
+	assert.equal(normalizeConfig({ ai: { hardAskOnUnattended: "deny" } }).ai.hardAskOnUnattended, "deny");
+	// 写死：ask 与 allow 都在装配期被拒。「ask」的语义是无人值守时无限等待，
+	// 既不是拒绝也不是授权，同样不许配。
+	assert.throws(() => normalizeConfig({ ai: { hardAskOnUnattended: "ask" } }), /hardAskOnUnattended/);
 	assert.throws(() => normalizeConfig({ ai: { hardAskOnUnattended: "allow" } }), /hardAskOnUnattended/);
 	assert.throws(() => normalizeConfig({ ai: { evidenceMaxFiles: 0 } }), /evidenceMaxFiles/);
 	assert.throws(() => normalizeConfig({ ai: { evidenceFetch: "all" } }), /evidenceFetch/);
@@ -2522,7 +2853,7 @@ test("handler: a judge's refusal of a plain command keeps the plain directive", 
 // ---------- 独立审核（codex, round 5）的六条 findings 回归 ----------
 
 test("handler: an enforced policy ask is not resolved by mode3OnAsk (finding 1)", async () => {
-	const cfg = baseConfig({ mode: "ai-auto", mode3OnAsk: "allow", rules: [] });
+	const cfg = baseConfig({ mode: "ai-auto", rules: [] });
 	const records = [];
 	let calls = 0;
 	const handler = createHandler({
@@ -2533,23 +2864,25 @@ test("handler: an enforced policy ask is not resolved by mode3OnAsk (finding 1)"
 	});
 	const { outcome } = await run(handler, makeReq({ callId: "enf1", command: "bash deploy.sh" }));
 	assert.equal(calls, 1);
-	assert.equal(outcome, "rejected", "mode3OnAsk: allow must not grant a high-risk action nobody authorized");
+	assert.equal(outcome, "rejected", "a high-risk action nobody authorized is never granted by a mode switch");
 	const entry = records.at(-1);
 	assert.equal(entry.policy, "high-risk-insufficient-authorization");
 	assert.equal(entry.enforced, true);
 	assert.equal(entry.viaAskResolution, true);
 });
 
-test("handler: an enforced ask still follows its own knob, not the generic one (finding 1)", async () => {
-	const cfg = baseConfig({ mode: "ai-auto", mode3OnAsk: "allow", rules: [], ai: { enforcedAskOnUnattended: "ask" } });
+test("handler: an enforced ask follows its own fixed knob, not the generic one (finding 1)", async () => {
+	// `enforcedAskOnUnattended` 写死 deny：旧配置里的 ask 在装配期就被拒。
+	assert.throws(() => baseConfig({ mode: "ai-auto", rules: [], ai: { enforcedAskOnUnattended: "ask" } }), TypeError);
+	const cfg = baseConfig({ mode: "ai-auto", rules: [] });
 	const handler = createHandler({
 		config: cfg,
 		record: async () => {},
 		llmRunner: async () => ({ ok: true, text: '{"risk":"high","authorization":"allow","reason":"x"}' })
 	});
 	const { outcome, nextCalls } = await run(handler, makeReq({ callId: "enf2", command: "bash deploy.sh" }));
-	assert.equal(outcome, "unavailable"); // deferred to the human chain
-	assert.equal(nextCalls.length, 1);
+	assert.equal(outcome, "rejected");
+	assert.equal(nextCalls.length, 0);
 });
 
 test("normalizeConfig: hardAsk is only meaningful on an ask rule (finding 2)", () => {
@@ -2565,6 +2898,7 @@ test("normalizeConfig: hardAsk is only meaningful on an ask rule (finding 2)", (
 	assert.equal(normalizeConfig({ rules: [{ tool: "bash", pattern: ["git", "push"], action: "ask", hardAsk: true }] }).rules[0].hardAsk, true);
 	assert.equal(normalizeConfig({ ai: { enforcedAskOnUnattended: "deny" } }).ai.enforcedAskOnUnattended, "deny");
 	assert.throws(() => normalizeConfig({ ai: { enforcedAskOnUnattended: "allow" } }), /enforcedAskOnUnattended/);
+	assert.throws(() => normalizeConfig({ ai: { enforcedAskOnUnattended: "ask" } }), /enforcedAskOnUnattended/);
 });
 
 test("handler: the second round is told which files were refused (finding 4)", async () => {
@@ -2784,7 +3118,10 @@ test("fetchEvidence: a hung resolver is bounded by the approval deadline (findin
 });
 
 test("handler: the judge and the audit get the command's structured facts", async () => {
-	const cfg = baseConfig({ rules: [] });
+	// 这条只测 facts 的传递与落盘，所以显式关掉会话骨架：默认（2026-10-06 起）
+	// transcript=short 会在 user 消息前加 Context 块，这里断言的是请求 JSON 本体。
+	// 上下文块本身由 transcript 相关用例覆盖。
+	const cfg = baseConfig({ rules: [], transcript: "off" });
 	const seen = [];
 	const records = [];
 	const handler = createHandler({

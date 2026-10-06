@@ -12,11 +12,11 @@ approval/request 到达（toolName + callId + reason）
 ├─ 2. 形状判定（shell-shape.js，bash/pwsh）：simple（单条纯命令）/ compound（安全分隔符串联）/ opaque（重定向、替换、变量、通配、控制流…）
 │     只有 simple 才可能被 allow 规则放行；compound/opaque 一律交规则 ask/deny → AI/人类
 ├─ 3. 证据门槛：参数缺失或命令超 ai.maxJudgeCommandChars → 标记 evidence-incomplete，**不问 AI**
-│      ai → 交人类；ai-auto → 拒绝（mode3OnAsk=allow 也不能放行）
+│      ai → 交人类；ai-auto → 拒绝（无人值守时任何开关都不能放行）
 ├─ 4. 规则层（deny > ask > allow，命中即定，0ms）
 │     deny → 直接拒绝（AI 无权覆盖）│ allow → 静默放行 │ ask → 交人类
 │     标了 hardAsk 的 ask 是**红条**（发布、凭据）：ai-auto 下不走 mode3OnAsk，
-│     改由 ai.hardAskOnUnattended 决定（默认 deny）
+│     改由 ai.hardAskOnUnattended 决定（写死 deny，不可配）
 ├─ 4b. 会话级闸门（仅在规则未命中、且证据完整时求值）
 │     一次性人工授权（/approval-allow-once）命中 → 直接放行一次（规则 deny 不可能到此）
 │     否则熔断冷却中 → 直接拒绝（breaker: cooldown）│ 同动作被拒达阈 → 拒绝（breaker: duplicate-action）
@@ -51,12 +51,17 @@ approval/request 到达（toolName + callId + reason）
 
 ### ① glob（文本匹配）
 
-匹配对象（任一表面命中即中，大小写不敏感）：
+匹配对象（任一表面命中即中，默认大小写不敏感）：
 
 - `ToolName(args preview)` — 如 `Bash(git status)`（bash/pwsh 为原始命令）
 - `reason:<文本>` — 审批 reason（如沙箱升级的 justification）
 
 通配：`*` 任意序列、`?` 单字符。
+
+两个可选字段调这条 glob 本身：
+
+- **`caseSensitive: true`**：不做大小写折叠。为 `git branch -D` 与 `git branch -d` 而设——前者丢弃可能含未合并提交的分支，后者 git 自己会拒绝，默认折叠会把两者合成一条规则。注意：默认规则里 `Bash(` 前缀的写法之所以成立，靠的就是折叠（真实工具名是 `bash`），所以一条 `caseSensitive` 规则要锚在命令文本上（`*git branch -D *`），不要再带工具前缀
+- **`unless: <模式 | 模式数组>`**：规则自己的例外，命中的表面**否决**这条规则、继续求值下一条。它只能让 deny/ask 规则**变窄**（标在 `allow` 上、或与结构化规则同用时装配期报错），所以它表达的是「除了这个形态」而不是「放宽」：默认规则用 `unless: "Bash(*git restore --staged*)"` 让 `git restore` 保持拒绝、只把「只动索引」的 `--staged` 形态留给 AI 判定。`unless` 与规则本身扫同一批表面，`caseSensitive` 同样作用于它。**组合形态要单独写**：`git restore --staged --worktree`（确实丢弃工作区内容）无法被 `unless` 看穿，靠一条写在它**前面**的窄 deny 拦住——同优先级规则按列表顺序取首个
 
 **规则匹配字符，shell 匹配 token，两者会在引号或空格拼接处错开。** 因此除原始文本外，规则还会扫几个还原面：
 
@@ -68,7 +73,7 @@ approval/request 到达（toolName + callId + reason）
 
 优先级：**deny > ask > allow**（与列表顺序无关）；同优先级内按列表顺序取首个。
 
-`ask` 规则可以再标 `hardAsk: true`（文本与结构化规则都支持），把它升级成**红条**：这是一条「必须本人签字」的询问，`ai-auto` 下不走 `mode3OnAsk`，而由 `ai.hardAskOnUnattended` 决定（默认拒绝）。默认规则里发布命令与凭据路径都标了红条；`.dsh/*` 不标（要常用 dsh 修 dsh）。
+`ask` 规则可以再标 `hardAsk: true`（文本与结构化规则都支持），把它升级成**红条**：这是一条「必须本人签字」的询问，`ai-auto` 下不走 `mode3OnAsk`，而由 `ai.hardAskOnUnattended` 决定（**写死 deny，不可配**）。默认规则里发布命令与凭据路径都标了红条；`.dsh/*` 不标（要常用 dsh 修 dsh）。
 
 ### ② 结构化 argv 前缀（仿 Codex `prefix_rule`）
 
@@ -82,6 +87,21 @@ approval/request 到达（toolName + callId + reason）
 ```
 
 `pathGuard` 的判定是静态检查 + `realpath` 复核，避免符号链接逃逸。"路径参数"包括 `--` 终止符之后的每一项（`cat -- -x` 的 `-x` 是路径，不是选项），也包括内联在选项里的值（`-Path:..\secret`、`--file=/etc/passwd`）——PowerShell 的参数名与值可以用空格或冒号分隔，两种写法等价。**不以 `-` 开头的不一定是路径、以 `-` 开头的也不一定是选项**：只有形如 `-n` / `--output` / `-Path` 的选项**名**会被跳过，`'-/../../x'` 这种带引号的参数值、裸 `-` 都会照常送检；内联值里只有具名计数开关（`-ReadCount:`/`-TotalCount:`/`-Tail:` + 数字或布尔）不算路径。引号的位置同样有语义：`-Path:'link'` 里引号紧跟选项名与分隔符，真正的值是 `link`；`'--file=link'` 整词被引号包裹，整串就是路径——两者分别按各自的值去送 realpath。
+
+### ②b 语义 guard（无 pattern，按 argv 判定）
+
+```yaml
+- tool: bash                    # 只对该工具生效
+  flagGuard: recursive-delete   # 该段的 argv 是一条「递归删除」才命中
+  action: ask
+```
+
+`flagGuard` 不看文本，看识别器重建的 argv——因为**短选项打包是文本规则看不见的**：`rm -rf` / `rm -fr` / `rm -r -f` / `rm -rvf` 是同一个命令，却是四个不同的字符串，glob 要把每个打包的每个字母排列都列出来，多一个字母（`-rvif`）就漏。判定把打包拆开（`-rvf` → `r`、`v`、`f`），找递归开关（`-r` / `-R` / `--recursive`）：**递归才是判据**，`-f` 只决定只读文件会不会拦住它，对可写目录树 `rm -r dir` 与 `rm -rf dir` 没有区别。pwsh 侧同一问题换拼法：`Remove-Item`（含 `rm` / `rd` / `rmdir` / `ri` / `del` / `erase` 别名）的 `-Recurse`，PowerShell 接受参数名的任意唯一前缀（`-r` / `-rec` / …）。
+
+- **每段都查**：`cd pkg && rm -rvf dist` 的 rm 段同样命中
+- **opaque 命令没有 argv**（`rm -rf $DIR/x`、`rm -rf "$(cat target)"`）：guard 一声不响，靠旁边的字面规则（`Bash(*rm -rf*)`）兜住——两者是配合关系，不是冗余
+- **只加严格性**：`flagGuard` 标在 `allow` 上、或与 `pattern` / `forbidOptions` / `pathGuard` / `configGuard` 同时出现，装配期直接报错
+- 目前只有 `recursive-delete` 一个取值；审计与拒绝反馈里记作 `Bash(flagGuard:recursive-delete)`
 
 `configGuard: "git-clean"` 读取 `<工作区>/.git/config` 与 `.git/config.worktree`（`extensions.worktreeConfig` 开启时的第二份配置），命中任一条就不放行：`external` / `command` / `textconv` 键（段头独占一行或与键同行的写法都算）、`gpg`（`gpg.program`，签名校验时执行）、`[include]` / `[includeIf]` / `include.path`（被包含的文件读不到，无法核验）、`fsmonitor` 的值不是 `true`/`false`/`0`（非布尔即路径或命令行；值按引号语法解析——`"false"` 是布尔，`"true; exec evil"` 是命令行）。**读不出来就不放行**：只有 `ENOENT`/`ENOTDIR` 才算"没有配置"，权限或 I/O 失败一律视为无法核验。这些键让一条只读命令**无需任何开关**就执行别处指定的程序；`.git` 是 worktree/submodule 的指针文件时同样不放行（配置在读不到的地方）。用户级 `~/.gitconfig` 不在检查范围：那是使用者自己的环境，不是请求能影响的东西。
 
@@ -120,14 +140,16 @@ bash/pwsh 的 **allow 规则只在命令被 `shell-shape.js` 判定为 `simple`*
 
 容忍度**不是**「自动放行上限」：它决定裁判判 `ask` 时的落点，而裁判判 `allow` 时还要看风险档位与用户授权。
 
-三条交人工的分支（`high-risk-insufficient-authorization`、`judge-allow-above-tolerance`、`ask-without-authorization`）带 `enforced: true` 标记，含义是「用户没有授权」，不是「裁判拿不准」。`ai-auto` 下最终落到 `ask` 的动作按来源分三路，**都不能被 `mode3OnAsk: allow` 放行**：
+三条交人工的分支（`high-risk-insufficient-authorization`、`judge-allow-above-tolerance`、`ask-without-authorization`）带 `enforced: true` 标记，含义是「用户没有授权」，不是「裁判拿不准」。`ai-auto` 下最终落到 `ask` 的动作按来源分四路，**四路的归宿都写死 `deny`，没有开关**：
 
 | 来源 | 归宿 |
 |---|---|
 | 证据不足（`evidence-incomplete`） | 固定拒绝 |
-| 规则红条（`hardAsk`） | `ai.hardAskOnUnattended`（默认拒绝） |
-| 策略强制人工（`enforced`） | `ai.enforcedAskOnUnattended`（默认拒绝） |
-| 裁判拿不准（普通 `judge-ask` 超档） | `mode3OnAsk`（默认拒绝，可设为放行——这是「拿不准就放行」的显式选择） |
+| 规则红条（`hardAsk`） | `ai.hardAskOnUnattended`（写死 deny） |
+| 策略强制人工（`enforced`） | `ai.enforcedAskOnUnattended`（写死 deny） |
+| 裁判拿不准（普通 `judge-ask` 超档） | `mode3OnAsk`（写死 deny） |
+
+无人值守时「非 `deny`」等价于「直接给这次调用完全权限」（`ask` 在 `ai-auto` 下还会被别的分支吸收），所以这四项都不接受配置：要放开权限请改宿主的权限档位（完全权限 / 无沙箱），而不是拆掉审批闸门上的红线。
 
 用户授权强度（`user_authorization`）由裁判给出：`strong` = 用户在本会话里用自己的话要求了这条动作或这个确切目标；`weak` = 用户要求过相近的事，但目标、范围或副作用不同；`none` = 没有用户请求覆盖它。agent 自己写的 reason 与提权理由**永远不算**用户授权；字段缺失时按「不是 strong」处理。
 
@@ -191,7 +213,7 @@ bash/pwsh 的 **allow 规则只在命令被 `shell-shape.js` 判定为 `simple`*
 
 ## 会话上下文（transcript）
 
-`transcript: "off"`（默认）= 零上下文判定（仅命令本体）；`transcript: "short"` = AI 审判带紧凑上下文，可判断"用户明确要求的操作应放行"（意图优先）。
+`transcript: "short"`（默认，2026-10-06 起）= AI 审判带紧凑上下文，可判断"用户明确要求的操作应放行"（意图优先）；`transcript: "off"` = 零上下文判定（仅命令本体，token 更省，但已经交代过的动作更容易被当成无授权而来打断人）。
 
 开启后追加 **Context 块**（紧凑会话骨架，≤ `transcriptMaxChars` 字符）——两级窗口：
 

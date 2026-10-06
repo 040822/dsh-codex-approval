@@ -117,7 +117,8 @@ export function collectSemanticItems(events) {
 		const type = event.type;
 		if (type === "user/message") {
 			const source = event.data?.source;
-			if (source?.kind === "plugin") continue; // never feed injections back
+			const kind = source?.kind;
+			if (kind === "plugin" || (typeof kind === "string" && kind.startsWith("plugin:"))) continue; // never feed injections back
 			const text = userText(event.data);
 			if (text === "") continue;
 			items.push({ seq: items.length, kind: "user", text, time: event.time });

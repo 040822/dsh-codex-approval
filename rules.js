@@ -7,10 +7,15 @@
  *   legacy (glob over the text):
  *     { match: "Bash(git status*)", action: "allow" }
  *     { match: "Bash(npm publish*)", action: "ask" }
+ *     { match: "Bash(git branch -D *)", action: "deny", caseSensitive: true }
+ *     { match: "Bash(*git restore*)", action: "deny", unless: "Bash(*git restore --staged*)" }
  *   structured (argv prefix, Codex `prefix_rule` style):
  *     { tool: "bash", pattern: ["git", "status"], action: "allow" }
  *     { tool: "bash", pattern: ["git", "diff"], action: "allow", forbidOptions: ["--output", "-O"] }
  *     { tool: "bash", pattern: ["cat"], action: "allow", pathGuard: "workspace-relative" }
+ *   structured, semantic (no pattern — judged on the argv itself):
+ *     { tool: "bash", flagGuard: "recursive-delete", action: "ask" }
+ *     { tool: "pwsh", flagGuard: "recursive-delete", action: "ask" }
  *
  * Evaluation priority is safety-first regardless of list order:
  *   deny  >  ask  >  allow
@@ -42,14 +47,28 @@ import {
 	forbiddenOptionHit,
 	isShellTool,
 	isWorkspaceRelativePath,
-	positionalArgs
+	positionalArgs,
+	recursiveDeleteFlags
 } from "./shell-shape.js";
 
-/** Classic glob match: `*` = any sequence (incl. empty), `?` = one char. Case-insensitive. */
-export function wildcardMatch(pattern, text) {
+/**
+ * Classic glob match: `*` = any sequence (incl. empty), `?` = one char.
+ *
+ * Case-insensitive by default, because a rule is written to describe a command
+ * and the shell's own spelling varies (`RM -RF` is `rm -rf`). `caseSensitive`
+ * exists for the opposite need: `git branch -D` and `git branch -d` are
+ * different commands — one discards unmerged commits, the other refuses to —
+ * and only a case-sensitive match can keep them apart.
+ * @param pattern - the rule's glob
+ * @param text - one match surface
+ * @param caseSensitive - match letter-for-letter instead of folding case
+ */
+export function wildcardMatch(pattern, text, caseSensitive = false) {
 	if (typeof pattern !== "string" || typeof text !== "string") return false;
-	pattern = pattern.toLowerCase();
-	text = text.toLowerCase();
+	if (caseSensitive !== true) {
+		pattern = pattern.toLowerCase();
+		text = text.toLowerCase();
+	}
 	let pi = 0;
 	let ti = 0;
 	let star = -1;
@@ -232,13 +251,20 @@ function unique(surfaces) {
 	return [...new Set(surfaces)];
 }
 
-/** Whether a rule is the structured (argv-prefix) form. */
+/** Every `flagGuard` this build understands. */
+export const FLAG_GUARDS = Object.freeze(["recursive-delete"]);
+
+/**
+ * Whether a rule is the structured (argv-prefix) form — including the semantic
+ * `flagGuard` form, which carries no `pattern` because it is judged on the argv
+ * rather than on a text prefix.
+ */
 export function isStructuredRule(rule) {
 	return rule !== null
 		&& typeof rule === "object"
 		&& typeof rule.tool === "string"
 		&& rule.tool !== ""
-		&& Array.isArray(rule.pattern);
+		&& (Array.isArray(rule.pattern) || typeof rule.flagGuard === "string");
 }
 
 /**
@@ -251,6 +277,7 @@ export function ruleLabel(rule) {
 	if (typeof rule.match === "string") return rule.match;
 	if (isStructuredRule(rule)) {
 		const tool = rule.tool.toLowerCase() === "bash" ? "Bash" : rule.tool.toLowerCase() === "pwsh" ? "Pwsh" : rule.tool;
+		if (typeof rule.flagGuard === "string") return `${tool}(flagGuard:${rule.flagGuard})`;
 		return `${tool}(${rule.pattern.join(" ")}${rule.pattern.length > 0 ? "*" : ""})`;
 	}
 	return "";
@@ -271,6 +298,7 @@ export function allowEligible(toolName, opts) {
 function matchesStructured(rule, req, opts) {
 	const toolName = String(req.toolName ?? "").toLowerCase();
 	if (toolName !== rule.tool.toLowerCase()) return false;
+	if (rule.flagGuard !== void 0) return matchesFlagGuard(rule, req.toolName, opts);
 	const argv = opts?.argv;
 	if (!Array.isArray(argv)) return false;
 	if (argv.length < rule.pattern.length) return false;
@@ -283,6 +311,57 @@ function matchesStructured(rule, req, opts) {
 		if (!args.every((arg) => isWorkspaceRelativePath(arg))) return false;
 	}
 	return true;
+}
+
+/**
+ * The `flagGuard` form: no pattern, judged on the argv the recognizer built.
+ *
+ * It exists because a text rule cannot see the *meaning* of a bundled short
+ * option: `rm -rvf ./x` and `rm -rf ./x` are one command, but as text they are
+ * two strings, so a glob list has to enumerate every letter of every bundle in
+ * every order (and loses to `-rvif`). `recursiveDeleteFlags` splits the bundle
+ * instead, and this rule fires on the meaning.
+ *
+ * Every part of a compound command is checked (`cd pkg && rm -rvf dist`), and
+ * an opaque command — no argv to inspect — simply does not match here; that is
+ * what the `Bash(*rm -rf*)` text rules next to it in the default list are for.
+ * `flagGuard` is a safety-side guard by design: `assertConfig` refuses it on an
+ * `allow` rule, so it can only add strictness.
+ *
+ * @param rule - a structured rule carrying `flagGuard`
+ * @param toolName - the request's tool name
+ * @param opts - { argv, parts } from shell-shape.classifyCommand
+ */
+function matchesFlagGuard(rule, toolName, opts) {
+	if (rule.flagGuard !== "recursive-delete") return false;
+	const parts = Array.isArray(opts?.parts) ? opts.parts : Array.isArray(opts?.argv) ? [opts.argv] : [];
+	for (const part of parts) {
+		const flags = recursiveDeleteFlags(part, toolName);
+		if (flags !== null && flags.recursive) return true;
+	}
+	return false;
+}
+
+/**
+ * Whether any `unless` pattern hits any surface.
+ *
+ * The exception is resolved against the same surfaces the rule itself matched,
+ * so a `deny` on `Bash(*git restore*)` with `unless: "Bash(*git restore
+ * --staged*)"` also lets the folded and bare surfaces speak.
+ * @param unless - a pattern or list of patterns, or undefined
+ * @param surfaces - the surfaces in play for this rule's action
+ * @param caseSensitive - passed through from the rule
+ */
+function unlessHits(unless, surfaces, caseSensitive) {
+	if (unless === void 0) return false;
+	const patterns = Array.isArray(unless) ? unless : [unless];
+	for (const pattern of patterns) {
+		if (typeof pattern !== "string" || pattern === "") continue;
+		for (const surface of surfaces) {
+			if (wildcardMatch(pattern, surface, caseSensitive)) return true;
+		}
+	}
+	return false;
 }
 
 /**
@@ -299,6 +378,11 @@ function matchesStructured(rule, req, opts) {
  * (2) and (3) only ever *add* candidates, so a rule that matched before still
  * matches; they close the gap between "what the text says" and "what the shell
  * runs" on the fail-safe side.
+ *
+ * Two per-rule options tune the glob itself:
+ *   - `caseSensitive: true` folds nothing — `git branch -D` ≠ `git branch -d`;
+ *   - `unless: <pattern|patterns>` is the rule's own exception, and it can only
+ *     narrow a deny/ask rule (`assertConfig` refuses it on an allow).
  * @param rules - ordered rule list (legacy `{match}` and/or structured forms)
  * @param req - { toolName, argsText, reason }
  * @param opts - { shape, argv, parts } from shell-shape.classifyCommand; a shell
@@ -333,8 +417,17 @@ export function evaluateRules(rules, req, opts = {}) {
 				continue;
 			}
 			if (typeof rule.match !== "string") continue;
+			const caseSensitive = rule.caseSensitive === true;
 			for (const surface of surfaces) {
-				if (wildcardMatch(rule.match, surface)) return rule;
+				if (!wildcardMatch(rule.match, surface, caseSensitive)) continue;
+				// `unless` is the rule's own exception: when it hits, this rule does
+				// not claim the request and evaluation moves on. It can only make a
+				// deny/ask rule *narrower* (`assertConfig` refuses it on an allow),
+				// which is what lets `git restore` stay denied while its `--staged`
+				// form — index only, nothing discarded from the working tree — is
+				// left to the judge.
+				if (unlessHits(rule.unless, surfaces, caseSensitive)) continue;
+				return rule;
 			}
 		}
 	}

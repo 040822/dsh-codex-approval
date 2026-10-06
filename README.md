@@ -61,7 +61,7 @@ dsh plugin --profile web add dsh-codex-approval
 | **无人值守** | 不弹窗等待，需要确认的操作默认拒绝 | `/approval-mode ai-auto` |
 | **人工审批** | 暂停插件的自动审批，交回 DSH 处理 | `/approval-mode manual` |
 
-切换只影响当前会话。输入 `/approval-mode` 查看当前模式，输入 `/approval-mode default` 恢复配置中的默认模式。
+切换只影响当前会话。输入 `/approval-mode` 查看当前模式，输入 `/approval-mode default` 恢复配置中的默认模式——**默认模式本身可以在 Web 设置卡片里选**（设置 → Codex 审批 → 默认审批模式），改完即时生效，不用重启 `dsh web`。
 
 无人值守模式适合不方便随时回应的长任务。遇到被拒绝的操作，Agent 仍需要调整方案；它不保证每个任务都能自动完成。
 
@@ -86,7 +86,9 @@ dsh plugin --profile web add dsh-codex-approval
 例如，在默认的日常模式下，如果这些 Bash 命令触发审批：
 
 - `git status`：常见只读操作，内置规则直接放行。
-- `npm publish`、`git push`：发布操作属于**红条**，必须你本人确认；无人值守时按你的设置直接拒绝（默认），不会被「无人值守就放行」的开关覆盖。
+- `npm publish`、`git push`：发布操作属于**红条**，必须你本人确认；无人值守时**直接拒绝**（写死的策略，没有"无人值守就放行"的开关——要在无人值守时放开权限请改宿主的权限档位）。
+- `rm -rf ./dist`、`Remove-Item -Recurse build`：**递归删除一律交你确认**——工作区是沙箱的写边界，不是备份，删掉的东西不受权限档位保护。`rm -r` 也算，`rm -rvf` 这类打包写法同样命中（判定在 argv 上做，靠拼写绕不过去）；`rm -rf /`、`rm -rf ~/Documents` 这类越界形态则是直接拒绝。
+- `git clean -fdx`、`git reset --hard`、`git branch -D`、`docker system prune -af --volumes`、`kubectl delete ns`、`wipefs -a`：**整体状态删除直接拒绝**——未提交的工作、分支提交、卷、对象存储前缀在别处没有副本，没有一次授权能把它们找回来。日常形态不被牵连：`git branch -d`（只删已合并分支）、`git restore --staged`（只动索引）、`kubectl delete pod`（重启 Pod 就是删它）交给 AI 判，`wipefs -n`（dry run）直接放行。
 - 其他没被规则覆盖的操作：交给 AI 评估——它同时给出风险、它建议的处理方式和**用户授权强度**，最终放行与否由程序按规则算；证据不足时它可以要求读取工作区内的脚本再判断。
 
 你可以自行调整规则。带有重定向、串联执行等复杂写法的命令，会做额外检查，不会仅凭开头看起来是只读命令就按规则放行。

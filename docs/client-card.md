@@ -14,15 +14,18 @@ Web UI → **设置 → 插件 → 插件配置**（英文 `Settings → Plugins
 
 | 项 | 说明 |
 |---|---|
+| **默认审批模式** | `manual` / `ai` / `ai-auto`（配置层的 `mode`）。它是**默认值**：只作用于没有会话覆盖的会话，会话内用 `/approval-mode` 覆盖、`/approval-mode default` 回到它。改动热生效（不重载插件），下一个审批请求就走新模式 |
 | **主模型** | 下拉，按 provider 分组，可用项在前、不可用项标 `⚠` 并置底 |
-| **兜底候选** | 最多 4 项，可增删、可上下移动调序 |
+| **回退模型** | 最多 4 项，可增删、可上下移动调序（按顺序尝试） |
 | **风险容忍度** | `low` / `medium` / `high`；只决定 AI 判 `ask` 时的落点 |
 | **`failOpen`** | AI 全部候选失败时的兜底动作 |
-| **`mode3OnAsk`** | `ai-auto` 下 `ask` 的归宿 |
-| **红条无人值守时** | `ai.hardAskOnUnattended`：发布 / 凭据这类红条在 `ai-auto` 下的归宿（默认拒绝，不受 `mode3OnAsk` 影响） |
+| **上下文** | `transcript`：`off` 关闭（只看本次请求）/ `short` 开启（带用户消息与工具链骨架），**默认 `short`**。改动热生效 |
+| **上下文字符上限** | `transcriptMaxChars`（100–16000） |
 | **超时** | 每个候选各自的超时 |
 | **最大输出 token** | 判定输出上限 |
 | **拒绝反馈开关** | `denyFeedback` |
+
+无人值守的三道红线（`mode3OnAsk`、`ai.hardAskOnUnattended`、`ai.enforcedAskOnUnattended`）**不在表单里**：它们写死 `deny`，patch 里配非 `deny` 会在装配期报错。要在无人值守时放开权限，请改宿主的权限档位（完全权限 / 无沙箱）。
 
 改动后 header 出现「未保存」Tag 并启用「保存 / 放弃」；保存经 settings revision fence 写入并在 Host 侧 live 生效。
 

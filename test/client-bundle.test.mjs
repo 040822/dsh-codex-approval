@@ -225,6 +225,20 @@ function toleranceSelect(tree) {
 			.join(",") === "low,medium,high");
 }
 
+/** The default-approval-mode `<select>`, found by its option values. */
+function modeSelect(tree) {
+	return collectElements(tree)
+		.filter((element) => element.type === "select")
+		.find((select) => collectElements(select)
+			.filter((element) => element.type === "option")
+			.map((option) => option.props.value)
+			.join(",") === "manual,ai,ai-auto");
+}
+
+const optionLabels = (select) => collectElements(select)
+	.filter((element) => element.type === "option")
+	.map((option) => collectText(option.props.children).join(""));
+
 test("bundle: loads, exports inject and registers the settings card", () => {
 	const react = makeReact();
 	const mod = loadBundle(react);
@@ -302,13 +316,26 @@ test("card: is a collapsed plugin card that expands into the full form", () => {
 		.find((element) => String(element.props?.className ?? "").includes("dsh-ca-card"));
 	assert.match(String(openCard?.props.className), /dsh-ca-cardOpen/);
 	assert.match(text, /主模型/);
-	assert.match(text, /兜底候选/);
-	assert.match(text, /添加兜底候选/);
-	assert.match(text, /调用顺序：/);
-	assert.match(text, /cpa-wx301 \/ command\/deepseek\/deepseek-v4\.1-flash → deepseek-official \/ deepseek-flash/);
+	assert.match(text, /回退模型/);
+	assert.match(text, /添加回退模型/);
+	// UI 精简：旧的「兜底候选」与「调用顺序」那行都已删除，钉住它们不再回来。
+	assert.doesNotMatch(text, /兜底候选|未配置兜底/);
+	assert.doesNotMatch(text, /调用顺序/);
 	assert.doesNotMatch(text, /undefined/, `card leaked "undefined": ${text}`);
 
-	assert.equal(collectElements(tree).filter((element) => element.type === "select").length, 7, "primary + 1 fallback + 5 policy selects");
+	assert.equal(collectElements(tree).filter((element) => element.type === "select").length, 6, "primary + 1 fallback + 4 policy selects（默认审批模式 / 风险容忍度 / AI 故障时 / 上下文）");
+	// 默认审批模式进了表单：它是配置层的 `mode`，也是 `/approval-mode default` 的落点。
+	assert.match(text, /默认审批模式/);
+	assert.match(text, /会话内用 \/approval-mode 覆盖/);
+	// 无人值守的三道红线不再有控件、也不再占一段说明文字：它们写死 deny。
+	assert.doesNotMatch(text, /ai-auto 模式下遇到 ask/);
+	assert.doesNotMatch(text, /高风险无授权无人值守时/);
+	assert.doesNotMatch(text, /红条（发布\/凭据）无人值守时/);
+	assert.doesNotMatch(text, /固定拒绝，无开关/);
+	// 判定上下文进了表单，且带字符上限（术语统一为「上下文」，不再叫「会话骨架」）。
+	assert.match(text, /上下文/);
+	assert.match(text, /上下文字符上限/);
+	assert.doesNotMatch(text, /会话骨架/);
 	assert.equal(byClass(tree, "dsh-ca-save").length, 1);
 	assert.equal(byClass(tree, "dsh-ca-discard").length, 1);
 	assert.equal(byClass(tree, "dsh-ca-save")[0].props.disabled, true, "save is disabled until something changes");
@@ -334,6 +361,51 @@ test("card: an edit marks the card unsaved and enables save", () => {
 	assert.equal(collectText(byClass(tree, "dsh-ca-pending")[0]).join(""), "未保存");
 	assert.equal(byClass(tree, "dsh-ca-save")[0].props.disabled, false);
 	assert.equal(byClass(tree, "dsh-ca-discard")[0].props.disabled, false);
+});
+
+test("card: the default approval mode is selectable and saves as one live field", async () => {
+	const react = makeReact();
+	const mod = loadBundle(react);
+	const { component, scope, loadModelCatalog } = mountCard(mod, { value: VALUE });
+	const props = { settingsScope: scope, loadModelCatalog };
+	let tree = expand(react, component, props);
+
+	const select = modeSelect(tree);
+	assert.ok(select !== undefined, "the card renders the default-approval-mode select");
+	// `mode` 是配置层唯一带默认值的 live 标量，未配置时显示内置默认（服务端
+	// `DEFAULT_CONFIG.mode`），与 `/approval-mode default` 的落点一致。
+	assert.equal(select.props.value, "ai", "未配置时显示内置默认 ai");
+
+	// 标签只留名字：括号里的后果说明于 2026-10-06 按要求删除（字段名已经叫
+	// 「默认审批模式」，再写「（默认）」是重复）。完整后果住在 docs/configuration.md
+	// 与 docs/client-card.md；这里反向钉住括号不再回来。
+	const labels = optionLabels(select);
+	assert.equal(labels.length, 3);
+	assert.equal(labels[0], "manual · 仅人工");
+	assert.equal(labels[1], "ai · AI 判定 + 人工兜底");
+	assert.equal(labels[2], "ai-auto · AI 全自动");
+	for (const label of labels) {
+		assert.ok(!label.includes("（"), `${label} 不应再带括号说明`);
+	}
+
+	select.props.onChange({ target: { value: "manual" } });
+	react.__rewind();
+	tree = component(props);
+	assert.equal(modeSelect(tree).props.value, "manual", "草稿立即反映在控件上");
+
+	byClass(tree, "dsh-ca-save")[0].props.onClick();
+	await new Promise((resolve) => setTimeout(resolve, 0));
+	assert.deepEqual(scope.state.mutated, [{ op: "set", path: ["mode"], value: "manual" }],
+		"保存只写 mode 一个字段，路径就是 entry config / 设置命名空间的顶层键");
+});
+
+test("card: an already-configured default mode wins over the display fallback", () => {
+	const react = makeReact();
+	const mod = loadBundle(react);
+	const { component, loadModelCatalog } = mountCard(mod, { value: { ...VALUE, mode: "ai-auto" } });
+	const scope = makeScope({ ...VALUE, mode: "ai-auto" });
+	const tree = expand(react, component, { settingsScope: scope, loadModelCatalog });
+	assert.equal(modeSelect(tree).props.value, "ai-auto");
 });
 
 test("card: catalog options carry availability and the primary diagnostic shows", async () => {
@@ -400,4 +472,7 @@ test("card: risk-tolerance copy agrees with the judge's actual permissiveness", 
 	assert.match(labels[2], /宽松/);
 	assert.doesNotMatch(labels[0], /尽量放行|宽松/);
 	assert.doesNotMatch(labels[2], /尽量询问|严格/);
+	// UI 精简（2026-10-06）：风险范围的说明文字从卡片移除，只留方向词。
+	// 那条「两档与档位无关的底线」写在 docs/configuration.md 与 decision-chain.md。
+	assert.doesNotMatch(collectText(tree).join(" | "), /越高越宽松/);
 });

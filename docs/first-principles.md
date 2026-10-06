@@ -110,6 +110,10 @@ OUTCOMES = ["allowed-once", "rejected", "cancelled", "unavailable"]
 
 `deny` 的语义是"人类永远不会被问到"（`index.js:96-99`）。所以默认 deny 只覆盖后果不可逆的动作，且要用 `*` 前缀抓"藏在分隔符后面"的破坏命令（`*rm -rf /*`）；而发布、凭据、审批配置一律是 `ask` 而非 `deny`——它们需要人的判断，不需要机器的独断。
 
+删除族因此分成两档：`rm -rf /`、`sudo rm`、`wipefs`，以及 `git clean -fdx` / `git reset --hard` / `git stash clear` / `docker system prune --volumes` / `kubectl delete` / `rclone purge` 这类**整体状态删除**是 `deny`——它们删掉的东西在别处没有副本，人类被问了也无从权衡，`/approval-allow-once` 更不可能把字节找回来；而工作区里的递归删除（`rm -rf ./dist`）、内容销毁（`truncate`、`shred`、`dd of=…`）是 `ask`——后果不可逆，但范围是人的判断能覆盖的。这两档的分界不是"危险程度"，是"人类在场能否改变结果"。
+
+同一条命令的两种拼法可以分属两档，这是这条原则的直接推论：`git branch -D` 丢弃可能含未合并提交的分支，`git branch -d` 自己就会拒绝（git 保证），于是 deny 只认大写那个（`caseSensitive`）；`git restore .` 丢弃工作区内容，`git restore --staged .` 只重写索引，于是后者从 deny 里被 `unless` 摘出来——它不放宽任何东西，只是把"这条规则不管这一种形态"写清楚。判据永远落在**后果**上，而不是命令的名字：把 `rm`、`git`、`kubectl` 一律拉黑只需要一行正则，但那会让机器替人拒绝人天天要做的事，而 deny 是连人类都无法当场推翻的档位。
+
 ---
 
 ## 4. AI 层：不可信输入 × 不可信输出
@@ -119,7 +123,7 @@ judge 是一个 LLM，它拿到的是**模型自己生成的命令文本**——
 ### 4.1 输入侧：三道隔离
 
 1. **政策与证据分离**：固定政策写在提示词前段，请求体是 `{"toolName","command","reason"}` JSON（`judge.js:56-70`）。
-2. **统一脱敏边界**：prompt、审计、拒绝反馈、provider 错误诊断**同一个** `redactSensitive`（`redact.js:25-36`）。要点是保留**形状**（标签、URL 参数名、路径）——judge 仍然需要认出"这条命令在处理凭据"。
+2. **统一脱敏边界**：prompt、审计、拒绝反馈、provider 错误诊断**同一个** `redactSensitive`（`redact.js:25-36`）。要点是保留**形状**（标签、URL 参数名、路径）——judge 仍然需要认出"这条命令在处理凭据"。会话骨架（`Context` 块的 `[U]` / `[T]` 行）同样过这一遍：它在**原文**上渲染工具参数，不过边界就等于把已脱敏的命令又原样抄回 prompt（2026-10-06 实测到这一点并修掉）。
 3. **上下文只喂骨架**：`transcript: "short"` 下，成功 stdout **一律不喂模型**（原始工具输出是最容易打字的间接注入面），plugin 自身注入的消息也不回灌（`transcript.js:120`）——后者的理由见第 6 节。
 
 ### 4.2 输出侧：闭合枚举 + 唯一可解析
@@ -152,14 +156,14 @@ return RISK_RANK[risk] <= RISK_RANK[tolerance] ? "allow" : "ask";   // judge.js:
 
 ## 5. 不确定性的分类学：两种"不知道"必须分开
 
-| 形态 | 含义 | 处置 | 是否受 `mode3OnAsk` 影响 |
+| 形态 | 含义 | 处置 | 是否受无人值守开关影响 |
 |---|---|---|---|
-| `evidence-incomplete` | **没看到操作**（参数缺失 / JSON 不可解析 / shell 无 command / 超过 `maxJudgeCommandChars`） | 不问 AI；`ai` → 人类，`ai-auto` → **拒绝** | **否**（`index.js:928-931` 显式豁免） |
-| `ai-error` | 看到了但**判不出**（超时 / 401 / 空回复 / 无判决） | 走 `failOpen`（默认交人类） | 是 |
+| `evidence-incomplete` | **没看到操作**（参数缺失 / JSON 不可解析 / shell 无 command / 超过 `maxJudgeCommandChars`） | 不问 AI；`ai` → 人类，`ai-auto` → **拒绝** | **否**（固定拒绝） |
+| `ai-error` | 看到了但**判不出**（超时 / 401 / 空回复 / 无判决） | 走 `failOpen`（默认交人类） | 是（`failOpen` 仍可配） |
 
 程序必须自己拒绝"未审到的操作"，因为拿 `command: null` 去问模型，模型真的会答 `allowed-once`——`index.js:704-709` 的注释记录了这次实测。
 
-**如果某个模式开关能把"没看到"变成"允许"，那这个开关本身就是绕过通道。** 所以 `evidence-incomplete` 在 `ai-auto` 下无条件拒绝，`mode3OnAsk: allow` 也管不到它。
+**如果某个模式开关能把"没看到"变成"允许"，那这个开关本身就是绕过通道。** 所以 `evidence-incomplete` 在 `ai-auto` 下无条件拒绝；同理，另外三条"无人值守时没人可问"的落点（`mode3OnAsk`、`hardAskOnUnattended`、`enforcedAskOnUnattended`）也一律写死 `deny`、不接受配置——无人值守时非 `deny` 的取值就等于"直接给这次调用完全权限"，要放开权限应改宿主的权限档位。
 
 ---
 
@@ -174,11 +178,11 @@ return RISK_RANK[risk] <= RISK_RANK[tolerance] ? "allow" : "ask";   // judge.js:
 
 第一性看：这是**观察者效应**。"谁做的这个决定"这条信息在返回语义里根本不存在（`OUTCOMES` 只有 4 态，没有来源），插件接管了决策槽位，却无法在该槽位里留下签名。
 
-→ 只能事后修补：把插件自身产生的拒绝放入队列，在下一个 `agent/pre-step` 注入一条 `source.kind: "plugin"` 的更正消息（`index.js:1233-1257`）。
+→ 只能事后修补：把插件自身产生的拒绝放入队列，在下一个 `agent/pre-step` 注入一条插件源更正消息（V4 会话格式下 `source.kind: "plugin:<name>"`，如 `plugin:dsh-codex-approval`；历史形态 `"plugin"` 仍被识别）。
 
 这个修补自己带来**二次风险**，且代码里已按风险处理：
 
-1. 注入消息进入会话历史 → `transcript` 必须**排除 plugin 源**，否则拒绝理由会回流给 judge，形成自我强化（`transcript.js:120`）
+1. 注入消息进入会话历史 → `transcript` 必须**排除插件源**（`"plugin"` 与 `plugin:*` 两种形态都要排除），否则拒绝理由会回流给 judge，形成自我强化（`transcript.js` 的 `collectSemanticItems`）
 2. 队列必须有上限（`denyFeedbackMax: 3`，丢最旧）
 3. 源头文案改不了（`docs/security.md:34`）——这是下游修正的固有代价
 
@@ -197,7 +201,7 @@ return RISK_RANK[risk] <= RISK_RANK[tolerance] ? "allow" : "ask";   // judge.js:
 `ai-auto` 不是"更自动的 ai"，而是**方向翻转**：人类这个最可靠的后备从链上被移除，所以
 
 - prompt 变体禁掉 `ask`，并把"不确定时倾向 ask"改写成"倾向 deny"（`judge.js:37-46`）
-- `mode3OnAsk` 决定 `ask` 的去向，**默认 `deny`**（`modes.js:59-62`）
+- `mode3OnAsk` 决定 `ask` 的去向，**写死 `deny`**（`modes.js:59-62`；配置层只接受 `deny`）
 
 可靠性链上少一环，整条链的失败方向就必须整体转向保守。这不是同一个策略的两个参数。
 

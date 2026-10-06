@@ -34,7 +34,7 @@ import { randomUUID } from "node:crypto";
 import { join, dirname, isAbsolute, relative, resolve } from "node:path";
 import z from "@deepseek-ai/schemastery";
 
-import { classifyRequest, evaluateRules, ruleLabel } from "./rules.js";
+import { classifyRequest, evaluateRules, FLAG_GUARDS, ruleLabel } from "./rules.js";
 import { findToolCallArgs, argsPreview, shellCallFacts } from "./enrich.js";
 import { commandFacts } from "./command-facts.js";
 import { judgeWith, decidePolicy, parseVerdict } from "./judge.js";
@@ -93,6 +93,8 @@ const PUBLISH_COMMANDS = [
 export const DEFAULT_CONFIG = {
 	enabled: true,
 	mode: "ai",
+	// 无人值守红线之一：ai-auto 模式下「ask」的落点。**写死 deny、不可配**——
+	// 见 `Config` 里三项红线的说明（要放开权限请改宿主权限，不要拆审批红线）。
 	mode3OnAsk: "deny",
 	locale: "auto",
 	rules: [
@@ -119,6 +121,12 @@ export const DEFAULT_CONFIG = {
 		{ tool: "bash", pattern: ["which"], action: "allow" },
 		{ tool: "bash", pattern: ["echo"], action: "allow" },
 		{ tool: "bash", pattern: ["cat"], action: "allow", pathGuard: "workspace-relative" },
+		// `wipefs -n` / `--no-act` is a dry run: it lists the signatures on the
+		// device and writes nothing, so it is as read-only as `ls`. The denying
+		// patterns for wipefs are written to fall *past* this one (deny beats
+		// allow), which is why they name `-a` / `--all` and a device path.
+		{ tool: "bash", pattern: ["wipefs", "-n"], action: "allow" },
+		{ tool: "bash", pattern: ["wipefs", "--no-act"], action: "allow" },
 		// ---- pwsh (Windows): the same families, pwsh tool calls only ---------
 		// dsh's shell tool is `pwsh` on Windows; tool names are matched
 		// case-insensitively and a structured rule only ever matches its own
@@ -174,7 +182,142 @@ export const DEFAULT_CONFIG = {
 		{ match: "Pwsh(Format-Volume*)", action: "deny" },
 		{ match: "Pwsh(Stop-Computer*)", action: "deny" },
 		{ match: "Pwsh(Restart-Computer*)", action: "deny" },
+		// ---- whole-state deletion: version control, containers, cloud -------
+		// These erase state that exists nowhere else — unstaged work, a dropped
+		// stash, a deleted branch's commits, a volume, an object-store prefix —
+		// so there is nothing for a human to weigh, and `/approval-allow-once`
+		// could not bring the bytes back either: deny. Each pattern is written
+		// for the shape that actually deletes, so the everyday forms of the same
+		// commands are left alone: `git clean -n` (dry run) carries no `-f`,
+		// `git clean --force` is still caught by the `-f` inside it, and the
+		// branch/restore/kubernetes rules below name the destructive spelling.
+		{ match: "Bash(git clean *-f*)", action: "deny" },
+		{ match: "Bash(*git clean *-f*)", action: "deny" },
+		{ match: "Bash(git reset --hard*)", action: "deny" },
+		{ match: "Bash(*git reset --hard*)", action: "deny" },
+		{ match: "Bash(git checkout -- *)", action: "deny" },
+		{ match: "Bash(*git checkout -- *)", action: "deny" },
+		// `git restore` discards working-tree content; `--staged` only rewrites
+		// the index, and `git restore --staged .` is an everyday call. Text cannot
+		// tell "has --staged" from "has nothing but --staged", so the rule denies
+		// the restoring forms and exempts the index one through `unless` — which
+		// only narrows a deny/ask rule (assertConfig refuses it on an allow). The
+		// one combination `unless` cannot see (`--staged --worktree`, which does
+		// discard work) is named explicitly *above* the exempted rules, because
+		// same-action rules are taken in list order.
+		{ match: "Bash(git restore*--worktree*)", action: "deny" },
+		{ match: "Bash(*git restore*--worktree*)", action: "deny" },
+		{ match: "Bash(git restore*)", action: "deny", unless: "Bash(*git restore --staged*)" },
+		{ match: "Bash(*git restore*)", action: "deny", unless: "Bash(*git restore --staged*)" },
+		{ match: "Bash(git stash clear*)", action: "deny" },
+		{ match: "Bash(*git stash clear*)", action: "deny" },
+		// case-sensitive on purpose — and therefore written without the `Bash(`
+		// prefix the other rules carry. That prefix is spelled in the rules' own
+		// capitalisation and only survives because matching folds case; under
+		// `caseSensitive` it would never meet the real tool name (`bash`), so the
+		// pattern anchors on the command text instead (bare-text surfaces cover
+		// every tool, which for a `deny` is the safe direction). `-D` drops a
+		// branch that may hold unmerged commits, `-d` refuses to — git enforces
+		// that difference itself, and folding case would make one rule of the two.
+		{ match: "*git branch -D *", action: "deny", caseSensitive: true },
+		{ match: "Bash(git worktree remove*)", action: "deny" },
+		{ match: "Bash(*git worktree remove*)", action: "deny" },
+		{ match: "*docker system prune*", action: "deny" },
+		{ match: "*docker volume rm *", action: "deny" },
+		{ match: "*docker volume prune*", action: "deny" },
+		{ match: "*docker compose down -v*", action: "deny" },
+		{ match: "*docker-compose down -v*", action: "deny" },
+		// Kubernetes: only the deletions that take a *whole* piece of state with
+		// them — a namespace, a volume, or `--all` of a kind. `kubectl delete pod
+		// web` is how a pod is restarted and stays with the judge.
+		{ match: "*kubectl delete ns*", action: "deny" },
+		{ match: "*kubectl delete namespace*", action: "deny" },
+		{ match: "*kubectl delete pvc*", action: "deny" },
+		{ match: "*kubectl delete pv*", action: "deny" },
+		{ match: "*kubectl delete *--all*", action: "deny" },
+		{ match: "*rclone purge*", action: "deny" },
+		{ match: "*aws s3 rm --recursive*", action: "deny" },
+		{ match: "*aws s3 rm *--recursive*", action: "deny" },
+		// Erasing the filesystem signatures on a device is a deny; a plain
+		// `wipefs /dev/sdX` (which also wipes) asks a human; `wipefs -n` is a dry
+		// run that writes nothing at all and is allowed below — the patterns here
+		// must therefore not match it, or deny > ask > allow would swallow the
+		// allow (`wipefs -a` / `--all` erases every signature it can find).
+		{ match: "*wipefs -a*", action: "deny" },
+		{ match: "*wipefs --all*", action: "deny" },
+		{ match: "*wipefs /dev/*", action: "ask" },
+		{ match: "*wipefs -f /dev/*", action: "ask" },
 		// ---- always ask a human ---------------------------------------------
+		// Recursive deletion. `rm -rf` is the one shape that erases a whole
+		// subtree in a single call, and the workspace being the sandbox's write
+		// boundary does not make it a safe one — nothing backed those bytes up,
+		// and regenerating them is the user's problem. `rm -r` alone counts too:
+		// `-f` only decides whether read-only files stop it.
+		//
+		// Which spellings count is answered on the argv, not on the text: as text
+		// `rm -rf`, `rm -fr`, `rm -r -f` and `rm -rvf` are four different strings,
+		// and a glob list would have to enumerate every letter of every bundle in
+		// every order. `flagGuard: "recursive-delete"` splits the bundle
+		// (shell-shape.js), so all of them — plus `rm --recursive --force`, `/bin/rm -rvf`,
+		// `cd pkg && rm -rvf dist`, and pwsh's `Remove-Item -Recurse` — match one rule.
+		//
+		// The text rules under the guard are not redundant: an *opaque* command
+		// has no argv to inspect, and those are exactly the ones that carry the
+		// literal (`rm -rf $DIR/x`, `rm -rf "$(cat target)"`). Rules match
+		// characters, not paths, so neither form can tell "inside the workspace"
+		// from "outside it"; what they cover in practice is the *relative*
+		// spelling, because every absolute form is claimed by `*rm -rf /*` above
+		// (deny > ask), which denies `rm -rf /tmp/x` exactly as it denies
+		// `rm -rf /`. The `Bash(` prefix keeps a non-shell tool that merely
+		// *mentions* the text (a file being written) out of the rule.
+		{ tool: "bash", flagGuard: "recursive-delete", action: "ask" },
+		{ tool: "pwsh", flagGuard: "recursive-delete", action: "ask" },
+		{ match: "Bash(*rm -rf*)", action: "ask" },
+		{ match: "Bash(*rm -fr*)", action: "ask" },
+		// the same switches written apart; whitespace runs are normalized on the
+		// safety side, so `rm  -r<TAB>-f` lands on the same text
+		{ match: "Bash(*rm -r -f*)", action: "ask" },
+		{ match: "Bash(*rm -f -r*)", action: "ask" },
+		// Content destruction that is not a recursive delete: truncation,
+		// overwrite, secure erase, single-file unlink. Irreversible for the bytes,
+		// but none of them takes a subtree with it — so a human decides rather
+		// than the request being refused outright.
+		{ match: "Bash(truncate *)", action: "ask" },
+		{ match: "Bash(*truncate *)", action: "ask" },
+		{ match: "Bash(shred *)", action: "ask" },
+		{ match: "Bash(*shred *)", action: "ask" },
+		{ match: "Bash(unlink *)", action: "ask" },
+		{ match: "Bash(*unlink *)", action: "ask" },
+		{ match: "Bash(cp /dev/null *)", action: "ask" },
+		{ match: "Bash(*cp /dev/null *)", action: "ask" },
+		// `dd of=<file>` overwrites that file (`of=/dev/*` is handled above)
+		{ match: "*dd *of=*", action: "ask" },
+		// a redirection with no command truncates the file it names
+		{ match: "Bash(> *)", action: "ask" },
+		{ match: "Bash(: > *)", action: "ask" },
+		// `find … -delete` is a recursive delete written without `rm`
+		{ match: "Bash(find *-delete*)", action: "ask" },
+		{ match: "Bash(*find *-delete*)", action: "ask" },
+		// mirroring with deletion: whatever is missing on the source is removed
+		// from the destination
+		{ match: "*rsync*--delete*", action: "ask" },
+		// one stash entry goes away, and it may be the only copy of that work
+		{ match: "*git stash drop*", action: "ask" },
+		// database and account destruction
+		{ match: "*DROP TABLE*", action: "ask" },
+		{ match: "*DROP DATABASE*", action: "ask" },
+		{ match: "*FLUSHALL*", action: "ask" },
+		// `userdel -r` takes the account's home directory with it
+		{ match: "*userdel -r*", action: "ask" },
+		{ match: "*userdel --remove*", action: "ask" },
+		// PowerShell and cmd deletion spellings. `/s` is cmd's recursive switch
+		// and it may sit anywhere in the argument list (`del /f /s /q x`,
+		// `rd /q /s x`), so the pattern allows anything between the program and
+		// the switch instead of spelling one order.
+		{ match: "Pwsh(*Clear-Content*)", action: "ask" },
+		{ match: "Pwsh(*rd*/s*)", action: "ask" },
+		{ match: "Pwsh(*rmdir*/s*)", action: "ask" },
+		{ match: "Pwsh(*del*/s*)", action: "ask" },
 		// publishing: a red line — never auto-decided, and an unattended mode
 		// cannot resolve it through `mode3OnAsk` (it fails closed instead).
 		...PUBLISH_COMMANDS.flatMap((command) => [
@@ -284,11 +427,14 @@ export const DEFAULT_CONFIG = {
 		// nobody authorized, or an allow above the tolerance nobody asked for.
 		// It is not the judge being unsure — `mode3OnAsk: allow` must not be able
 		// to turn "no user consented" into permission, so this is its own knob.
+		// **写死 deny、不可配**：非 deny 就等于在无人值守时直接授予完全权限，
+		// 要放开权限请改宿主权限层（见 `Config` 里三项红线的说明）。
 		enforcedAskOnUnattended: "deny",
 		// Where a `hardAsk` red line lands when nobody can be asked. A red line
 		// is an ask an unattended mode may not resolve through `mode3OnAsk`
-		// (publishing, credentials): "nobody could consent" is not consent, so
-		// the default is deny. Set to "ask" only if you want the prompt to block.
+		// (publishing, credentials): "nobody could consent" is not consent.
+		// **写死 deny、不可配**（同上一项；"ask" 的语义是无人值守时无限等待，
+		// 既不是拒绝也不是授权，故一并写死）。
 		hardAskOnUnattended: "deny",
 		// One budget for the WHOLE approval, not per candidate: a chain of slow
 		// judges (and an evidence round) must not add up to minutes on the
@@ -324,11 +470,16 @@ export const DEFAULT_CONFIG = {
 		duplicate: 2,
 		cooldownMs: 600_000
 	},
-	// Compact session transcript for the AI judge: "off" (default) keeps the
-	// v0.3.0 zero-context input; "short" adds a bounded two-level window
-	// skeleton (see transcript.js) so the judge sees user intent and the
-	// surrounding tool chain. Absolute size is capped by transcriptMaxChars.
-	transcript: "off",
+	// Compact session transcript for the AI judge: "short" (default since
+	// 2026-10-06) adds a bounded two-level window skeleton (see transcript.js) so
+	// the judge sees user intent and the surrounding tool chain; "off" keeps the
+	// old v0.3.0 zero-context input. Measured on the 24-case set
+	// (`command/deepseek/deepseek-v4.1-flash`, repeat=3): short 13/72 human
+	// handoffs vs off 17/72, same non-disputed dangerous releases (0/66) — the
+	// four extra interruptions were all "user already asked for this" cases the
+	// judge could not see without the skeleton. Absolute size is capped by
+	// transcriptMaxChars.
+	transcript: "short",
 	transcriptMaxChars: 4000,
 	logFile: join(homedir(), ".dsh", "logs", "approval.jsonl"),
 	// Rotate the audit log to `<logFile>.1` once it grows past this many bytes.
@@ -403,6 +554,10 @@ export function materializeConfig(value) {
  * 写入状态的镜像，`makeModeStore` 启动时即复制进内存 Map，引用语义不适用。
  */
 const LIVE_FIELDS = [
+	// 默认审批模式：设置页可选（manual / ai / ai-auto），改动**热生效、不重载插件**。
+	// `resolveMode()`（会话覆盖优先）在每次审批请求里都读 `cfg.mode`，而这里是把它接成
+	// getter，所以改完的下一个请求就走新模式；`/approval-mode` 显示的「配置默认」同源。
+	["mode", ["mode"]],
 	["provider", ["ai", "provider"]],
 	["model", ["ai", "model"]],
 	["fallbacks", ["ai", "fallbacks"]],
@@ -410,7 +565,9 @@ const LIVE_FIELDS = [
 	["failOpen", ["ai", "failOpen"]],
 	["timeoutMs", ["ai", "timeoutMs"]],
 	["maxTokens", ["ai", "maxTokens"]],
-	["mode3OnAsk", ["mode3OnAsk"]],
+	// 会话骨架：设置页改动即刻生效（不重载插件）。
+	["transcript", ["transcript"]],
+	["transcriptMaxChars", ["transcriptMaxChars"]],
 	["denyFeedback", ["denyFeedback"]]
 ];
 
@@ -472,14 +629,18 @@ export function installLiveGetters(cfg, source, baseline = undefined) {
 /** User-editable model and policy settings, separate from per-session mode overrides. */
 export const CONFIG_SETTINGS_NAMESPACE = "dsh-codex-approval-config";
 export const CONFIG_SETTINGS_SCHEMA = z.object({
+	// 默认审批模式。字段名与 entry Config 的顶层键一致（0.2.0 设置页读写的就是后者）：
+	// 两版的可编辑字段同名，客户端卡片才能用一份代码同时服务两条设置路径。
+	mode: z.union(MODES).default(DEFAULT_CONFIG.mode),
 	provider: z.string().default(DEFAULT_CONFIG.ai.provider),
 	model: z.string().default(DEFAULT_CONFIG.ai.model),
 	fallbacks: z.array(z.object({ provider: z.string().min(1), model: z.string().min(1) })).max(MAX_FALLBACKS).default(DEFAULT_CONFIG.ai.fallbacks),
 	riskTolerance: z.union(TOLERANCES).default(DEFAULT_CONFIG.ai.riskTolerance),
 	failOpen: z.union(ACTIONS).default(DEFAULT_CONFIG.ai.failOpen),
-	mode3OnAsk: z.union(["deny", "allow"]).default(DEFAULT_CONFIG.mode3OnAsk),
 	timeoutMs: z.number().step(1).min(1).default(DEFAULT_CONFIG.ai.timeoutMs),
 	maxTokens: z.number().step(1).min(1).default(DEFAULT_CONFIG.ai.maxTokens),
+	transcript: z.union(["off", "short"]).default(DEFAULT_CONFIG.transcript),
+	transcriptMaxChars: z.number().step(1).min(100).max(16_000).default(DEFAULT_CONFIG.transcriptMaxChars),
 	denyFeedback: z.boolean().default(DEFAULT_CONFIG.denyFeedback)
 });
 
@@ -503,12 +664,20 @@ export const CONFIG_SETTINGS_SCHEMA = z.object({
  * `undefined`，那样「用户显式清空 `[]`」与「没配过」就分不开了。已知限制：顶层数组的
  * default 目前仍会遮住旧嵌套 `ai.fallbacks`（见 README「六之五」的已知限制一节）。
  *
- * 运行期字段（enabled/mode/locale/fallback）保持普通字段 + 默认值：它们不进设置
+ * 运行期字段（enabled/locale/fallback）保持普通字段 + 默认值：它们不进设置
  * 表单，改动它们会让 loader 走普通更新路径（重载插件），这正是期望行为。
+ *
+ * `mode`（默认审批模式）是这条规则唯一的例外，且**必须**是 volatile（live）：
+ * 0.2.0 设置页写回 entry config 时，宿主按 `isVolatilePath()` 逐路径校验，非 volatile
+ * 字段的写入会被直接拒绝（`Config field "mode" is not volatile`），所以想让用户能在
+ * 设置页选默认模式，就只能走 live 通道。它同时是 `.default()` 的例外——其余标量不带
+ * 默认值的理由是「默认值注入会让顶层恒有值，`applyConfigSettings` 里回退读旧嵌套
+ * `ai.*` 的分支永远轮不到」；`mode` 从不参与那条回退（它一直只在顶层），默认值不会
+ * 遮蔽任何更严格的旧配置，而带默认值反而让设置表单里这一行恒有值可显示。
  */
 export const Config = z.object({
 	enabled: z.boolean().default(DEFAULT_CONFIG.enabled),
-	mode: z.union(MODES).default(DEFAULT_CONFIG.mode),
+	mode: live(z.union(MODES).default(DEFAULT_CONFIG.mode)),
 	locale: z.union(["auto", "zh", "en"]).default(DEFAULT_CONFIG.locale),
 	fallback: z.union(ACTIONS).default(DEFAULT_CONFIG.fallback),
 	// **标量一律不带 `.default()`**：默认值一旦注入，顶层字段就「恒有值」，
@@ -523,11 +692,20 @@ export const Config = z.object({
 	})).max(MAX_FALLBACKS).default(DEFAULT_CONFIG.ai.fallbacks)),
 	riskTolerance: live(z.union(TOLERANCES)),
 	failOpen: live(z.union(ACTIONS)),
-	mode3OnAsk: live(z.union(["deny", "allow"])),
 	timeoutMs: live(z.number().step(1).min(1)),
 	maxTokens: live(z.number().step(1).min(1)),
-	hardAskOnUnattended: live(z.union(["deny", "ask"])),
-	enforcedAskOnUnattended: live(z.union(["deny", "ask"])),
+	// 会话骨架（判定输入里的 [U]/[T]/[D]/[W] 行）：off = 零上下文，short = 有界两级窗口。
+	// 两项都进设置表单且可热改（live）——它只改变判定**输入**，不改变任何权限判定。
+	transcript: live(z.union(["off", "short"])),
+	transcriptMaxChars: live(z.number().step(1).min(100).max(16_000)),
+	// 三项无人值守红线：**写死 deny**，不接受配置，也不进设置表单。
+	// 理由：无人可问时非 deny 的取值等价于「直接给这次调用完全权限」——`allow` 是放行，
+	// `ask` 在 ai-auto 下还会被别的分支吸收成放行。要放开权限，正确层位是宿主的权限/
+	// 沙箱授予（例如直接跑完全权限、无沙箱），不是在审批闸门里把红线拆掉。
+	// schema 只接受 "deny"：patch 里写了别的值会在装配期直接失败，而不是被静默忽略。
+	mode3OnAsk: z.union(["deny"]).default("deny"),
+	hardAskOnUnattended: z.union(["deny"]).default("deny"),
+	enforcedAskOnUnattended: z.union(["deny"]).default("deny"),
 	totalBudgetMs: live(z.number().step(1).min(0)),
 	evidenceFetch: live(z.union(EVIDENCE_FETCH)),
 	evidenceMaxFiles: live(z.number().step(1).min(1)),
@@ -551,7 +729,9 @@ function assertConfig(cfg) {
 	if (typeof cfg !== "object" || cfg === null) throw new TypeError("dsh-codex-approval: config must be an object");
 	if (typeof cfg.enabled !== "boolean") throw new TypeError("dsh-codex-approval: config.enabled must be a boolean");
 	if (!MODES.includes(cfg.mode)) throw new TypeError(`dsh-codex-approval: config.mode must be one of ${MODES.join("/")}`);
-	if (!["deny", "allow"].includes(cfg.mode3OnAsk)) throw new TypeError("dsh-codex-approval: config.mode3OnAsk must be deny/allow");
+	// 三项无人值守红线写死 deny。报错要指向「该在哪一层放开」，否则用户只会以为
+	// 配置写错了，然后去找下一个能放宽的开关。
+	if (cfg.mode3OnAsk !== "deny") throw new TypeError("dsh-codex-approval: config.mode3OnAsk is a fixed red line and only accepts deny — 无人值守时放开权限请改宿主权限层（完全权限/无沙箱），不要拆审批红线");
 	if (!["auto", "zh", "en"].includes(cfg.locale)) throw new TypeError("dsh-codex-approval: config.locale must be auto/zh/en");
 	if (!Array.isArray(cfg.rules)) throw new TypeError("dsh-codex-approval: config.rules must be an array");
 	for (const rule of cfg.rules) {
@@ -566,9 +746,45 @@ function assertConfig(cfg) {
 		if (rule.hardAsk === true && rule.action !== "ask") {
 			throw new TypeError("dsh-codex-approval: rule.hardAsk is only meaningful on an ask rule");
 		}
-		if (Array.isArray(rule.pattern) || typeof rule.tool === "string") {
+		// Two options tune a glob rule itself. Both are checked here so they
+		// cannot reach a structured rule (whose argv comparison is already
+		// exact) or an allow (where widening is the failure mode):
+		//   - `caseSensitive` keeps `git branch -D` apart from `git branch -d`;
+		//   - `unless` is the rule's own exception, and it can only narrow a
+		//     deny/ask rule — on an allow it would widen a silent approval.
+		const structured = Array.isArray(rule.pattern) || typeof rule.tool === "string";
+		if (rule.caseSensitive !== void 0 && typeof rule.caseSensitive !== "boolean") {
+			throw new TypeError("dsh-codex-approval: rule.caseSensitive must be a boolean");
+		}
+		if (rule.unless !== void 0) {
+			const patterns = Array.isArray(rule.unless) ? rule.unless : [rule.unless];
+			if (patterns.length === 0 || !patterns.every((pattern) => typeof pattern === "string" && pattern !== "")) {
+				throw new TypeError("dsh-codex-approval: rule.unless must be a non-empty string or a list of them");
+			}
+			if (structured) throw new TypeError("dsh-codex-approval: rule.unless is a glob option and does not apply to a structured rule");
+			if (rule.action === "allow") throw new TypeError("dsh-codex-approval: rule.unless can only narrow a deny/ask rule — on an allow it would widen it");
+		}
+		if (structured && rule.caseSensitive !== void 0) {
+			throw new TypeError("dsh-codex-approval: rule.caseSensitive is a glob option and does not apply to a structured rule");
+		}
+		if (structured) {
 			// structured argv-prefix rule (Codex `prefix_rule` style)
 			if (typeof rule.tool !== "string" || rule.tool === "") throw new TypeError("dsh-codex-approval: a structured rule needs a non-empty tool");
+			// A `flagGuard` rule is judged on the argv, so it carries no pattern —
+			// and it is a strictness-only guard: on an `allow` it would authorize
+			// the very shape it exists to catch, so it is refused here instead of
+			// being silently honored.
+			if (rule.flagGuard !== void 0) {
+				if (!FLAG_GUARDS.includes(rule.flagGuard)) {
+					throw new TypeError(`dsh-codex-approval: rule.flagGuard must be one of ${FLAG_GUARDS.join("/")}`);
+				}
+				if (rule.pattern !== void 0) throw new TypeError("dsh-codex-approval: a flagGuard rule takes no pattern — it is judged on the argv");
+				if (rule.action === "allow") throw new TypeError("dsh-codex-approval: rule.flagGuard is a strictness guard and cannot sit on an allow rule");
+				if (rule.forbidOptions !== void 0 || rule.pathGuard !== void 0 || rule.configGuard !== void 0) {
+					throw new TypeError("dsh-codex-approval: rule.flagGuard does not combine with forbidOptions / pathGuard / configGuard");
+				}
+				continue;
+			}
 			if (!Array.isArray(rule.pattern) || rule.pattern.length === 0 || !rule.pattern.every((part) => typeof part === "string" && part !== "")) {
 				throw new TypeError("dsh-codex-approval: a structured rule needs a non-empty string pattern");
 			}
@@ -592,8 +808,8 @@ function assertConfig(cfg) {
 	if (!Number.isSafeInteger(cfg.ai.maxJudgeCommandChars) || cfg.ai.maxJudgeCommandChars < 200 || cfg.ai.maxJudgeCommandChars > 200_000) {
 		throw new TypeError("dsh-codex-approval: config.ai.maxJudgeCommandChars must be an integer in 200..200000");
 	}
-	if (!["deny", "ask"].includes(cfg.ai.hardAskOnUnattended)) throw new TypeError("dsh-codex-approval: config.ai.hardAskOnUnattended must be deny/ask");
-	if (!["deny", "ask"].includes(cfg.ai.enforcedAskOnUnattended)) throw new TypeError("dsh-codex-approval: config.ai.enforcedAskOnUnattended must be deny/ask");
+	if (cfg.ai.hardAskOnUnattended !== "deny") throw new TypeError("dsh-codex-approval: config.ai.hardAskOnUnattended is a fixed red line and only accepts deny — 放开权限请改宿主权限层");
+	if (cfg.ai.enforcedAskOnUnattended !== "deny") throw new TypeError("dsh-codex-approval: config.ai.enforcedAskOnUnattended is a fixed red line and only accepts deny — 放开权限请改宿主权限层");
 	if (!Number.isSafeInteger(cfg.ai.totalBudgetMs) || cfg.ai.totalBudgetMs < 0 || cfg.ai.totalBudgetMs > 600_000) {
 		throw new TypeError("dsh-codex-approval: config.ai.totalBudgetMs must be an integer in 0..600000");
 	}
@@ -680,7 +896,11 @@ export function applyConfigSettings(baseConfig, settings) {
 	const pickBreaker = (key, fallback) => settings?.denialBreaker?.[key] ?? fallback;
 	return normalizeConfig({
 		...merged,
-		mode3OnAsk: pick("mode3OnAsk", baseConfig.mode3OnAsk),
+		// 三项无人值守红线写死 deny：旧 settings 文档或旧 patch 里留下的 ask/allow
+		// 一律不进入运行配置——放开权限的正确层位是宿主权限/沙箱授予。
+		mode3OnAsk: "deny",
+		transcript: pick("transcript", baseConfig.transcript),
+		transcriptMaxChars: pick("transcriptMaxChars", baseConfig.transcriptMaxChars),
 		denyFeedback: pick("denyFeedback", baseConfig.denyFeedback),
 		denialBreaker: {
 			consecutive: pickBreaker("consecutive", baseConfig.denialBreaker.consecutive),
@@ -702,8 +922,8 @@ export function applyConfigSettings(baseConfig, settings) {
 			failOpen: pick("failOpen", baseAi.failOpen),
 			timeoutMs: pick("timeoutMs", baseAi.timeoutMs),
 			maxTokens: pick("maxTokens", baseAi.maxTokens),
-			hardAskOnUnattended: pick("hardAskOnUnattended", baseAi.hardAskOnUnattended),
-			enforcedAskOnUnattended: pick("enforcedAskOnUnattended", baseAi.enforcedAskOnUnattended),
+			hardAskOnUnattended: "deny",
+			enforcedAskOnUnattended: "deny",
 			totalBudgetMs: pick("totalBudgetMs", baseAi.totalBudgetMs),
 			evidenceFetch: pick("evidenceFetch", baseAi.evidenceFetch),
 			evidenceMaxFiles: pick("evidenceMaxFiles", baseAi.evidenceMaxFiles),
@@ -1375,8 +1595,13 @@ export function createHandler({ config, record, llmRunner, getSessionMode, denia
 		} else if (gate !== null) {
 			verdict = gate;
 		} else if (cfg.ai.enabled) {
+			// The skeleton quotes the session (user messages and tool-call
+			// arguments verbatim), so it goes through the SAME redaction boundary
+			// as the command: without this, `short` puts the un-redacted
+			// `Authorization: Bearer …` back into the judge prompt right next to
+			// the redacted copy — one leak path per transcript line.
 			context = cfg.transcript === "short"
-				? buildTranscript({
+				? redactSensitive(buildTranscript({
 					events: req.agent?.session,
 					cfg,
 					denialHistory: history,
@@ -1385,7 +1610,7 @@ export function createHandler({ config, record, llmRunner, getSessionMode, denia
 					tolerance: cfg.ai.riskTolerance,
 					mode3OnAsk: cfg.mode3OnAsk,
 					cwd
-				})
+				}))
 				: "";
 			const judgeInput = { toolName: req.toolName, argsText, reason: reasonText, context, cwd, workdir: facts?.workdir, escalation, facts: textFacts };
 			// One budget for the whole approval: every candidate AND the evidence
@@ -1962,7 +2187,7 @@ export function makeDenialInjector({ config, getConfig, denialFeed, getLocale })
 				id: randomUUID(),
 				role: "user",
 				content: [{ type: "text", text }],
-				source: { kind: "plugin", plugin: name, form: "instructions" }
+				source: { kind: `plugin:${name}`, form: "instructions" }
 			}]
 		};
 	};
@@ -2181,6 +2406,7 @@ export async function apply(ctx, userConfig) {
 		installConfigSettings({
 			settings: settingsCtx.settings,
 			base: {
+				mode: cfg.mode,
 				provider: cfg.ai.provider,
 				model: cfg.ai.model,
 				fallbacks: cfg.ai.fallbacks,

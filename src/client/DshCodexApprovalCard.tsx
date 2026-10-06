@@ -97,28 +97,39 @@ const NUL = '\u0000'
  * user picking the stricter-sounding option silently widened auto-approval.
  */
 const TOLERANCES = [
-  { value: 'low', label: 'low · 严格：只放行 low 风险' },
-  { value: 'medium', label: 'medium · 平衡（默认）：放行 ≤medium 风险' },
-  { value: 'high', label: 'high · 宽松：放行 ≤high 风险' },
+  { value: 'low', label: 'low · 严格' },
+  { value: 'medium', label: 'medium · 平衡（默认）' },
+  { value: 'high', label: 'high · 宽松' },
 ]
 const FAIL_OPEN = [
   { value: 'ask', label: 'ask · 交给人确认（默认）' },
   { value: 'deny', label: 'deny · 拒绝' },
   { value: 'allow', label: 'allow · 放行' },
 ]
-const MODE3_ON_ASK = [
-  { value: 'deny', label: 'deny · 拒绝（默认）' },
-  { value: 'allow', label: 'allow · 放行' },
+/**
+ * 判定上下文。`off` 是关闭（判定模型只看本次请求）；`short` 会带上**有界**的两级窗口
+ * （最近的用户消息 + 工具链骨架 + 本会话的拒绝历史，总量受 `transcriptMaxChars` 限制）。
+ * 它只决定判定模型**能看到什么**，不改变任何权限判定。默认 `short`：实测 24 案例
+ * repeat=3 下交人工 13/72，而 `off` 是 17/72，两者的非争议危险放行都是 0/66。
+ */
+const TRANSCRIPT = [
+  { value: 'off', label: 'off · 关闭' },
+  { value: 'short', label: 'short · 开启（默认）' },
 ]
-/** Where an enforced policy ask lands when nobody can be asked (no strong user authorization). */
-const ENFORCED_ASK = [
-  { value: 'deny', label: 'deny · 拒绝（默认）' },
-  { value: 'ask', label: 'ask · 交给人（无人值守时会一直等）' },
-]
-/** Where the red lines (publishing, credentials) land when nobody can be asked. */
-const HARD_ASK = [
-  { value: 'deny', label: 'deny · 拒绝（默认）' },
-  { value: 'ask', label: 'ask · 交给人（无人值守时会一直等）' },
+
+/**
+ * 默认审批模式（配置层的 `mode`，与会话内的 `/approval-mode` 覆盖同一维度）。
+ *
+ * 它是**默认值**：只对没有会话覆盖的会话生效，`/approval-mode default` 就是回到它。
+ * 三种取值与 `modes.js` 的语义一一对应。标签只留名字——2026-10-06 用户要求删掉三项
+ * 后面的括号（字段名已经是「默认审批模式」，再写「（默认）」是重复）。完整后果写在
+ * `docs/configuration.md` 与 `docs/client-card.md`：`manual` 是插件完全旁路（不判定、
+ * 不审计），`ai-auto` 是 ask 永不交人类（写死的 `mode3OnAsk: deny` 直接拒绝）。
+ */
+const MODES = [
+  { value: 'manual', label: 'manual · 仅人工' },
+  { value: 'ai', label: 'ai · AI 判定 + 人工兜底' },
+  { value: 'ai-auto', label: 'ai-auto · AI 全自动' },
 ]
 
 /** One labelled form row, mirroring the shipped fields.module.css layout. */
@@ -177,12 +188,12 @@ export function DshCodexApprovalCard({ settingsScope, loadModelCatalog }: Props)
   }, [loadModelCatalog])
 
   const value = { ...(snapshot.value ?? {}), ...draft } as Record<string, any>
-  // 未配置主模型时的**展示兜底**。
+  // 未配置主模型时的**展示回退**。
   //
   // 服务端 `Config` 的标量字段刻意不带 `.default()`（否则默认值注入会让顶层「恒有值」，
   // 旧嵌套 `ai.*` 就永远读不到、更严格的旧策略被静默放宽），所以表单投影里
   // `provider`/`model` 可能是 undefined。展示层需要一个等价的内置默认，否则主模型会显示
-  // 成空白、调用顺序里只剩兜底候选，还会误报「该 provider 当前不可路由」。
+  // 成空白、还会误报「该 provider 当前不可路由」。
   // 只用于展示，**不要写进草稿**。服务端 `DEFAULT_CONFIG.ai` 的这两个值改动时这里要同步。
   const primaryProvider = value.provider ?? 'cpa-wx301'
   const primaryModel = value.model ?? 'command/deepseek/deepseek-v4.1-flash'
@@ -262,7 +273,7 @@ export function DshCodexApprovalCard({ settingsScope, loadModelCatalog }: Props)
         <span className="dsh-ca-headText">
           <span className="dsh-ca-name">审批模型</span>
           <span className="dsh-ca-description">
-            {`AI 审判模型：主模型失败后依次尝试兜底候选（${chain.length === 0 ? '未配置兜底' : `${chain.length} 项`}）`}
+            {`AI 审判模型：主模型失败后依次尝试回退模型（${chain.length === 0 ? '未配置回退' : `${chain.length} 项`}）`}
           </span>
         </span>
         {dirty ? <Tag tone="neutral" className="dsh-ca-pending">未保存</Tag> : null}
@@ -292,9 +303,9 @@ export function DshCodexApprovalCard({ settingsScope, loadModelCatalog }: Props)
               : null}
           </Field>
 
-          <Field label={`兜底候选（按顺序尝试，最多 ${MAX_FALLBACKS} 项）`}>
+          <Field label={`回退模型（按顺序尝试，最多 ${MAX_FALLBACKS} 项）`}>
             {chain.length === 0
-              ? <p className="dsh-ca-hint">未配置兜底：主模型失败时直接走“AI 故障时”的策略。</p>
+              ? <p className="dsh-ca-hint">未配置回退：主模型失败时直接走“AI 故障时”的策略。</p>
               : null}
             {chain.map((entry, index) => {
               const failure = catalog?.failures?.find((item) => item.id === entry.provider)
@@ -326,15 +337,20 @@ export function DshCodexApprovalCard({ settingsScope, loadModelCatalog }: Props)
             })}
             <div className="dsh-ca-row">
               <button type="button" className="dsh-ca-ghostButton" disabled={disabled || chain.length >= MAX_FALLBACKS} onClick={addChain}>
-                <IconPlus /> 添加兜底候选
+                <IconPlus /> 添加回退模型
               </button>
             </div>
             {chainError !== '' ? <p className="dsh-ca-invalid">{chainError}</p> : null}
-            <p className="dsh-ca-order">调用顺序：{judgeOrder.length === 0 ? '（未选择模型）' : judgeOrder.join(' → ')}</p>
           </Field>
 
           <div className="dsh-ca-grid">
-            <Field label="风险容忍度" hint="越高越宽松，但有两道与档位无关的底线：AI 自己拿不准（ask）且风险 ≥ medium、或风险 high 而用户没明确要求，都会交给人工。">
+            <Field label="默认审批模式" hint="会话内用 /approval-mode 覆盖">
+              <select className="dsh-ca-select" value={String(value.mode ?? 'ai')} disabled={disabled}
+                onChange={(event) => setField('mode', event.target.value)}>
+                {MODES.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}
+              </select>
+            </Field>
+            <Field label="风险容忍度">
               <select className="dsh-ca-select" value={String(value.riskTolerance ?? 'medium')} disabled={disabled}
                 onChange={(event) => setField('riskTolerance', event.target.value)}>
                 {TOLERANCES.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}
@@ -346,29 +362,21 @@ export function DshCodexApprovalCard({ settingsScope, loadModelCatalog }: Props)
                 {FAIL_OPEN.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}
               </select>
             </Field>
-            <Field label="ai-auto 模式下遇到 ask">
-              <select className="dsh-ca-select" value={String(value.mode3OnAsk ?? 'deny')} disabled={disabled}
-                onChange={(event) => setField('mode3OnAsk', event.target.value)}>
-                {MODE3_ON_ASK.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}
+            <Field label="上下文" hint="关闭时判定模型只看本次请求。">
+              <select className="dsh-ca-select" value={String(value.transcript ?? 'short')} disabled={disabled}
+                onChange={(event) => setField('transcript', event.target.value)}>
+                {TRANSCRIPT.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}
               </select>
             </Field>
-            <Field label="高风险无授权无人值守时" hint="高风险且用户未明确要求、或 AI 放行但超出档位时，不受「ai-auto 遇到 ask」影响；默认直接拒绝">
-              <select className="dsh-ca-select" value={String(value.enforcedAskOnUnattended ?? 'deny')} disabled={disabled}
-                onChange={(event) => setField('enforcedAskOnUnattended', event.target.value)}>
-                {ENFORCED_ASK.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}
-              </select>
+            <Field label="上下文字符上限" hint="超出时先丢拒绝历史。">
+              <input className="dsh-ca-input" type="number" min="100" max="16000" value={Number(value.transcriptMaxChars ?? 4000)}
+                disabled={disabled} onChange={(event) => setField('transcriptMaxChars', Number(event.target.value))} />
             </Field>
-            <Field label="红条（发布/凭据）无人值守时" hint="发布与凭据目录属红条，不受上面两项开关影响；默认直接拒绝">
-              <select className="dsh-ca-select" value={String(value.hardAskOnUnattended ?? 'deny')} disabled={disabled}
-                onChange={(event) => setField('hardAskOnUnattended', event.target.value)}>
-                {HARD_ASK.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}
-              </select>
-            </Field>
-            <Field label="超时（毫秒）" hint="每个候选各自计时，默认 15000">
+            <Field label="超时（毫秒）">
               <input className="dsh-ca-input" type="number" min="1" value={Number(value.timeoutMs ?? 15000)}
                 disabled={disabled} onChange={(event) => setField('timeoutMs', Number(event.target.value))} />
             </Field>
-            <Field label="最大输出 token" hint="含思考 token 余量，默认 512">
+            <Field label="最大输出 token" hint="含推理 token">
               <input className="dsh-ca-input" type="number" min="1" value={Number(value.maxTokens ?? 512)}
                 disabled={disabled} onChange={(event) => setField('maxTokens', Number(event.target.value))} />
             </Field>

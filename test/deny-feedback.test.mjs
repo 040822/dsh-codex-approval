@@ -172,8 +172,8 @@ test("injector: staged denial → one corrective user message appended", async (
 	assert.equal(decision.messages.length, 2);
 	const injected = decision.messages[1];
 	assert.equal(injected.role, "user");
-	assert.equal(injected.source.kind, "plugin");
-	assert.equal(injected.source.plugin, "dsh-codex-approval");
+	assert.equal(injected.source.kind, "plugin:dsh-codex-approval"); // V4 producer-owned kind
+	assert.equal(injected.source.plugin, undefined); // v3 wrapper field must not survive into v4
 	assert.equal(injected.source.form, "instructions");
 	assert.match(injected.content[0].text, /NOT a user rejection/);
 	assert.match(injected.content[0].text, /rm -rf/);
