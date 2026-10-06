@@ -36,8 +36,12 @@ import { homedir, tmpdir } from "node:os";
 
 const HOME = homedir();
 const SRC = resolve(process.argv[2] ?? join(import.meta.dirname, ".."));
-/** 期待被跳过的用例数：test/index.test.mjs 里 3 条纯 volatile 语义的往返用例。 */
-const EXPECTED_SKIPS_WITHOUT_VOLATILE = 3;
+/**
+ * 期待被跳过的用例数：test/index.test.mjs 里标记 `VOLATILE_ONLY` 的用例条数 ——
+ * 3 条纯 volatile 语义的配置往返 + 1 条「默认审批模式热生效」。
+ * 新增 VOLATILE_ONLY 用例时同步这个数字，否则无 volatile 的平面会误报。
+ */
+const EXPECTED_SKIPS_WITHOUT_VOLATILE = 4;
 const SKIP_DIRS = new Set(["node_modules", ".git", ".pnpm"]);
 
 const c = { r: "\x1b[31m", g: "\x1b[32m", y: "\x1b[33m", b: "\x1b[1m", x: "\x1b[0m" };
