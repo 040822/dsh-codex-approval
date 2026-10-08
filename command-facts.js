@@ -143,23 +143,33 @@ export function commandFacts({ toolName, argsText, shapeInfo }) {
 	// so every string that leaves this module is derived from redacted text.
 	const text = redactSensitive(rawText);
 
-	const paths = [];
+	const allPaths = [];
 	const hosts = [];
 	const destructive = [];
 	let budget = MAX_TOTAL_CHARS;
+	let flagsOmitted = 0;
+	let hostsOmitted = 0;
+	// Paths are COLLECTED here and ranked at the end (see the ranking before
+	// `facts` is built). The cap must not be filled first-come-first-served:
+	// the entries the judge must not miss are the out-of-workspace ones, and the
+	// model controls argv order — it could otherwise park an `/etc/shadow` past
+	// MAX_PATHS and hand the judge a fact list that looks clean.
 	const pushPath = (candidate) => {
 		const value = clean(candidate);
-		if (value === "" || paths.length >= MAX_PATHS || budget < value.length) return;
-		if (paths.some((entry) => entry.path === value)) return;
-		budget -= value.length;
-		paths.push({ path: value, ...isWorkspaceRelativePath(value) ? {} : { outside: true } });
+		if (value === "") return;
+		if (allPaths.some((entry) => entry.path === value)) return;
+		allPaths.push({ path: value, ...isWorkspaceRelativePath(value) ? {} : { outside: true } });
 	};
 	const pushHost = (candidate) => {
 		// An IPv6 literal arrives bracketed from a URL authority; the bare form is
 		// what the "uninteresting host" list and the report should compare.
 		const value = clean(candidate).toLowerCase().replace(/^\[|\]$/g, "");
-		if (value === "" || hosts.length >= MAX_HOSTS || budget < value.length) return;
+		if (value === "" || budget < value.length) return;
 		if (UNINTERESTING_HOSTS.has(value) || hosts.includes(value)) return;
+		if (hosts.length >= MAX_HOSTS) {
+			hostsOmitted += 1;
+			return;
+		}
 		budget -= value.length;
 		hosts.push(value);
 	};
@@ -212,14 +222,35 @@ export function commandFacts({ toolName, argsText, shapeInfo }) {
 		if (token === "") continue;
 		const name = token.includes("=") ? token.slice(0, token.indexOf("=")) : token;
 		if (!DESTRUCTIVE_FLAGS.includes(name)) continue;
-		if (destructive.length >= MAX_FLAGS || destructive.includes(name)) break;
+		if (destructive.includes(name)) continue;
+		if (destructive.length >= MAX_FLAGS) {
+			flagsOmitted += 1;
+			continue;
+		}
 		destructive.push(name);
 	}
+
+	// Out-of-workspace paths are ranked first, then document order; the character
+	// budget and the count cap are applied here. Everything they drop is reported
+	// (`pathsOmitted` / `flagsOmitted` / `hostsOmitted`) instead of being silently
+	// omitted — "the facts are short" must never be able to read as "the command
+	// is clean".
+	const ranked = [...allPaths].sort((a, b) => (b.outside === true ? 1 : 0) - (a.outside === true ? 1 : 0));
+	const paths = [];
+	for (const entry of ranked) {
+		if (paths.length >= MAX_PATHS || budget < entry.path.length) continue;
+		budget -= entry.path.length;
+		paths.push(entry);
+	}
+	const pathsOmitted = ranked.length - paths.length;
 
 	const facts = {};
 	if (paths.length > 0) facts.paths = paths;
 	if (hosts.length > 0) facts.hosts = hosts;
 	if (destructive.length > 0) facts.destructive = destructive;
+	if (pathsOmitted > 0) facts.pathsOmitted = pathsOmitted;
+	if (flagsOmitted > 0) facts.flagsOmitted = flagsOmitted;
+	if (hostsOmitted > 0) facts.hostsOmitted = hostsOmitted;
 	return Object.keys(facts).length === 0 ? null : facts;
 }
 

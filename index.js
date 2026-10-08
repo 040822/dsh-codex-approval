@@ -1187,6 +1187,97 @@ export function evidenceProblem({ args, toolName, argsText, cfg }) {
  * fetching, executing, destroying. Two or more signals mean a human (and the
  * judge) cannot credibly confirm the whole effect from the text alone.
  */
+/** Path-valued argument keys of non-shell tools (edit / write / patch families). */
+const PATH_ARG_KEYS = Object.freeze(["file_path", "filePath", "path", "notebook_path", "target_file", "output_path"]);
+/** …and the ones that carry a list of them. */
+const PATH_ARG_LIST_KEYS = Object.freeze(["files", "paths", "file_paths"]);
+
+/**
+ * The path-valued arguments of a NON-shell tool call.
+ *
+ * The shell recogniser never sees these tools, so `command-facts.js` reports
+ * nothing about them — which is why an `edit` / `write` call carried no
+ * structural signal at all and every `pathGuard`-style option was unavailable
+ * to its rules. This is the smallest thing that gives them one.
+ * @param args - the recovered tool arguments
+ * @param toolName - the request's tool name
+ * @returns the trimmed path strings (possibly empty)
+ */
+export function toolPathArgs(args, toolName) {
+	if (args === null || typeof args !== "object" || isShellTool(toolName)) return [];
+	const out = [];
+	const push = (value) => {
+		if (typeof value === "string" && value.trim() !== "") out.push(value.trim());
+	};
+	for (const key of PATH_ARG_KEYS) push(args[key]);
+	for (const key of PATH_ARG_LIST_KEYS) {
+		const value = args[key];
+		if (Array.isArray(value)) for (const item of value) push(item);
+	}
+	return out;
+}
+
+/**
+ * Whether a call's own structure shows anything reaching outside the current
+ * task's blast radius — the input the policy layer needs to decide whether the
+ * judge's "I am not sure" may be resolved by the tolerance (see
+ * `decidePolicy`'s `scope` option) instead of always going to a human.
+ *
+ * Everything here is derived from the CALL, never from the model's prose: the
+ * structured facts recovered from the command text (`command-facts.js`, which
+ * reports what it could not fit as `*Omitted`), the working directory the call
+ * actually runs in, and — for tools the shell recogniser cannot see — the
+ * path-valued arguments themselves.
+ *
+ * Fail-closed on unknowns: a call whose target cannot be recovered, or whose
+ * workspace root is unknown, is NOT clean. "I could not tell" must never read
+ * like "in scope", which is the same rule the evidence layer follows.
+ *
+ * This is not a security boundary — the sandbox and the rule layer are. It is
+ * the difference between "the model was unsure about a workspace-local edit"
+ * and "the model was unsure about something that leaves the workspace".
+ *
+ * @param opts - { toolName, args, textFacts, cwd, runsInsideWorkspace }
+ * @returns { clean, reasons } — `clean` is true only with zero risk signals.
+ */
+export function actionScope({ toolName, args, textFacts, cwd, runsInsideWorkspace, escalationTo }) {
+	const reasons = [];
+	if (runsInsideWorkspace === false) reasons.push("executes-outside-workspace");
+	// Widening the sandbox is itself an out-of-scope act: the call asks to leave
+	// the boundary the session is confined to, whatever its command text looks
+	// like. Without this, `ls` + `sandbox_permissions: danger-full-access` was
+	// in-scope (the command carries no other signal) and could be auto-approved
+	// on the judge's uncertainty — after the rule layer had already refused it.
+	if (typeof escalationTo === "string" && escalationTo !== "") reasons.push("sandbox-escalation");
+	if (isShellTool(toolName)) {
+		if (textFacts !== null && typeof textFacts === "object") {
+			if (Array.isArray(textFacts.paths) && textFacts.paths.some((entry) => entry?.outside === true)) {
+				reasons.push("path-outside-workspace");
+			}
+			if (Array.isArray(textFacts.hosts) && textFacts.hosts.length > 0) reasons.push("network-target");
+			if (Array.isArray(textFacts.destructive) && textFacts.destructive.length > 0) reasons.push("destructive-option");
+			for (const key of ["pathsOmitted", "flagsOmitted", "hostsOmitted"]) {
+				if (typeof textFacts[key] === "number" && textFacts[key] > 0) reasons.push(`facts-truncated:${key}`);
+			}
+		}
+		return { clean: reasons.length === 0, reasons };
+	}
+	const paths = toolPathArgs(args, toolName);
+	if (paths.length === 0) {
+		reasons.push("target-unknown");
+		return { clean: false, reasons };
+	}
+	if (typeof cwd !== "string" || cwd === "") {
+		reasons.push("workspace-unknown");
+		return { clean: false, reasons };
+	}
+	for (const path of paths) {
+		const rel = relative(cwd, resolve(cwd, path));
+		if (rel !== "" && (rel.startsWith("..") || isAbsolute(rel))) reasons.push(`path-outside-workspace:${path}`);
+	}
+	return { clean: reasons.length === 0, reasons };
+}
+
 const SIDE_EFFECT_SIGNALS = [
 	/\b(?:curl|wget|invoke-webrequest|iwr|start-bitstransfer)\b/i,
 	/\|\s*(?:sh|bash|zsh|dash|python3?|node|perl|ruby|pwsh|powershell|iex)\b/i,
@@ -1483,7 +1574,29 @@ export function createHandler({ config, record, llmRunner, getSessionMode, denia
 			const configOk = match.configGuard === "git-clean"
 				? await gitConfigGuard({ ...guardOpts.config, readFile: readConfigFile })
 				: true;
-			if (pathsOk && configOk) return match;
+			// A call that widens the sandbox is never settled by a rule. The rule
+			// layer judges the command TEXT; the escalation is a separate thing the
+			// user consents to, and the host maps `allowed-once` straight onto
+			// granting the wider mode (`dsh-sandbox`'s `approveEscalation`). Before
+			// this check, a guard-free allow rule (`ls`, `pwd`, `echo`, `which`,
+			// `wipefs -n`) plus `sandbox_permissions: danger-full-access` was
+			// answered `allowed-once` — no judge call, no prompt, sandbox widened.
+			// The judge already sees `escalation`, so such a call falls through to
+			// it (or to the human) instead of being auto-approved.
+			const escalationOk = guardOpts.escalation?.to === undefined;
+			// `scopeOk` is false only when the call runs outside the workspace, and
+			// undefined when the workspace root is unknown (then the other guards
+			// decide, as before).
+			const scopeOk = guardOpts.scopeOk !== false;
+			if (pathsOk && configOk && escalationOk && scopeOk) return match;
+			// A guard said no to this action. That fact outlives the rule layer:
+			// losing the rule is not the same as "no rule applied", and the policy
+			// layer may not treat this call as if nothing had objected to it (see
+			// the guard-refused dirt in `policyScope`). Without this, `git status`
+			// inside a sub-repository whose config runs a program — or any call
+			// whose only allow rule was refused — came back as an in-scope medium
+			// action and could be auto-approved on the judge's uncertainty.
+			guardOpts.refused.value = true;
 			remaining = remaining.filter((candidate) => candidate !== match);
 		}
 	};
@@ -1523,10 +1636,46 @@ export function createHandler({ config, record, llmRunner, getSessionMode, denia
 				...facts.justification === undefined ? {} : { justification: redactSensitive(facts.justification) }
 			};
 
+		// 1c) The directory THIS call actually runs in, resolved the way the host
+		//     resolves it (`dsh-tool-bash`'s `resolveWorkdir`: a relative `workdir`
+		//     is session-workspace-relative, and it becomes the spawn cwd). The two
+		//     guards must judge the paths the command really reaches: with
+		//     `workdir` ignored, `cat keep.txt` was auto-approved after checking
+		//     `<workspace>/keep.txt` while the shell read `<elsewhere>/keep.txt`,
+		//     and `git status` inside a sub-repository was approved after checking
+		//     the workspace root's (clean) `.git/config` instead of the one whose
+		//     `core.fsmonitor` / `diff.external` actually runs.
+		// `facts === null` means "no workdir, no escalation, no background" — NOT
+		// "no working directory": the call then runs in the session root, which is
+		// what `cwd` already is.
+		const workdir = facts === null || typeof facts.workdir !== "string" || facts.workdir === "" ? undefined : facts.workdir;
+		const execDir = typeof cwd !== "string" || cwd === ""
+			? undefined
+			: workdir === undefined
+				? cwd
+				: resolve(cwd, workdir);
+		// An allow rule may only settle a call that runs INSIDE the workspace. A
+		// command whose workdir escapes it reaches paths and repository config the
+		// user's allow rules were never written about, so it goes to the judge (or
+		// the human) instead. Kept separate from `pathGuard`: the git rules carry
+		// `configGuard` only, so they would otherwise stay auto-approvable.
+		const execRel = typeof cwd !== "string" || cwd === "" || execDir === undefined ? undefined : relative(cwd, execDir);
+		const runsInsideWorkspace = execRel === undefined
+			? undefined
+			: execRel === "" || (!execRel.startsWith("..") && !isAbsolute(execRel));
+
 		// 2) Classify the command's shape from the ORIGINAL text — redaction must
 		//    never turn an opaque command into an approvable one — then redact
-		//    once, so rules, the judge, the log and the denial feedback all see
-		//    the same credential-free text.
+		//    once, so the judge, the log and the denial feedback all see the same
+		//    credential-free text.
+		//
+		//
+		//    Rules are the exception: they match the ORIGINAL text. Redaction is
+		//    a rewrite, and a rewrite can delete exactly the text a rule keys on
+		//    (`token=Z|git reset --hard HEAD` used to lose its `git`, so the
+		//    deny rule never fired and the command reached the judge). A rule's
+		//    verdict is the deterministic half of the decision, so it must judge
+		//    what will actually run — never a sanitised stand-in.
 		const shapeInfo = classifyRequest(req.toolName, fullText);
 		const argsText = redactSensitive(fullText);
 		const reasonText = redactSensitive(req.reason ?? "");
@@ -1534,7 +1683,12 @@ export function createHandler({ config, record, llmRunner, getSessionMode, denia
 		// that leave the workspace, network destinations, destructive options.
 		// Derived from the redacted text, so no credential leaks into the prompt.
 		const textFacts = commandFacts({ toolName: req.toolName, argsText, shapeInfo });
-		const matchReq = { toolName: req.toolName, argsText, reason: reasonText };
+		// The call's own structural shape, as the policy layer sees it. What the
+		// judge could not see about this call's blast radius is exactly what
+		// decides whether its uncertainty may be settled by the tolerance
+		// (`medium-uncertain-in-scope`) or has to go to a human / fail closed.
+		const callScope = actionScope({ toolName: req.toolName, args, textFacts, cwd, runsInsideWorkspace, escalationTo: facts?.escalationTo });
+		const matchReq = { toolName: req.toolName, argsText: fullText, reason: req.reason ?? "" };
 		const preview = boundedText(argsText, ARGS_PREVIEW_MAX_CHARS) ?? "";
 		const evidenceIssue = evidenceProblem({ args, toolName: req.toolName, argsText, cfg });
 
@@ -1549,10 +1703,17 @@ export function createHandler({ config, record, llmRunner, getSessionMode, denia
 		//     stops paying for judge calls it keeps losing.
 		const actionKey = actionKeyOf(req.toolName, argsText, facts);
 		let gate = null;
+		// Set by `resolveRule` when an allow rule was dropped because one of its
+		// guards refused this call. Losing a rule to a guard is a decision about
+		// the call, and the policy layer must not be able to re-open it.
+		const guardRefused = { value: false };
 		if (evidenceIssue === null) {
 			rule = await resolveRule(matchReq, shapeInfo, {
-				path: { cwd, root: cwd, resolvePath },
-				config: { root: cwd }
+				path: { cwd: execDir, root: cwd, resolvePath },
+				config: { root: execDir },
+				escalation: { to: facts?.escalationTo },
+				scopeOk: runsInsideWorkspace,
+				refused: guardRefused
 			});
 		}
 		if (evidenceIssue === null && rule === null) {
@@ -1674,7 +1835,23 @@ export function createHandler({ config, record, llmRunner, getSessionMode, denia
 						else evidenceRoundFailed = true;
 					}
 				}
-				const decision = decidePolicy(answered.verdict, { tolerance: cfg.ai.riskTolerance });
+				// A judge that asked for evidence and did not get it is not merely
+				// unsure — it is blind on a point it itself flagged. "I could not
+				// see it" must never be settled by the tolerance, so the scope is
+				// dirtied whenever the evidence round failed or something was
+				// refused. Same principle as the evidence layer's own rule that an
+				// unreadable script is not an absent risk.
+				// Two things dirty the scope beyond the call's own shape: a rule
+				// guard that refused this exact call, and a judge that asked for
+				// evidence it did not get (it is blind on a point it flagged, not
+				// merely unsure). Neither may be settled by the tolerance.
+				const scopeDirt = [];
+				if (guardRefused.value === true) scopeDirt.push("rule-guard-refused");
+				if (evidenceRoundFailed === true || (Array.isArray(evidenceRefused) && evidenceRefused.length > 0)) scopeDirt.push("evidence-unavailable");
+				const policyScope = scopeDirt.length === 0
+					? callScope
+					: { clean: false, reasons: [...callScope.reasons, ...scopeDirt] };
+				const decision = decidePolicy(answered.verdict, { tolerance: cfg.ai.riskTolerance, scope: policyScope });
 				verdict = {
 					kind: "ai",
 					action: decision.action,
@@ -1683,6 +1860,10 @@ export function createHandler({ config, record, llmRunner, getSessionMode, denia
 					// was auto-approved rather than only that it was.
 					policy: decision.rule,
 					...decision.enforced === true ? { enforced: true } : {},
+					// Why the call's own shape allowed (or forbade) settling the
+					// judge's uncertainty without a human — the audit has to be able
+					// to answer that after the fact.
+					...policyScope.reasons.length === 0 ? {} : { scopeReasons: policyScope.reasons },
 					risk: answered.verdict.risk,
 					// The judge's own opinion, kept next to the policy branch that
 					// used it: without it a past decision cannot be replayed under a
@@ -2340,7 +2521,14 @@ export async function apply(ctx, userConfig) {
 		denialFeed,
 		denialHistory,
 		breakerStore,
-		getCwd: (agent) => agent?.session?.policy?.workspaceRoot ?? agent?.cwd
+		// The session's workspace root. On 0.2.x it lives on the session HEADER
+		// (`dsh-session` validates it as an absolute path, and `dsh-sandbox-policy`
+		// resolves confinement from the same field), not on `session.policy`. The
+		// previous spelling evaluated to `undefined` in production, which made
+		// `pathGuardAllows` and `gitConfigGuard` refuse on every call and silently
+		// disabled both guards (22 of the default allow rules, the transcript's
+		// `[W]` line, and the evidence root).
+		getCwd: (agent) => agent?.session?.header?.cwd ?? agent?.session?.policy?.workspaceRoot ?? agent?.cwd
 	});
 	ctx.on("approval/request", handler);
 	// volatile 热更新审计：设置页改配置走 loader 的 `updateVolatile` 原地写快照，

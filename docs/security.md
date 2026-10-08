@@ -4,7 +4,7 @@
 
 ## 安全机制
 
-- **deny 规则永远最先求值**，AI 无权覆盖显式拒绝
+- **deny 规则最先求值**，AI 无权覆盖显式拒绝。注意边界：**证据门槛排在规则层之前**——参数恢复失败或命令超预算时整个规则层不求值（这条路径直接交人类 / 在 `ai-auto` 下拒绝），所以"deny 不可覆盖"只在规则层真正跑过的请求上成立（fail-safe 方向）
 - **形状闸门**：命令文本不是"单条纯命令"就绝不被 allow 规则放行（复合命令 / 重定向 / 命令替换 / 变量 / 通配 / 控制流全部交 AI 或人类）
 - **路径参数完整**：`--` 终止符之后的每一项、以及内联在选项里的值（`-Path:..\secret` / `--file=/etc/passwd`）都算路径参数，不能靠"看起来像选项"躲过 `pathGuard`
 - **规则扫还原面**：除原始文本外还匹配"裸参数文本"、"重建 argv"与（deny/ask 专用的）"折叠紧贴引号 + 规范化空白"，`npm  publish`、`rm -r"f" /tmp/x`、`npm<TAB>publish 2>log` 与它们的常规写法同样命中（见[决策链与规则语法](decision-chain.md#规则语法)）
@@ -27,6 +27,9 @@
 - **AI 调用有超时上限**（默认 15s，每个候选各自计时），失败默认交还人类（fail-open，不会静默全拒）
 - **取消传播**：审批期间取消会传播给模型链（`signal`），取消的请求审计为 `cancelled`，不会留下过时的 `allowed-once`
 - **审计对由宿主持久化**：`approval/asked` + `approval/decided` 由 dsh 审批服务写入，插件只追加自己的决策日志
+- **提权请求永不适用 allow 规则**：宿主把 `allowed-once` 直接映射为授予更宽的沙箱（`dsh-sandbox` 的 `approveEscalation`），所以带 `sandbox_permissions` 的调用一律跳过规则层、落到裁判（它能看到 `escalation`）或人类。此前一条无守卫的 allow 规则（`ls` / `pwd` / `echo` / `which` / `wipefs -n`）加上提权目标就是一次**静默的沙箱放宽**：不调裁判、不弹窗
+- **守卫跟随命令的实际执行目录**：`pathGuard` 用 `resolve(会话根, workdir)` 解析路径参数，`configGuard` 检查**那个目录里**的仓库（子仓库的 `core.fsmonitor` 不再漏检）；`workdir` 落在工作区外时任何 allow 规则都不适用。会话根取自 `session.header.cwd`（0.2.x 的权威字段）
+- **越界信号决定"AI 拿不准"能不能被档位 settle**（`actionScope` / `medium-uncertain-in-scope`）：裁判判 `ask`、风险 medium、无人授权时，只有在这个调用**自身没有任何越界信号**时，才由 `riskTolerance` 落成放行。信号包括：越界路径、网络目标、破坏性选项、**被截断的事实**（`pathsOmitted` 等——"线索短"不等于"命令干净"）、提权请求、执行目录在工作区外、非 shell 工具的目标路径在工作区外或无法识别、**规则守卫拒绝过这条调用**、**裁判请求过补证却没拿到**。后两条尤其重要：守卫说过"不行"的动作、以及裁判"想看却没看到"的动作，都不属于"模型只是拿不准"，一律照旧 `enforced`（`ai-auto` 下拒绝）。信号全部取自调用本身（命令文本、执行目录、工具参数），不取自模型自述
 
 ## 拒绝归因（`denyFeedback`）
 
@@ -67,7 +70,7 @@ a materially safer alternative, or stop and ask the user.
 
 ### 1）层叠冲突——上游的「需要人工」被下游 AI 重新裁决
 
-`tools/pre-execute` 是 waterfall，返回 `kind: "ask"` 会触发 `dsh-tools` 的 `approval.request()`；本插件 prepend 在人类答复者之前，因此有权把该审批答成 `allowed-once`，请求就不会到达人工 UI。
+`tools/pre-execute` 是 waterfall，返回 `kind: "ask"` 会触发 `dsh-tools` 的 `approval.request()`；本插件在该接缝上应答，因此有权把该审批答成 `allowed-once`，请求就不会到达人工 UI。**注意本插件不是靠 `{ prepend: true }` 抢在人类答者之前**：它用普通的 `ctx.on("approval/request", handler)` 注册（`index.js` 的 `apply`），赢在时序——浏览器侧的人类答者要等客户端连上来才由 remote 桥注册，插件在加载期就注册了。这条时序是**事实前提而不是保证**（详见 [第一性原理](first-principles.md#9-结构性张力按严重度均为真实约束而非缺陷) 与本次审查报告 §3.1.9）。
 
 官方 Auto review 正是这种上游：它按效果分级（low 直接允许、medium 需当前人类或直接父级明确授权、high 始终拒绝），`medium` 时返回 `ask` 交给审批链。若该档位的 `approval` 策略为 `ask`，而本插件同时处于 `ai` 模式，本插件的 AI 层会**重新裁决**这一请求，可能直接判 allow 放行——官方 review 刚做出的"需要人工授权"判定被静默吃掉，且用户看不到弹窗。
 
@@ -75,12 +78,12 @@ a materially safer alternative, or stop and ask the user.
 
 所有直接监听 `approval/request` 的插件（`gbthui/dsh-auto-review`、`@quill507/dsh-auto-approval-llm`、`ZhuRuoLing/dsh-command-approve-for-me` 等）与本插件同接缝。waterfall 语义是**第一个返回结果的答者独占决策槽位，后来者收不到该请求**（Cordis `waterfall()` 源码注释："a listener that does not call `next()` vetoes the rest of the chain"）。
 
-启动时用 `{ prepend: true }` 注册的答者被 `unshift` 到监听器数组头部、先被调用；多个插件都 prepend 时，**实际胜负由 bundle 加载顺序决定**（后注册的 prepend 排更前）。被旁路的一方**静默失效——不报错、不告警**。
+启动时用 `{ prepend: true }` 注册的答者被 `unshift` 到监听器数组头部、先被调用；多个插件都 prepend 时，**实际胜负由 bundle 加载顺序决定**（后注册的 prepend 排更前）。**本插件不用 prepend**（见上），所以它与另一个裁决插件共存时，谁先应答由加载顺序与时序决定。被旁路的一方**静默失效——不报错、不告警**。
 
 ### 建议
 
 - 同一 profile **只装一个**审批裁决插件
 - 与官方 `@deepseek-ai/dsh-experimental-auto-review` **不要并用**：前者的"需要人工"判定可能被后者重新裁决，而本插件的 `denyFeedback` 归因更正只覆盖插件自身产生的拒绝，管不到这种被吃掉的场景
-- 已经装了第二个插件时，暂停本插件最省事的方式是 `/approval-mode manual`（完全旁路）或把会话权限档切回 `Workspace Write`，无需卸载
+- 已经装了第二个插件时，暂停本插件最省事的方式是 `/approval-mode manual`（完全旁路），无需卸载。**不要用"把会话权限档切回 `Workspace Write`"来暂停它**：插件只认 `cfg.enabled` 与自己的审批模式，**不看沙箱档位**——切回去不会让它旁路，反而可能把它从空闲变成活跃
 
 > 验证记录（2026-10-01，DSH 0.2.0-rc.2）：Cordis waterfall 语义与注册顺序已由源码与官方 cordis-plugin-development 文档（"waterfall listeners can rewrite and **depend on registration order**"）确认；本机唯一性问题已实测。**真实双插件抢答尚未在本机复现**（需引入第二个裁决插件并重启），上述胜负结论由源码推导。

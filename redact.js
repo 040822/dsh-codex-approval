@@ -18,17 +18,40 @@
 /**
  * Replace credential-shaped values with `[REDACTED]`.
  * Covers bearer tokens, `sk-`/`pk-` keys, URL query parameters, and
- * `key: value` / `key=value` assignments for the usual secret names.
+ * `key: value` / `key=value` assignments for the usual secret names —
+ * quoted values included.
+ *
+ * The value classes deliberately stop at `&`, `|`, `;` and `,`. An earlier
+ * `[^\s,;]+` swallowed everything after a `&` or a `|`, so
+ * `token=Z|git reset --hard HEAD` collapsed into `token=[REDACTED] reset
+ * --hard HEAD` — the `git` the deny rule matches on was gone, and the command
+ * fell through to the judge. Rules now also see the ORIGINAL text (see
+ * `index.js`), but redaction must still not rewrite a command into a different
+ * one.
  * @param text - raw text (command, reason, model output, error message)
  * @returns the redacted text; non-strings pass through unchanged.
  */
 export function redactSensitive(text) {
 	if (typeof text !== "string") return text;
 	return text
-		.replace(/\bBearer\s+[^\s,;]+/gi, "Bearer [REDACTED]")
+		.replace(/\bBearer\s+[^\s,;"]+/gi, "Bearer [REDACTED]")
 		.replace(/\b(?:sk|pk)-[A-Za-z0-9_-]{8,}\b/g, "[REDACTED]")
-		.replace(/([?&](?:api[_-]?key|access[_-]?token|auth(?:orization)?|password|passwd|secret|token)=)[^&#\s]*/gi, "$1[REDACTED]")
-		.replace(/\b(?:api[_-]?key|access[_-]?token|auth(?:orization)?|password|passwd|secret|token)\s*[:=]\s*[^\s,;]+/gi, (match) => {
+		.replace(/([?&](?:api[_-]?key|access[_-]?token|auth(?:orization)?|password|passwd|secret|token)=)[^&#\s|]*/gi, "$1[REDACTED]")
+		// Quoted values first: `--password='alpha beta'` used to leave the tail
+		// (`beta`) in the clear, because the unquoted rule below stops at the space.
+		.replace(/\b(?:api[_-]?key|access[_-]?token|auth(?:orization)?|password|passwd|secret|token)\s*[:=]\s*(['"])(?:\\.|[^'"\\])*\1/gi, (match) => {
+			const separator = match.match(/\s*[:=]\s*/)?.[0] ?? "=";
+			const label = match.slice(0, match.indexOf(separator));
+			return `${label}${separator}[REDACTED]`;
+		})
+		// `(?!Bearer\b)`: `Authorization: Bearer <token>` is already handled by the
+		// scheme rule above; without this the assignment rule swallowed the scheme
+		// too, leaving `Authorization: [REDACTED] [REDACTED]`.
+		//
+		// `\\.` keeps an escaped separator inside the value (`password=alpha\|beta`
+		// is one value): stopping at the backslash leaked the tail. A bare `|`/`&`
+		// still ends the value, which is what keeps the rest of the line visible.
+		.replace(/\b(?:api[_-]?key|access[_-]?token|auth(?:orization)?|password|passwd|secret|token)\s*[:=]\s*(?![Bb]earer\b)(?:\\.|[^\s,;&|\\])+/gi, (match) => {
 			const separator = match.match(/\s*[:=]\s*/)?.[0] ?? "=";
 			const label = match.slice(0, match.indexOf(separator));
 			return `${label}${separator}[REDACTED]`;

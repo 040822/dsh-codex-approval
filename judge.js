@@ -294,14 +294,20 @@ export const POLICY_RULES = [
  * authorization outranks the tolerance.
  *
  * @param verdict - parsed AI verdict { risk, authorization, userAuthorization? }
- * @param opts - { tolerance }
+ * @param opts - { tolerance, scope }
+ *   `scope` is the call's own structural shape, computed by `index.js`'s
+ *   `actionScope`: `{ clean, reasons }`, true only when nothing in the call
+ *   reaches outside the workspace (or past what the fact extractor could
+ *   report). It is the one input that lets a judge's uncertainty be settled
+ *   without a human — see `medium-uncertain-in-scope`. `undefined` means the
+ *   caller could not compute it, which keeps the stricter old behaviour.
  * @returns { action, rule, enforced? } — action is "allow" | "ask" | "deny".
  *   `enforced: true` marks an "ask" that exists because the user never
  *   authorized this action, NOT because the judge was unsure: an unattended
  *   mode may not resolve it through its generic ask setting (it has to fail
  *   closed), or the whole point of separating risk from authorization is lost.
  */
-export function decidePolicy(verdict, { tolerance = "medium" } = {}) {
+export function decidePolicy(verdict, { tolerance = "medium", scope } = {}) {
 	const riskRank = RISK_RANK[verdict.risk] ?? 2;
 	const toleranceRank = RISK_RANK[tolerance] ?? 1;
 	const authorization = verdict.userAuthorization;
@@ -318,7 +324,24 @@ export function decidePolicy(verdict, { tolerance = "medium" } = {}) {
 	// action that the judge doubts and nobody authorized goes to a human: this is
 	// where the live baseline (`node scripts/eval.mjs --live`) caught pipelines
 	// like `curl … | sh` being approved on a mere in-tolerance "ask".
+	//
+	// EXCEPT — and this is the unattended-mode lever — when the call carries no
+	// out-of-scope signal of its own (`scope.clean`): no escaping path, no
+	// network target, no destructive option, no truncated fact list, and a
+	// target inside the workspace. A `/workspace/src/index.js` edit that the
+	// model is merely unsure about is not the same proposition as `curl | sh`,
+	// and under `ai-auto` the generic rule sent both to `deny` — which is how
+	// the mode ended up refusing the routine half of its own workload. The
+	// signals come from the call (command text, working directory, tool
+	// arguments), never from the model's prose, and `scope === undefined` keeps
+	// the strict reading.
 	if (riskRank >= RISK_RANK.medium && !strong) {
+		// The in-scope exception only ever ADDS an approval (when the tolerance
+		// already reaches the risk); every other landing keeps its old branch name
+		// and its old enforced semantics.
+		if (verdict.risk === "medium" && scope !== undefined && scope.clean === true && riskRank <= toleranceRank) {
+			return { action: "allow", rule: "medium-uncertain-in-scope" };
+		}
 		return { action: "ask", rule: "ask-without-authorization", enforced: true };
 	}
 	if (riskRank > toleranceRank) return { action: "ask", rule: "judge-ask" };

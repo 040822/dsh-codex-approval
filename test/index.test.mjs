@@ -3140,3 +3140,67 @@ test("handler: the judge and the audit get the command's structured facts", asyn
 	assert.equal("facts" in plain, false);
 	assert.equal("commandFacts" in records.at(-1), false);
 });
+
+test("handler: rules match the ORIGINAL command, not the redacted one", async () => {
+	// Redaction is a rewrite; it must never rewrite a command out of a rule's
+	// reach. The command is deliberately OPAQUE (trailing `# note`): a compound
+	// command gets an extra "semantic" surface rebuilt from the shell parts of the
+	// original text, which hides this defect; only the opaque shape falls back to
+	// the single argument-text surface, and that one used to be the redacted copy
+	// (`token=Z|git reset --hard` collapsed to `token=[REDACTED] reset --hard`,
+	// losing `git`, so the deny rule never fired and the command reached the judge).
+	const records = [];
+	const cfg = baseConfig({ rules: [{ match: "Bash(*git reset --hard*)", action: "deny" }] });
+	const handler = createHandler({
+		config: cfg,
+		record: async (entry) => { records.push(entry); },
+		llmRunner: async () => ({ ok: true, text: VERDICT_TEXT })
+	});
+	const { outcome, nextCalls } = await run(handler, makeReq({ callId: "redact-1", command: "echo hi token=Z|git reset --hard HEAD # note" }));
+	assert.equal(outcome, "rejected");
+	assert.equal(nextCalls.length, 0);
+	const entry = records.at(-1);
+	assert.equal(entry.kind, "rule");
+	assert.match(entry.match, /git reset --hard/);
+});
+
+test("handler: a rule that keys on the credential VALUE only matches the original text", async () => {
+	// The discriminating case for "rules read the original text": redaction
+	// replaces the value with `[REDACTED]` no matter how careful the pattern is,
+	// so a rule written against the value can only fire if the rule layer sees the
+	// raw command. (A rule keyed on surrounding words passes even with the old
+	// ordering, so it cannot pin this half of the fix.)
+	const records = [];
+	let judgeCalls = 0;
+	const cfg = baseConfig({ rules: [{ match: "Bash(*api_key=AAA*)", action: "ask", hardAsk: true }] });
+	const handler = createHandler({
+		config: cfg,
+		record: async (entry) => { records.push(entry); },
+		llmRunner: async () => { judgeCalls++; return { ok: false, error: "AI must not run" }; }
+	});
+	const { outcome } = await run(handler, makeReq({ callId: "redact-2", command: "echo hi api_key=AAA # note" }));
+	assert.equal(outcome, "unavailable"); // the human, via hardAsk
+	assert.equal(records.at(-1).hardAsk, true);
+	assert.equal(records.at(-1).kind, "rule");
+	assert.equal(judgeCalls, 0, "a matched rule must not spend a judge call");
+});
+
+test("handler: the audit preview stays redacted even when a rule saw the original", async () => {
+	// Rule matching is the one consumer that reads raw text; everything written
+	// down or sent out must still be credential-free.
+	const records = [];
+	const seen = [];
+	const cfg = baseConfig({ rules: [{ match: "Bash(echo*)", action: "allow" }] });
+	const handler = createHandler({
+		config: cfg,
+		record: async (entry) => { records.push(entry); },
+		llmRunner: async (messages) => { seen.push(messages); return { ok: true, text: VERDICT_TEXT }; }
+	});
+	const { outcome } = await run(handler, makeReq({ callId: "redact-3", command: "echo api_key=SECRETVALUE" }));
+	assert.equal(outcome, "allowed-once");
+	const entry = records.at(-1);
+	assert.equal(entry.kind, "rule");
+	assert.ok(!`${entry.argsPreview ?? ""}`.includes("SECRETVALUE"), "the preview must not carry the credential");
+	assert.ok(`${entry.argsPreview ?? ""}`.includes("[REDACTED]"));
+	assert.equal(seen.length, 0, "an allow rule must not spend a judge call");
+});

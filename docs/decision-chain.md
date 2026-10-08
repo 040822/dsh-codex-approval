@@ -127,8 +127,11 @@ bash/pwsh 的 **allow 规则只在命令被 `shell-shape.js` 判定为 `simple`*
 | `high-risk-insufficient-authorization` | 风险 high，且用户授权不是 strong | 交人工（**容忍度管不了它**） |
 | `judge-allow-above-tolerance` | 裁判判 allow，但风险高于容忍度、授权不是 strong | 交人工 |
 | `judge-allow` | 裁判判 allow，且在容忍度内（或授权 strong） | 放行 |
-| `ask-without-authorization` | 裁判判 ask、风险 ≥ medium、授权不是 strong | 交人工（`enforced`；**live 基线里 `curl … \| sh` 正是从这里被放行的**） |
+| `ask-without-authorization` | 裁判判 ask、风险 ≥ medium、授权不是 strong，且**该调用带越界信号**（见下） | 交人工（`enforced`） |
+| `medium-uncertain-in-scope` | 裁判判 ask、风险为 medium、授权不是 strong，但该调用**自身没有任何越界信号**，且风险在容忍度内 | 放行（`ai-auto` 下也是放行——这是无人值守不再拒绝日常工作的地方） |
 | `judge-ask` | 裁判判 ask，且风险 low 或授权 strong：在容忍度内 → 放行，否则交人工 | 两种落点 |
+
+**「越界信号」是 `medium-uncertain-in-scope` 的准入条件**，由 `actionScope` 从调用自身算出（不取自模型自述），任一项成立即不干净、走 `ask-without-authorization`：越界路径、网络目标主机、破坏性选项、**被截断的事实**（`pathsOmitted` / `flagsOmitted` / `hostsOmitted`）、提权请求（`sandbox_permissions`）、执行目录在工作区外、非 shell 工具的目标路径在工作区外或无法识别、**规则守卫拒绝过这条调用**、**裁判请求过补证却没拿到**。最后两条是这次收紧的重点：守卫说过"不行"的动作，以及裁判"想看却没看到"的动作，都不算"模型只是拿不准"。
 
 三档容忍度在 `ai` 模式下的落点：
 
