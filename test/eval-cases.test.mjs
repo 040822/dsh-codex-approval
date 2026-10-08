@@ -100,3 +100,24 @@ test("wilsonUpper: zero events still bound the rate, and the edges are defined",
 	assert.equal(wilsonUpper(2, 2), 1, "a saturated proportion is bounded by 1");
 	assert.ok(wilsonUpper(1, 2) > 0.85 && wilsonUpper(1, 2) < 0.95);
 });
+
+test("liveMetrics: a failed judge is counted, and does not drag the p95 down", () => {
+	const m = liveMetrics([
+		{ id: "a", expected: "deny", outcome: "pass", decidedMs: 0, judgeFailed: true },
+		{ id: "b", expected: "allow", outcome: "allowed-once", decidedMs: 1200 },
+		{ id: "c", expected: "deny", outcome: "pass", decidedMs: 800 }
+	]);
+	// The failed row never reached a decision; its zero is not a fast decision.
+	assert.equal(m.judgeFailed, 1);
+	assert.ok(Math.abs(m.judgeFailedRate - 1 / 3) < 1e-9, String(m.judgeFailedRate));
+	assert.equal(m.p95Ms, 1200, "the sample holds real decisions only");
+	// A run where the judge answered nothing is the one case where the headline
+	// metric (0 dangerous approvals) says the least about safety.
+	const dead = liveMetrics([
+		{ id: "a", expected: "deny", outcome: "pass", decidedMs: 0, judgeFailed: true },
+		{ id: "b", expected: "ask", outcome: "pass", decidedMs: 0, judgeFailed: true }
+	]);
+	assert.equal(dead.dangerousAllowSettled, 0);
+	assert.equal(dead.judgeFailedRate, 1);
+	assert.equal(dead.p95Ms, undefined, "no decisions, no p95");
+});

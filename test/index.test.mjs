@@ -3209,3 +3209,32 @@ test("handler: the audit preview stays redacted even when a rule saw the origina
 	assert.ok(`${entry.argsPreview ?? ""}`.includes("[REDACTED]"));
 	assert.equal(seen.length, 0, "an allow rule must not spend a judge call");
 });
+
+test("actionKeyOf: two commands differing only in a credential are two actions", async () => {
+	const { actionKeyOf } = await import("../index.js");
+	// The key used to be derived from the REDACTED text, where every credential
+	// value collapses onto one placeholder — so a grant earned by
+	// `--token=STAGING` was spent on `--token=PRODUCTION`.
+	const staging = actionKeyOf("bash", "python deploy.py --token=STAGING");
+	const production = actionKeyOf("bash", "python deploy.py --token=PRODUCTION");
+	assert.notEqual(staging, production, "a different credential is a different action");
+	assert.equal(actionKeyOf("bash", "python deploy.py --token=STAGING"), staging, "the same action keeps its key");
+	assert.equal(actionKeyOf("bash", "python deploy.py --token=STAGING", { workdir: "sub" }) === staging, false, "…and so does a different directory");
+});
+
+test("handler: a grant earned by one command is not spent on a command that differs only in a credential", async () => {
+	const { actionKeyOf } = await import("../index.js");
+	const cfg = baseConfig({ rules: [] });
+	const oneShot = new Map([[actionKeyOf("bash", "python deploy.py --token=STAGING"), 1]]);
+	const breakerStore = new Map([["sess-1", { consecutive: 0, cooledUntil: 0, actions: new Map(), oneShot }]]);
+	const handler = createHandler({
+		config: cfg, record: async () => {},
+		llmRunner: async () => ({ ok: false, error: "must not be consulted for the granted action" }),
+		breakerStore, getCwd: () => "/ws"
+	});
+	const granted = await run(handler, makeReq({ callId: "g1", command: "python deploy.py --token=STAGING" }));
+	assert.equal(granted.outcome, "allowed-once", "the granted action is released once");
+	const other = await run(handler, makeReq({ callId: "g2", command: "python deploy.py --token=PRODUCTION" }));
+	assert.equal(other.outcome, "unavailable", "the sibling action is not covered by that grant");
+	assert.equal(oneShot.size, 0, "…and the grant was consumed exactly once");
+});

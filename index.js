@@ -1534,6 +1534,13 @@ export function actionKeyOf(toolName, argsText, facts) {
 	// itself contain whatever separator we picked, which would let a crafted
 	// directory (or an escalation string) produce the same key as another action
 	// and spend a grant the human gave for something else.
+	//
+	// `argsText` must be the ORIGINAL command text, never the redacted copy. The
+	// redaction maps every credential value onto one placeholder, which made two
+	// different actions share a key (`--token=STAGING` and `--token=PRODUCTION`
+	// hashed identically) — and a one-shot grant is the human saying "this
+	// action, once". The key is a hash, so nothing about the command reaches the
+	// audit through it.
 	const parts = [];
 	if (typeof facts?.workdir === "string" && facts.workdir !== "") parts.push(`wd:${facts.workdir}`);
 	if (typeof facts?.escalationTo === "string" && facts.escalationTo !== "") parts.push(`esc:${facts.escalationTo}`);
@@ -1746,7 +1753,13 @@ export function createHandler({ config, record, llmRunner, getSessionMode, denia
 		//   - a one-shot human approval of THIS exact action, consumed here;
 		//   - a tripped rejection breaker, so a session that keeps getting denied
 		//     stops paying for judge calls it keeps losing.
-		const actionKey = actionKeyOf(req.toolName, argsText, facts);
+		// The key is derived from the ORIGINAL command, not the redacted one.
+		// Redaction replaces credential values with one placeholder, so
+		// `deploy --token=STAGING` and `deploy --token=PRODUCTION` collapsed onto
+		// the same key — and the second one then consumed the human signature the
+		// first had earned. A one-shot grant is the human saying "this action,
+		// once"; a different credential is a different action.
+		const actionKey = actionKeyOf(req.toolName, fullText, facts);
 		let gate = null;
 		// Set by `resolveRule` when an allow rule was dropped because one of its
 		// guards refused this call. Losing a rule to a guard is a decision about
