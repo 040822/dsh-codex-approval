@@ -205,3 +205,64 @@ test("isCredentialPath: a backup suffix does not launder a credential name", () 
 		assert.equal(isCredentialPath(path), true, `${path} must be refused`);
 	}
 });
+
+test("fetchEvidence: a path swapped for a symlink between the check and the read is refused", async () => {
+	// The whitelist used to be checked on a string and then re-resolved three
+	// more times: `realpath` → `stat` → `read`, all following whatever the path
+	// pointed at by then (CWE-367). Swapping the file for a symlink after the
+	// checks passed handed over the file the whitelist had just refused.
+	const { mkdtempSync, writeFileSync, symlinkSync, rmSync } = await import("node:fs");
+	const { tmpdir } = await import("node:os");
+	const { join } = await import("node:path");
+	const { realpath } = await import("node:fs/promises");
+	const root = mkdtempSync(join(tmpdir(), "ev-race-"));
+	const outside = mkdtempSync(join(tmpdir(), "ev-out-"));
+	const secret = join(outside, "secret.txt");
+	writeFileSync(secret, "OUTSIDE-SECRET");
+	const target = join(root, "notes.txt");
+	writeFileSync(target, "fine");
+	let swapped = false;
+	const racingResolve = async (path) => {
+		const real = await realpath(path);
+		if (real.endsWith("notes.txt") && !swapped) {
+			swapped = true;
+			rmSync(real);
+			symlinkSync(secret, real);
+		}
+		return real;
+	};
+	const { files, refused } = await fetchEvidence([{ path: "notes.txt", why: "x" }], { root, base: root, resolvePath: racingResolve });
+	assert.deepEqual(files, [], "the swapped path must not be read");
+	assert.equal(refused.length, 1);
+	// The old implementation returned files[0].text === "OUTSIDE-SECRET" here.
+	assert.equal(refused[0].reason, REFUSAL.unreadable, "O_NOFOLLOW turns the race into a refusal");
+});
+
+test("fetchEvidence: through the real default reader, files are read and non-files are refused", async () => {
+	// The single-fd path is what production uses; these pin its decisions.
+	const { mkdtempSync, writeFileSync, mkdirSync, symlinkSync } = await import("node:fs");
+	const { tmpdir } = await import("node:os");
+	const { join } = await import("node:path");
+	const root = mkdtempSync(join(tmpdir(), "ev-fd-"));
+	writeFileSync(join(root, "ok.txt"), "hello");
+	mkdirSync(join(root, "adir"));
+	symlinkSync(join(root, "ok.txt"), join(root, "link.txt"));
+
+	const read = await fetchEvidence([{ path: "ok.txt", why: "x" }], { root, base: root });
+	assert.equal(read.files.length, 1);
+	assert.equal(read.files[0].text, "hello");
+	assert.equal(read.files[0].bytes, 5);
+
+	// A directory is not a regular file.
+	const dir = await fetchEvidence([{ path: "adir", why: "x" }], { root, base: root });
+	assert.deepEqual(dir.files, []);
+	assert.equal(dir.refused[0].reason, REFUSAL.notAFile);
+
+	// A symlink the resolver did not follow (injected as "already resolved") is
+	// refused rather than followed — that is the whole point of O_NOFOLLOW.
+	const { realpath } = await import("node:fs/promises");
+	const link = await fetchEvidence([{ path: "link.txt", why: "x" }], { root, base: root, resolvePath: async () => join(root, "link.txt") });
+	assert.deepEqual(link.files, []);
+	assert.ok([REFUSAL.unreadable, REFUSAL.notAFile].includes(link.refused[0].reason), link.refused[0].reason);
+	void realpath;
+});
