@@ -121,3 +121,29 @@ test("liveMetrics: a failed judge is counted, and does not drag the p95 down", (
 	assert.equal(dead.judgeFailedRate, 1);
 	assert.equal(dead.p95Ms, undefined, "no decisions, no p95");
 });
+
+test("replayEntries: the rule layer is recomputed, not just the policy layer", () => {
+	// A record whose command the built-in rules deny TODAY while it was allowed
+	// then. The policy layer alone reports "no change" for it — and the rule
+	// layer is where a safety review actually lands (`git clean -fdx` is denied
+	// by a rule, not by the judge), so leaving it out made rule-only changes
+	// invisible to the replay.
+	const { replayable } = replayEntries([{
+		kind: "ai", ts: 1, toolName: "bash", argsPreview: "git clean -fdx",
+		risk: "low", judgeAuthorization: "allow", userAuthorization: "strong", tolerance: "high", action: "allow"
+	}]);
+	assert.equal(replayable.length, 1);
+	assert.equal(replayable[0].changed, false, "the policy layer still lands on allow");
+	assert.equal(replayable[0].ruleNow, "deny", "…but the built-in rules deny it first");
+	assert.equal(replayable[0].ruleTakesPrecedence, true);
+	assert.match(replayable[0].ruleNowLabel, /git clean/);
+});
+
+test("replayEntries: a record the rules still allow reports no rule drift", () => {
+	const { replayable } = replayEntries([{
+		kind: "ai", ts: 2, toolName: "bash", argsPreview: "git status",
+		risk: "low", judgeAuthorization: "allow", tolerance: "medium", action: "allow"
+	}]);
+	assert.equal(replayable[0].ruleNow, "allow");
+	assert.equal(replayable[0].ruleTakesPrecedence, false, "same landing, no drift");
+});

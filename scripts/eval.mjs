@@ -29,6 +29,7 @@
  */
 
 import { createHash } from "node:crypto";
+import { spawnSync } from "node:child_process";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -36,6 +37,7 @@ import { buildJudgeMessages, decidePolicy, parseVerdict } from "../judge.js";
 import { createHandler, normalizeConfig } from "../index.js";
 import { commandFacts } from "../command-facts.js";
 import { classifyCommand } from "../shell-shape.js";
+import { evaluateRules, ruleLabel } from "../rules.js";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 /** Distinguishes live reports by transcript mode, so two runs do not overwrite. */
@@ -160,6 +162,16 @@ export async function evaluatePolicyCases(cases) {
 export function replayEntries(entries) {
 	const replayable = [];
 	let aiRecords = 0;
+	// The rule layer is recomputed from the same record. It used to be skipped
+	// entirely, so a change that only touched the rules — where safety reviews
+	// actually land — reported "0 条落点改变" (`git clean -fdx` is denied by a
+	// rule, and the replay called it an allow).
+	//
+	// A guard (`pathGuard` / `configGuard`) needs a filesystem and a workspace
+	// root, and audit records carry no `cwd` (measured: 0 of 258 decisions), so
+	// what is recomputed is the guard-free match: the deny/ask rules and the
+	// shape gate, which is the half that decides most records.
+	const rules = normalizeConfig({}).rules;
 	for (const entry of entries) {
 		if (entry === null || typeof entry !== "object") continue;
 		if (entry.kind !== "ai") continue;
@@ -168,6 +180,13 @@ export function replayEntries(entries) {
 		const decision = decidePolicy(
 			{ risk: entry.risk, authorization: entry.judgeAuthorization, ...entry.userAuthorization === undefined ? {} : { userAuthorization: entry.userAuthorization } },
 			{ tolerance: entry.tolerance }
+		);
+		const commandText = typeof entry.argsPreview === "string" ? entry.argsPreview : "";
+		const toolName = typeof entry.toolName === "string" ? entry.toolName : "bash";
+		const ruleMatch = evaluateRules(
+			rules,
+			{ toolName, argsText: commandText, reason: "" },
+			classifyCommand(toolName, commandText)
 		);
 		replayable.push({
 			ts: entry.ts,
@@ -179,7 +198,14 @@ export function replayEntries(entries) {
 			was: entry.action,
 			now: decision.action,
 			rule: decision.rule,
-			changed: entry.action !== decision.action
+			changed: entry.action !== decision.action,
+			// What the built-in rules alone would do with this command today, and
+			// whether that would land before the policy layer (it does: rules are
+			// evaluated first, and a rule's decision — including a deny — is never
+			// overridden).
+			ruleNow: ruleMatch === null ? null : ruleMatch.action,
+			ruleNowLabel: ruleMatch === null ? "" : ruleLabel(ruleMatch),
+			ruleTakesPrecedence: ruleMatch !== null && (entry.action ?? null) !== ruleMatch.action
 		});
 	}
 	return { replayable, aiRecords };
@@ -261,9 +287,40 @@ export function liveMetrics(rows) {
 	};
 }
 
+/**
+ * What code and what prompt produced a report.
+ *
+ * Gate rule 1 asks for "the reports before and after the change" as the evidence
+ * for loosening anything. Two reports that cannot be attributed to a revision
+ * are not that evidence: a report written from a dirty tree does not correspond
+ * to any commit at all, and nothing in the old header said so.
+ */
+function buildProvenance() {
+	const git = (args) => {
+		const out = spawnSync("git", args, { cwd: ROOT, encoding: "utf8" });
+		return out.status === 0 ? (out.stdout ?? "").trim() : "";
+	};
+	const head = git(["rev-parse", "--short", "HEAD"]);
+	const porcelain = git(["status", "--porcelain"]);
+	// Hash the judge policy the way it is actually sent (the system message), so
+	// a prompt edit invalidates the comparison even when no code file changed.
+	const promptHash = createHash("sha1")
+		.update(buildJudgeMessages({ toolName: "bash", argsText: "x", reason: "" })[0].content[0].text)
+		.digest("hex")
+		.slice(0, 10);
+	return { head, dirty: porcelain === "" ? "clean" : "dirty", promptHash };
+}
+
 /** Markdown report: the artifact a change is judged by. */
 export function renderReport({ mode, meta, lines, table }) {
-	const head = [`# dsh-codex-approval eval — ${mode}`, "", `- 生成时间：${new Date().toISOString()}`, ...meta.map((m) => `- ${m}`), ""];
+	const prov = buildProvenance();
+	const head = [
+		`# dsh-codex-approval eval — ${mode}`, "",
+		`- 生成时间：${new Date().toISOString()}`,
+		`- 代码：${prov.head === "" ? "(不是 git 工作区)" : prov.head}${prov.dirty === "clean" ? "（工作区干净）" : "（**工作区有未提交改动——本报告不对应任何提交**）"}`,
+		`- 判定提示词哈希：${prov.promptHash}（temperature 0）`,
+		...meta.map((m) => `- ${m}`), ""
+	];
 	return [...head, ...lines, "", ...table, ""].join("\n");
 }
 
@@ -430,20 +487,36 @@ async function main() {
 		const entries = readCases(file);
 		const { replayable, aiRecords } = replayEntries(entries);
 		const changed = replayable.filter((r) => r.changed);
+		// The rule layer is the other half of "what would happen today". A rule is
+		// evaluated before the policy layer and is never overridden by it, so a
+		// record the built-in rules would now deny is an outcome change even when
+		// the policy landing is identical — and rules are where safety reviews
+		// actually land (`git clean -fdx` is denied by a rule, not by the judge).
+		const ruleDrift = replayable.filter((r) => r.ruleTakesPrecedence);
 		const rows = changed.map((r) => `| ${r.ts ?? "-"} | ${(r.argsPreview ?? "").slice(0, 60).replace(/\|/g, "\\|")} | ${r.risk} | ${r.judgeAuthorization} | ${r.userAuthorization ?? "-"} | ${r.tolerance} | ${r.was} | ${r.now} | ${r.rule} |`);
+		const ruleRows = ruleDrift.map((r) => `| ${r.ts ?? "-"} | ${(r.argsPreview ?? "").slice(0, 60).replace(/\|/g, "\\|")} | ${r.risk} | ${r.was} | ${r.ruleNow} | ${r.ruleNowLabel} |`);
 		const text = renderReport({
 			mode: "replay",
 			meta: [
 				`日志：${file}`,
 				`ai 记录：${aiRecords}`,
-				`可精确回放：${replayable.length}（需要 judgeAuthorization + tolerance，v0.5.0 起写入）`,
-				`落点改变：${changed.length}`
+				`可精确回放：${replayable.length}（需要 judgeAuthorization + tolerance，v0.4.6 起写入）`,
+				`策略层落点改变：${changed.length}`,
+				`规则层今天会先接管：${ruleDrift.length}`
 			],
-			lines: ["## 会改变的判定", "", "| 时间 | 命令 | risk | judge 意见 | 用户授权 | 容忍度 | 原动作 | 现动作 | 现分支 |", "|---|---|---|---|---|---|---|---|---|", ...rows],
+			lines: [
+				"## 策略层会改变的判定", "",
+				"| 时间 | 命令 | risk | judge 意见 | 用户授权 | 容忍度 | 原动作 | 现动作 | 现分支 |",
+				"|---|---|---|---|---|---|---|---|---|", ...rows,
+				"", "## 规则层今天会先接管的记录", "",
+				"内置规则集，guard（`pathGuard` / `configGuard`）不复算——审计记录里没有 `cwd`。规则先于策略层求值且不被覆盖，所以这些记录今天的结局与「原动作」不同。", "",
+				"| 时间 | 命令 | risk | 原动作 | 规则层今天 | 命中规则 |",
+				"|---|---|---|---|---|---|", ...ruleRows
+			],
 			table: []
 		});
 		const out = writeReport("replay", text);
-		console.log(`replay: ${replayable.length}/${aiRecords} 条可回放，${changed.length} 条落点改变 → ${out}`);
+		console.log(`replay: ${replayable.length}/${aiRecords} 条可回放，策略层落点改变 ${changed.length} 条，规则层今天会先接管 ${ruleDrift.length} 条 → ${out}`);
 		return;
 	}
 
