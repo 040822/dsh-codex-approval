@@ -36,13 +36,60 @@ import { homedir, tmpdir } from "node:os";
 
 const HOME = homedir();
 const SRC = resolve(process.argv[2] ?? join(import.meta.dirname, ".."));
+
 /**
- * 期待被跳过的用例数：test/index.test.mjs 里标记 `VOLATILE_ONLY` 的用例条数 ——
- * 3 条纯 volatile 语义的配置往返 + 1 条「默认审批模式热生效」。
- * 新增 VOLATILE_ONLY 用例时同步这个数字，否则无 volatile 的平面会误报。
+ * The only cases allowed to be skipped on a plane without `.volatile()`:
+ * configuration round-trips, whose subject IS the volatile mechanism. Nothing
+ * here decides an approval.
+ *
+ * A safety case marked `VOLATILE_ONLY` would be skipped forever on the
+ * production plane, and "bump the expected count" used to be enough to make
+ * both planes green. Counting the markers closed the first half; this list
+ * closes the second — adding a name here means naming the case, and a name like
+ * "a grant cannot re-enable a rule denial" is visible in a way that `4 → 5` is
+ * not.
  */
-const EXPECTED_SKIPS_WITHOUT_VOLATILE = 4;
+const VOLATILE_ONLY_ALLOWED = new Set([
+	"配置往返：改回默认值、删除字段都按预期生效",
+	"配置往返：删除字段后回落到内置兜底，而不是恢复启动时的值",
+	"配置往返：fallbacks 的「清空」与「没配过」可区分",
+	"默认审批模式：设置值覆盖配置默认，且经 live 通道热生效",
+	"五个 volatile 字段经 live 通道热生效（收紧审批的闸门写入即生效）"
+]);
+
+/**
+ * Which cases a plane without `.volatile()` is expected to skip:
+ * **counted from the test sources**, not kept as a literal.
+ *
+ * The literal's only failure signal was "the count does not match", and that
+ * signal could be consumed by editing the literal itself — mark a real safety
+ * case `{ skip: VOLATILE_ONLY }`, bump the constant, and both planes report
+ * "全部通过" while that case is skipped forever on the production plane and
+ * nobody is told. Counting removes that shortcut: the only way to change the
+ * expectation is to change the tests, which is visible.
+ * @param dir - the plugin source directory
+ * @returns { count, names } — names feed the allow-list check above
+ */
+async function countVolatileOnlyCases(dir) {
+	let files;
+	try {
+		files = await readdir(join(dir, "test"));
+	} catch {
+		return { count: 0, names: [] };
+	}
+	const names = [];
+	for (const file of files) {
+		if (!file.endsWith(".mjs")) continue;
+		const text = await readFile(join(dir, "test", file), "utf8");
+		for (const match of text.matchAll(/test\(\s*"([^"]+)"\s*,\s*\{\s*skip:\s*VOLATILE_ONLY\s*\}/g)) names.push(match[1]);
+	}
+	return { count: names.length, names };
+}
+
 const SKIP_DIRS = new Set(["node_modules", ".git", ".pnpm"]);
+
+/** Filled in before the planes run (see `countVolatileOnlyCases`). */
+let expectedSkips = 0;
 
 const c = { r: "\x1b[31m", g: "\x1b[32m", y: "\x1b[33m", b: "\x1b[1m", x: "\x1b[0m" };
 const say = (s = "") => process.stdout.write(`${s}\n`);
@@ -151,8 +198,8 @@ async function runPlane({ version, dir }) {
 		if (probe.volatile && skipped !== 0) problems.push(`volatile 可用却跳过了 ${skipped} 条——探测与用例不一致`);
 		if (!probe.volatile && skipped === 0)
 			problems.push("volatile 不可用却一条都没跳过——平面没挂对，或测试丢失了平面感知");
-		if (!probe.volatile && skipped !== EXPECTED_SKIPS_WITHOUT_VOLATILE && skipped > 0)
-			problems.push(`跳过数为 ${skipped}，预期 ${EXPECTED_SKIPS_WITHOUT_VOLATILE}`);
+		if (!probe.volatile && skipped !== expectedSkips && skipped > 0)
+			problems.push(`跳过数为 ${skipped}，源码里标了 ${expectedSkips} 条 VOLATILE_ONLY`);
 
 		for (const p of problems) say(`  ${c.r}✗ ${p}${c.x}`);
 		if (!problems.length) say(`  ${c.g}✓ 通过${c.x}`);
@@ -165,9 +212,23 @@ async function runPlane({ version, dir }) {
 const dim = (s) => `\x1b[2m${s}\x1b[0m`;
 
 const planes = discoverPlanes();
+const skippedInfo = await countVolatileOnlyCases(SRC);
+expectedSkips = skippedInfo.count;
 say(`${c.b}dsh-codex-approval 双平面单测${c.x}`);
 say(`插件源码  ${SRC}`);
 say(`发现平面  ${planes.length} 个：${planes.map((p) => p.version).join(", ") || "(无)"}`);
+say(`跳过期待  从测试源码数得 ${expectedSkips} 条 VOLATILE_ONLY（无 volatile 的平面应恰好跳过这些）`);
+// Only configuration round-trips may carry the marker: a safety case skipped on
+// the production plane is a hole nobody would notice.
+const disallowed = skippedInfo.names.filter((name) => !VOLATILE_ONLY_ALLOWED.has(name));
+if (disallowed.length > 0) {
+	say("");
+	say(`${c.r}✗ 有非配置用例标了 VOLATILE_ONLY${c.x}：`);
+	for (const name of disallowed) say(`    · ${name}`);
+	say(`  这些用例在无 volatile 的平面（0.1.5，生产）上会被永久跳过。`);
+	say(`  要么去掉标记，要么把用例名加进 check-planes.mjs 的 VOLATILE_ONLY_ALLOWED 并写明它为何与 volatile 机制同义。`);
+	process.exit(1);
+}
 say("");
 if (!planes.length) {
 	say(`${c.r}一个平面都没发现${c.x}：检查 ~/.npm-global 与 ~/dsh-runtimes 下的 dsh 安装，或用 EXTRA_SCHEMASTER 指定。`);

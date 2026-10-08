@@ -568,7 +568,21 @@ const LIVE_FIELDS = [
 	// 会话骨架：设置页改动即刻生效（不重载插件）。
 	["transcript", ["transcript"]],
 	["transcriptMaxChars", ["transcriptMaxChars"]],
-	["denyFeedback", ["denyFeedback"]]
+	["denyFeedback", ["denyFeedback"]],
+	// These five are declared `volatile` in the Config schema, so the loader never
+	// reloads the plugin for them (`isVolatilePath` → `volatileOnly`) and the
+	// settings form derives its fields from that same declaration — which is to
+	// say the operator could edit them, watch the save succeed, and keep running
+	// the startup snapshot until the next restart. Three of them are the levers
+	// that TIGHTEN unattended operation (`denialBreaker`, `evidenceFetch`,
+	// `evidenceMaxBytes`), so a silently ignored write is the worst case. The
+	// 0.1.x settings path always rebuilt `cfg`, which is why this only ever broke
+	// on 0.2.0.
+	["totalBudgetMs", ["ai", "totalBudgetMs"]],
+	["evidenceFetch", ["ai", "evidenceFetch"]],
+	["evidenceMaxFiles", ["ai", "evidenceMaxFiles"]],
+	["evidenceMaxBytes", ["ai", "evidenceMaxBytes"]],
+	["denialBreaker", ["denialBreaker"]]
 ];
 
 /**

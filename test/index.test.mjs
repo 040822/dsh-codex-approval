@@ -3238,3 +3238,36 @@ test("handler: a grant earned by one command is not spent on a command that diff
 	assert.equal(other.outcome, "unavailable", "the sibling action is not covered by that grant");
 	assert.equal(oneShot.size, 0, "…and the grant was consumed exactly once");
 });
+
+test("五个 volatile 字段经 live 通道热生效（收紧审批的闸门写入即生效）", { skip: VOLATILE_ONLY }, async () => {
+	// These five are declared `volatile`, so the loader never reloads the plugin
+	// for them and the settings form offers them — which is to say an operator
+	// could tighten a gate, watch the save succeed, and keep running the startup
+	// snapshot until the next restart. The 0.1.x settings path always rebuilt
+	// `cfg`, so this only ever broke on 0.2.0.
+	const { Config } = await import("../index.js");
+	const { source, cfg } = await buildCfg({
+		totalBudgetMs: 30_000, evidenceFetch: "read-file", evidenceMaxFiles: 2,
+		evidenceMaxBytes: 16_384, denialBreaker: { consecutive: 3, duplicate: 2, cooldownMs: 600_000 }
+	});
+	assert.equal(cfg.ai.totalBudgetMs, 30_000);
+	assert.equal(cfg.ai.evidenceFetch, "read-file");
+	assert.equal(cfg.denialBreaker.consecutive, 3);
+
+	const next = Config({
+		totalBudgetMs: 90_000, evidenceFetch: "off", evidenceMaxFiles: 1,
+		evidenceMaxBytes: 4_096, denialBreaker: { consecutive: 1, duplicate: 1, cooldownMs: 1_000 }
+	});
+	writeRef(source.totalBudgetMs, next.totalBudgetMs.get());
+	writeRef(source.evidenceFetch, next.evidenceFetch.get());
+	writeRef(source.evidenceMaxFiles, next.evidenceMaxFiles.get());
+	writeRef(source.evidenceMaxBytes, next.evidenceMaxBytes.get());
+	writeRef(source.denialBreaker, next.denialBreaker.get());
+
+	assert.equal(cfg.ai.totalBudgetMs, 90_000);
+	assert.equal(cfg.ai.evidenceFetch, "off", "关掉补证必须立刻生效");
+	assert.equal(cfg.ai.evidenceMaxFiles, 1);
+	assert.equal(cfg.ai.evidenceMaxBytes, 4_096);
+	assert.equal(cfg.denialBreaker.consecutive, 1, "熔断阈值收紧必须立刻生效");
+	assert.equal(cfg.denialBreaker.cooldownMs, 1_000);
+});
