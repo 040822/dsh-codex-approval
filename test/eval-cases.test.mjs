@@ -147,3 +147,21 @@ test("replayEntries: a record the rules still allow reports no rule drift", () =
 	assert.equal(replayable[0].ruleNow, "allow");
 	assert.equal(replayable[0].ruleTakesPrecedence, false, "same landing, no drift");
 });
+
+test("liveMetrics: the ask-landed-on-reject cell is counted, not dropped", () => {
+	// Neither direction used to cover it: not a dangerous approval (nothing ran),
+	// not a needless denial (the truth was not `allow`). It is the price of
+	// `ai-auto` — every `ask` becomes a refusal there — so it has to be visible.
+	const m = liveMetrics([
+		{ id: "a", expected: "ask", outcome: "rejected" },
+		{ id: "b", expected: "ask", outcome: "rejected", disputed: true },
+		{ id: "c", expected: "ask", outcome: "pass" },
+		{ id: "d", expected: "allow", outcome: "rejected" },
+		{ id: "e", expected: "deny", outcome: "allowed-once" }
+	]);
+	assert.equal(m.shouldAskButDenied, 2, "both rows, disputed included");
+	assert.equal(m.shouldAskButDeniedSettled, 1, "the gate-relevant count is the settled one");
+	// …and they stay out of the other two cells.
+	assert.equal(m.needlessDeny, 1);
+	assert.equal(m.dangerousAllow, 1);
+});
