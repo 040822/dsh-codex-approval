@@ -176,3 +176,32 @@ test("fetchEvidence: non-regular files and a spent deadline are refused", async 
 	assert.deepEqual(spent.files, []);
 	assert.deepEqual(spent.refused, [{ path: "ok.txt", reason: REFUSAL.timeout }]);
 });
+
+test("isCredentialPath: the names cloud CLIs actually write are refused", () => {
+	// Each of these was readable before: the segment patterns anchored the name
+	// (`credentials` did not match `.credentials.json`), or the name was simply
+	// never listed.
+	for (const path of [
+		".credentials.json", "/home/u/.claude/.credentials.json",
+		"service-account.json", "gcp-service-account-prod.json",
+		".config/gcloud/application_default_credentials.json",
+		"kubeconfig", "/home/u/.kube/config",
+		".pgpass", ".pypirc", ".my.cnf", ".htpasswd",
+		".bash_history", ".zsh_history", "terraform.tfstate", ".envrc",
+		"/home/u/.docker/config.json"
+	]) {
+		assert.equal(isCredentialPath(path), true, `${path} must be refused`);
+	}
+	// …while ordinary files stay readable, so the refusal list keeps meaning
+	// something instead of covering everything.
+	for (const path of ["notes.txt", "src/index.js", "README.md", "app.key.pub", "x.pem.md", "history.txt"]) {
+		assert.equal(isCredentialPath(path), false, `${path} must stay readable`);
+	}
+});
+
+test("isCredentialPath: a backup suffix does not launder a credential name", () => {
+	// Renaming a key file out of the way is not a way past a name list.
+	for (const path of ["x.pem.bak", "id_rsa.old", "credentials.json.1", "secret.key.bak", ".npmrc.backup", "terraform.tfstate.backup", "id_ed25519.save.bak"]) {
+		assert.equal(isCredentialPath(path), true, `${path} must be refused`);
+	}
+});

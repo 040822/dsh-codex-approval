@@ -55,23 +55,46 @@ const CREDENTIAL_PATH = [
 	/(^|\/)\.ssh(\/|$)/i,
 	/(^|\/)\.aws(\/|$)/i,
 	/(^|\/)\.gnupg(\/|$)/i,
+	/(^|\/)\.config\/gcloud(\/|$)/i,
+	/(^|\/)\.config\/gh(\/|$)/i,
 	/(^|\/)auth\.json$/i,
 	/(^|\/)\.codex(\/|$)/i,
 	/(^|\/)\.codex-run(\/|$)/i,
 	/(^|\/)\.dsh\/profiles(\/|$)/i,
 	/(^|\/)\.dsh\/settings\.yaml$/i,
 	/(^|\/)\.env(\.|$)/i,
+	/(^|\/)\.envrc$/i,
 	/(^|\/)id_(rsa|dsa|ecdsa|ed25519)$/i,
-	/\.(pem|key|p12|pfx|keystore)$/i,
-	/(^|\/)credentials(\.json)?$/i,
+	/\.(pem|key|p12|pfx|keystore|jks)$/i,
+	// `.credentials.json` — the dot-prefixed form — as well as `credentials.json`.
+	// The old pattern anchored the segment at `credentials`, so the name every
+	// cloud CLI actually writes went straight through.
+	/(^|\/)\.?credentials(\.json)?$/i,
+	/(^|\/)application_default_credentials\.json$/i,
+	// The segment may be prefixed (`gcp-service-account-prod.json`): anchoring it
+	// at the start of the name only caught the bare spelling.
+	/(^|\/)[^/]*service-account[^/]*\.json$/i,
+	/(^|\/)kubeconfig$/i,
+	/(^|\/)\.kube\/config$/i,
 	/(^|\/)\.npmrc$/i,
 	/(^|\/)\.git-credentials$/i,
 	/(^|\/)\.netrc$/i,
 	/(^|\/)_netrc$/i,
-	/(^|\/)\.config\/gh(\/|$)/i,
-	/(^|\/)\.docker\/config\.json$/i,
-	/(^|\/)\.kube\/config$/i
+	/(^|\/)\.pgpass$/i,
+	/(^|\/)\.pypirc$/i,
+	/(^|\/)\.my\.cnf$/i,
+	/(^|\/)\.htpasswd$/i,
+	/(^|\/)\.(?:bash|zsh|sh)_history$/i,
+	/(^|\/)terraform\.tfstate$/i,
+	/(^|\/)\.docker\/config\.json$/i
 ];
+
+/**
+ * Backup / version suffixes that leave a file exactly as sensitive as its base
+ * name. `x.pem.bak` and `id_rsa.old` are the same key with a suffix — renamed
+ * by anyone who has ever moved a credential aside, and previously readable here.
+ */
+const CREDENTIAL_SUFFIX = /\.(?:bak|backup|old|orig|tmp|temp|save|sav|swp|copy|disabled|\d+)$/i;
 
 /**
  * The largest file we are willing to pull into memory at all. Anything bigger is
@@ -110,9 +133,15 @@ export function parseNeeds(raw, maxFiles = 2) {
  * Whether a path looks like a credential file we never read. Works on the
  * requested path AND on a resolved one — a symlink must not smuggle a
  * credential in under an innocent name.
+ *
+ * Backup and version suffixes are stripped first: `x.pem.bak`, `id_rsa.old` and
+ * `credentials.json.1` are the same file, and "add a suffix" is not a way past
+ * a name list.
+ * @param path - the path to test
  */
 export function isCredentialPath(path) {
-	const normalized = path.replace(/\\/g, "/");
+	let normalized = String(path).replace(/\\/g, "/");
+	while (CREDENTIAL_SUFFIX.test(normalized)) normalized = normalized.replace(CREDENTIAL_SUFFIX, "");
 	return CREDENTIAL_PATH.some((pattern) => pattern.test(normalized));
 }
 

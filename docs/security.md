@@ -23,7 +23,7 @@
 - **补证是白名单只读**：裁判只能请求工作区内的文件——realpath 复核、拒凭据文件与二进制、超长截断并标注，拒绝原因同时进审计与第二轮判定；插件不给裁判 shell、目录列举或任意读盘能力
 - **原文进判**：规则与 AI 看到的是完整命令；截断只用于日志与 UI 预览
 - **证据门槛**：参数缺失 / 无法解析 / 命令超预算 → 不问 AI，直接交人类（`ai-auto` 下直接拒绝），审计标 `evidenceIncomplete`。这是"没看到操作"，不是"AI 判定不确定"，因此不受任何无人值守开关影响（`mode3OnAsk` / `hardAskOnUnattended` / `enforcedAskOnUnattended` 三项都已写死 `deny`）
-- **统一脱敏**：命令、reason、提权理由与会话骨架（`transcript: short` 的 `Context` 块，含 `[U]` / `[T]` 行）在进入 AI prompt、审计日志、拒绝反馈前一律脱敏；插件新建的审计日志为 `0600` 并按 `logMaxBytes` 轮转（**已存在的旧日志权限不会被自动改动**）
+- **统一脱敏**：命令、reason、提权理由、会话骨架（`transcript: short` 的 `Context` 块，含 `[U]` / `[T]` 行）、**补证文件正文**与裁判回显（`aiReason` / `aiEvidence` / `aiUnknowns`）在进入 AI prompt、审计日志、拒绝反馈前一律脱敏；覆盖认证头（保留 scheme）、环境变量风格的键名、URL 内嵌凭据（**保留 host**）、AWS/GitHub/npm/Slack/JWT/PEM 等无标签形态。插件新建的审计日志为 `0600` 并按 `logMaxBytes` 轮转（**已存在的旧日志权限不会被自动改动**）
 - **AI 调用有超时上限**（默认 15s，每个候选各自计时），失败默认交还人类（fail-open，不会静默全拒）
 - **取消传播**：审批期间取消会传播给模型链（`signal`），取消的请求审计为 `cancelled`，不会留下过时的 `allowed-once`
 - **审计对由宿主持久化**：`approval/asked` + `approval/decided` 由 dsh 审批服务写入，插件只追加自己的决策日志

@@ -339,3 +339,20 @@ test("buildJudgeMessages: unknown facts are omitted, keeping the previous payloa
 	assert.equal(Object.keys(payload).length, 3);
 	assert.match(user.content[0].text, /"command":"git status"/);
 });
+
+test("buildJudgeMessages: the evidence body goes through the redaction boundary", () => {
+	// This module's header calls itself the one boundary every command text
+	// travels; the evidence body was the path that skipped it, so a deploy
+	// script holding a token put that token in the prompt verbatim.
+	const messages = buildJudgeMessages({
+		toolName: "bash", argsText: "bash scripts/deploy.sh", reason: "",
+		evidence: [{ path: "scripts/deploy.sh", bytes: 120, text: 'TOKEN=ghp_abcdefghijklmnopqrstuvwxyz0123456789\naws s3 ls --region us-east-1' }]
+	});
+	const body = messages[1].content[0].text;
+	assert.ok(body.includes("Evidence"), "the evidence block is present");
+	assert.ok(!body.includes("ghp_abcdefghijklmnopqrstuvwxyz0123456789"), "the token must not reach the prompt");
+	assert.ok(body.includes("[REDACTED]"), "…and the label stays, so the judge still sees a credential was handled");
+	// The path and the AWS command around it survive: redaction changes the
+	// secret, not the shape of the evidence.
+	assert.ok(body.includes("aws s3 ls --region us-east-1"));
+});

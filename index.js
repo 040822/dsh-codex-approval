@@ -1922,9 +1922,12 @@ export function createHandler({ config, record, llmRunner, getSessionMode, denia
 					// The tolerance in force, so the decision can be replayed later.
 					tolerance: cfg.ai.riskTolerance,
 					...answered.verdict.userAuthorization === undefined ? {} : { userAuthorization: answered.verdict.userAuthorization },
-					...answered.verdict.evidence === undefined ? {} : { aiEvidence: answered.verdict.evidence },
-					...answered.verdict.unknowns === undefined ? {} : { aiUnknowns: answered.verdict.unknowns },
-					aiReason: answered.verdict.reason,
+					// The judge's own words go through the same boundary as everything
+					// else it was shown: it reads the (now redacted) evidence body, so
+					// whatever it echoes back must not carry a credential into the log.
+					...answered.verdict.evidence === undefined ? {} : { aiEvidence: answered.verdict.evidence.map((item) => redactSensitive(item)) },
+					...answered.verdict.unknowns === undefined ? {} : { aiUnknowns: answered.verdict.unknowns.map((item) => redactSensitive(item)) },
+					aiReason: redactSensitive(answered.verdict.reason),
 					...evidenceFetched === undefined ? {} : { evidenceFetched },
 					...evidenceRefused === undefined || evidenceRefused.length === 0 ? {} : { evidenceRefused },
 					...evidenceRoundFailed === true ? { evidenceRoundFailed: true } : {},

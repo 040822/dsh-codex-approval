@@ -29,6 +29,20 @@
 
 **验证（补三项后）**：单测 420/420（新增 `test/judge-budget.test.mjs`：预算抬升的两个方向、主路由 12 条非法取值、以及"主候选挂起时回退链真的被走到"的端到端用例）。
 
+再加一项（激进化的安全前提：无人值守下更多命令被自动放行，脱敏缺口的暴露面同步变大）：
+
+8. **统一脱敏的规则重写**。此前对 12 种常见凭据形态实测**漏 10 种**，其中两种是"看起来处理过了"的最坏形态：
+
+   - **环境变量风格的键名整体不生效**：标签规则用 `\b` 卡在关键词前，而 `_` 是词字符——`AWS_SECRET_ACCESS_KEY=`、`GITHUB_TOKEN=`、`npm config set …​:_authToken=` 前都没有词边界，整条规则不触发。现在标签按**整个键名**匹配（`[A-Za-z0-9_-]*<关键词>[A-Za-z0-9_-]*`）。
+   - **认证头只认 `Bearer`**：`Authorization: Basic <b64>` 被处理成 `Authorization: [REDACTED] <b64>`——标签涂黑、凭据（`user:password` 的 base64）留在明处。现在 scheme 保留、scheme 之后的值全部吃掉，且 scheme 不会被两条规则吃两次。
+   - **URL userinfo 无任何规则**：`https://user:pass@host` 原样进 prompt 与审计。现在凭据被替换，**host 保留**——占位符刻意不带方括号，因为 `[REDACTED]` 会破坏 URL authority，而 `command-facts.js` 正是从这段脱敏文本里提取主机（实测 `https://[REDACTED]@host` 被解析成主机 `redacted`，丢掉的恰是裁判最需要的线索）。URL 规则排在赋值规则**之前**，否则 `oauth2:glpat-…@host` 会被当成 `label: value` 而把整个 URL 尾巴当凭据吞掉。
+   - **补上无标签形态**：AWS `AKIA…`、GitHub `ghp_`/`github_pat_`、npm `npm_`、Slack `xox*`、JWT、PEM 私钥块、`-u user:pass`。
+9. **补证正文与模型回显过脱敏边界**。`buildJudgeMessages` 把证据文件正文原样拼进 prompt（`redact.js` 自述是"每条命令文本路径的唯一脱敏边界"，而证据正文是唯一跳过它的一条路），现在证据正文过同一遍；裁判回显的 `aiReason` / `aiEvidence` / `aiUnknowns` 写审计前也过一遍——它读的就是脱敏后的文本，回显不该把凭据带进日志。
+10. **补证凭据清单扩充 + 后缀剥离**。原清单漏掉云 CLI 真正写的名字：`.credentials.json`（段锚定要求以 `credentials` 开头，点前缀形式漏网）、`service-account*.json`（含 `gcp-` 前缀形式）、`kubeconfig`、`.pgpass`、`.pypirc`、`.my.cnf`、`.htpasswd`、`.bash_history`/`.zsh_history`、`terraform.tfstate`、`.envrc`、`.config/gcloud/`；且 `x.pem.bak` / `id_rsa.old` / `credentials.json.1` 这类**加后缀**即可绕过——现在后缀先剥离再判。
+
+**验证**：单测 427/427（脱敏新增 4 条用例共 30 余条断言，含"suffix 不能洗白凭据名"与"URL 里的 host 必须保留"两侧；凭据清单新增 2 条）。12 种形态探针复核：**12/12 正确脱敏，0 误伤**（无凭据的 URL 原样不动、`Authorization` 的 scheme 保留）。
+
+
 
 ---
 
