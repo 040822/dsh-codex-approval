@@ -2932,7 +2932,12 @@ test("handler: the second round is told which files were refused (finding 4)", a
 });
 
 test("handler: a read that outlives the budget is refused, not waited on (finding 5)", async () => {
-	const cfg = baseConfig({ rules: [], ai: { totalBudgetMs: 60 } });
+	// A SELF-CONSISTENT tiny budget: `timeoutMs` is set alongside it because a
+	// ceiling shorter than the per-candidate timeout is now lifted (see
+	// `judgeBudgetMs`). The old combination — 60ms total against the 15s default
+	// per-candidate timeout — was itself the misconfiguration that test now
+	// covers elsewhere, and it could no longer express "60ms total".
+	const cfg = baseConfig({ rules: [], ai: { totalBudgetMs: 60, timeoutMs: 60 } });
 	const records = [];
 	let calls = 0;
 	const hanging = () => new Promise(() => {});

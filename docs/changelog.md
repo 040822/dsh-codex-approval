@@ -21,6 +21,15 @@
 
 **验证**：单测 414/414（新增 `test/action-scope.test.mjs`，覆盖判据的两个方向与三条端到端场景）；双平面 `check-planes` 2/2；离线策略回归 18/18（新增 `p-ask-medium-in-scope` / `p-ask-medium-out-of-scope`，并修好 `p-ask-medium-no-auth`——它此前**声称**覆盖 `curl|sh` 却没给命令，实际跑的是默认 `echo hi`）。
 
+随后在同一工作区补的三项（同一目标：让 ai-auto 可被日常依赖）：
+
+5. **判定预算不再压死回退链**（`judgeBudgetMs`）。`ai.totalBudgetMs` 是硬上限，但**上限比单个候选的超时还短**时它表达不了部署的意图：`attemptJudge` 把每个候选压到剩余预算内，一个挂起的主候选就能吃光全部预算，配置好的 `fallbacks` 永远不会被尝试——而"主候选挂起"正是回退链存在的理由。本机实测（`timeoutMs: 60000` 撞上默认 `totalBudgetMs: 30000`）：82 条带 `judgeAttempts` 的记录**恒为 1**、`judgeFallbackFrom` **0 条**。现在上限会被抬到"链上每个候选各一次完整尝试"所需的量（配置值只升不降，`0` 仍然表示不设预算），并在 `plugin-loaded` 审计里同时记录配置值与生效值（`judgeBudget`）。
+6. **主判定路由的校验**。`ai.provider` / `ai.model` 此前是 `z.string()` 无 `min(1)`，且 `assertConfig` 完全不看它们——`ai.provider: ""` 让每次 `prepareCall` 抛错（被吞成 `failOpen`），`ai.timeoutMs: "15s"`（YAML 常见写法）一路走到 `AbortSignal.timeout()` 并在守卫之外抛错，把请求变成没有答复的审批。现在四者都有类型与范围校验（`timeoutMs` 1..600000、`maxTokens` 1..32768），而 `fallbacks` 条目本来就在两级校验——主路由反而没有，这个不对称一并消掉。
+7. **评测报告给出置信区间**（`wilsonUpper`）。报告里最常被引用的数字大多是零，而零事件只能给上界；`--repeat 3` 把 22 个非争议案例变成 66 行，按行数算上界 ≈ 4.5%、按**不同案例**算 ≈ 14.9%——差三倍。`--live` 的报告与 stdout 现在都在危险放行旁标注 95% 上界与它的分母（案例数，不是行数）。
+
+**验证（补三项后）**：单测 420/420（新增 `test/judge-budget.test.mjs`：预算抬升的两个方向、主路由 12 条非法取值、以及"主候选挂起时回退链真的被走到"的端到端用例）。
+
+
 ---
 
 ## v0.4.6 — 2026-10-06

@@ -803,6 +803,25 @@ function assertConfig(cfg) {
 	}
 	if (typeof cfg.ai !== "object" || cfg.ai === null) throw new TypeError("dsh-codex-approval: config.ai must be an object");
 	if (typeof cfg.ai.enabled !== "boolean") throw new TypeError("dsh-codex-approval: config.ai.enabled must be a boolean");
+	// The AI layer's own routing and timing. These are the switches for "is the
+	// judge alive at all", and until now none of them was checked: `ai.provider:
+	// ""` made every `prepareCall` throw (swallowed into `failOpen`), and a
+	// non-numeric `ai.timeoutMs` — YAML `timeoutMs: "15s"` is a common way to
+	// write it — reached `AbortSignal.timeout()`, which throws on anything that
+	// is not a non-negative integer. `fallbacks` entries were validated at both
+	// levels while the primary route was not.
+	if (typeof cfg.ai.provider !== "string" || cfg.ai.provider === "") {
+		throw new TypeError("dsh-codex-approval: config.ai.provider must be a non-empty string");
+	}
+	if (typeof cfg.ai.model !== "string" || cfg.ai.model === "") {
+		throw new TypeError("dsh-codex-approval: config.ai.model must be a non-empty string");
+	}
+	if (!Number.isSafeInteger(cfg.ai.timeoutMs) || cfg.ai.timeoutMs < 1 || cfg.ai.timeoutMs > 600_000) {
+		throw new TypeError("dsh-codex-approval: config.ai.timeoutMs must be an integer in 1..600000");
+	}
+	if (!Number.isSafeInteger(cfg.ai.maxTokens) || cfg.ai.maxTokens < 1 || cfg.ai.maxTokens > 32_768) {
+		throw new TypeError("dsh-codex-approval: config.ai.maxTokens must be an integer in 1..32768");
+	}
 	if (!TOLERANCES.includes(cfg.ai.riskTolerance)) throw new TypeError(`dsh-codex-approval: config.ai.riskTolerance must be one of ${TOLERANCES.join("/")}`);
 	if (!ACTIONS.includes(cfg.ai.failOpen)) throw new TypeError("dsh-codex-approval: config.ai.failOpen must be allow/ask/deny");
 	if (!Number.isSafeInteger(cfg.ai.maxJudgeCommandChars) || cfg.ai.maxJudgeCommandChars < 200 || cfg.ai.maxJudgeCommandChars > 200_000) {
@@ -1097,6 +1116,32 @@ function unparseableFailure(result) {
  * a candidate is never retried: the judge sits on the approval critical path,
  * where an extra model call is latency the user pays.
  */
+/**
+ * The budget one approval really gets.
+ *
+ * `ai.totalBudgetMs` is a hard ceiling, and the chain still stops when it runs
+ * out. But a ceiling SHORTER than one candidate's own timeout cannot express
+ * what the deployment asked for: `attemptJudge` clips each candidate to what
+ * the budget has left, so a primary that hangs consumes all of it and the
+ * configured `fallbacks` are never tried — the failure mode a fallback chain
+ * exists for. Measured on this machine before the fix: `timeoutMs: 60000`
+ * against the default `totalBudgetMs: 30000`, `judgeAttempts` = 1 in all 82
+ * records that carried it, `judgeFallbackFrom` = 0.
+ *
+ * The ceiling is therefore lifted to what one full attempt per candidate needs
+ * — the deployment already consented to that wait by setting `timeoutMs`. The
+ * configured value is never lowered, and `0` still disables the budget.
+ * @param ai - the effective `ai` config section
+ * @returns the effective budget in milliseconds, or 0 when unbudgeted
+ */
+export function judgeBudgetMs(ai) {
+	const total = ai?.totalBudgetMs;
+	if (!Number.isSafeInteger(total) || total <= 0) return 0;
+	const candidates = 1 + (Array.isArray(ai.fallbacks) ? ai.fallbacks.length : 0);
+	const perCandidate = Number.isSafeInteger(ai.timeoutMs) && ai.timeoutMs > 0 ? ai.timeoutMs : 0;
+	return Math.max(total, perCandidate * candidates);
+}
+
 export function makeLlmRunner(llm, configOrGetter) {
 	const getConfig = typeof configOrGetter === "function" ? configOrGetter : () => configOrGetter;
 	return async (messages, { signal, sessionId, deadline } = {}) => {
@@ -1776,7 +1821,12 @@ export function createHandler({ config, record, llmRunner, getSessionMode, denia
 			const judgeInput = { toolName: req.toolName, argsText, reason: reasonText, context, cwd, workdir: facts?.workdir, escalation, facts: textFacts };
 			// One budget for the whole approval: every candidate AND the evidence
 			// round share it, so a slow chain cannot stretch an approval to minutes.
-			const deadline = cfg.ai.totalBudgetMs > 0 ? started + cfg.ai.totalBudgetMs : undefined;
+			// `judgeBudgetMs` lifts a ceiling that would otherwise be shorter than a
+			// single candidate's own timeout — which is what silently disabled the
+			// fallback chain on this machine (`timeoutMs: 60000` vs the default
+			// `totalBudgetMs: 30000`).
+			const budgetMs = judgeBudgetMs(cfg.ai);
+			const deadline = budgetMs > 0 ? started + budgetMs : undefined;
 			const judged = await judgeWith({
 				runner: llmRunner,
 				input: judgeInput,
@@ -2637,6 +2687,15 @@ export async function apply(ctx, userConfig) {
 		ai: cfg.ai.enabled,
 		judge: `${cfg.ai.provider}/${cfg.ai.model}`,
 		judgeFallbacks: cfg.ai.fallbacks.map((entry) => `${entry.provider}/${entry.model}`),
+		// The budget actually in force, next to the configured one: a ceiling
+		// shorter than one candidate's own timeout is lifted (see judgeBudgetMs),
+		// and without this line that difference stayed invisible.
+		judgeBudget: {
+			configured: cfg.ai.totalBudgetMs,
+			effective: judgeBudgetMs(cfg.ai),
+			perCandidateMs: cfg.ai.timeoutMs,
+			candidates: 1 + cfg.ai.fallbacks.length
+		},
 		tolerance: cfg.ai.riskTolerance,
 		fallback: cfg.fallback,
 		denyFeedback: cfg.denyFeedback,

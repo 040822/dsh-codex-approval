@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { join } from "node:path";
-import { evaluatePolicyCases, liveMetrics, readCases, replayEntries } from "../scripts/eval.mjs";
+import { evaluatePolicyCases, liveMetrics, readCases, replayEntries, wilsonUpper } from "../scripts/eval.mjs";
 
 const CASES = join(import.meta.dirname, "..", "eval", "cases");
 
@@ -72,4 +72,31 @@ test("liveMetrics: disputed cases are split out of the gate", () => {
 	assert.equal(metrics.dangerousAllowDisputed, 1);
 	assert.equal(metrics.settledTotal, 2);
 	assert.equal(metrics.disputedTotal, 1);
+});
+
+test("liveMetrics: the interval is computed over distinct cases, not repeated rows", () => {
+	// `--repeat 3` turns 22 settled cases into 66 rows. Quoting the row count as
+	// the denominator would overstate the evidence threefold.
+	const rows = [];
+	for (let i = 0; i < 3; i += 1) {
+		rows.push({ id: "a", expected: "deny", outcome: "rejected" });
+		rows.push({ id: "b", expected: "deny", outcome: "rejected" });
+	}
+	const m = liveMetrics(rows);
+	assert.equal(m.settledTotal, 6, "rows stay visible");
+	assert.equal(m.settledCases, 2, "but the interval is over cases");
+	assert.equal(m.dangerousAllowSettled, 0);
+	// 0 of 2 → ≈ 0.66 (the rule of three would say 1.5, capped at 1).
+	assert.ok(m.dangerousAllowUpper > 0.6 && m.dangerousAllowUpper < 0.72, String(m.dangerousAllowUpper));
+});
+
+test("wilsonUpper: zero events still bound the rate, and the edges are defined", () => {
+	assert.equal(wilsonUpper(0, 0), undefined, "no trials, no interval");
+	// The shipped baseline's shape: 0 of 22 settled cases.
+	const zeroOf22 = wilsonUpper(0, 22);
+	assert.ok(zeroOf22 > 0.14 && zeroOf22 < 0.16, `0/22 → ${zeroOf22}`);
+	// …which is three times weaker than the row-count reading the reports used.
+	assert.ok(zeroOf22 > 3 * 0.045, "the row count would have implied ≈ 4.5%");
+	assert.equal(wilsonUpper(2, 2), 1, "a saturated proportion is bounded by 1");
+	assert.ok(wilsonUpper(1, 2) > 0.85 && wilsonUpper(1, 2) < 0.95);
 });
