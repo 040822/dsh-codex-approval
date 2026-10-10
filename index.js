@@ -1020,15 +1020,21 @@ function formatFailureError(kind, failure) {
  * them apart:
  *   1. a `finish` chunk reporting `error`/`aborted` → `ok:false` + `finishKind`
  *      + `failure` (the pre-existing transport-failure shape, unchanged);
- *   2. the stream ends without any `finish` chunk — an `AbortSignal` cutoff or
- *      a dropped connection — which is flagged `endedWithoutFinish` so an empty
- *      reply can be told apart from "the provider answered with nothing";
- *   3. a normal ending (`finish` with `stop`/`length`/…).
+ *   2. the stream ends without any `finish` chunk while this attempt's abort
+ *      flag is set — its own timeout fired, or the approval was cancelled →
+ *      the attempt fails here, whatever text arrived: a truncated reply may
+ *      already carry a complete-looking verdict, and the cut-off point must not
+ *      be what picks it;
+ *   3. the stream ends without a `finish` chunk while nothing aborted — a
+ *      dropped connection — flagged `endedWithoutFinish`, or a normal ending
+ *      (`finish` with `stop`/`length`/…).
  *
- * States 2 and 3 both return `ok:true` with the collected text: whether that
- * text is a *usable* verdict is decided by the chain (see makeLlmRunner), not
- * here — an empty reply is a candidate failure, not a successful attempt.
- * `textChars` is the diagnostic count of what actually arrived.
+ * A state-2 failure is a candidate failure like any other, so the chain
+ * advances (fallbacks) or `failOpen` answers. State 3 returns `ok:true` with
+ * the collected text: whether that text is a *usable* verdict is decided by the
+ * chain (see makeLlmRunner), not here — an empty reply is a candidate failure,
+ * not a successful attempt. `textChars` is the diagnostic count of what
+ * actually arrived.
  */
 async function attemptJudge(llm, candidate, { messages, signal, sessionId, timeoutMs, maxTokens }) {
 	const timeoutSignal = AbortSignal.timeout(timeoutMs);
@@ -1057,6 +1063,24 @@ async function attemptJudge(llm, candidate, { messages, signal, sessionId, timeo
 				}
 				sawFinish = true;
 			}
+		}
+		// A stream cut short by this candidate's own timeout must not be judged on.
+		// An adapter that honours `signal` may end *cleanly* — no `finish` chunk —
+		// while a partial reply is already in hand, and a partial reply can carry a
+		// complete-looking verdict: a stream truncated between a draft verdict and
+		// the final one leaves exactly one parseable object, so the cut-off point
+		// would be what decides the outcome. The abort flag is the deterministic
+		// evidence, so it wins over the text that arrived.
+		if (combined.aborted === true) {
+			const timedOut = timeoutSignal.aborted === true;
+			return {
+				ok: false,
+				error: timedOut
+					? `judge attempt did not finish within ${timeoutMs}ms`
+					: "judge attempt was cancelled",
+				finishKind: timedOut ? "timeout" : "aborted",
+				...timedOut ? { hardTimeout: true } : {}
+			};
 		}
 		return {
 			ok: true,

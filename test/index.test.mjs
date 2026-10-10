@@ -41,8 +41,10 @@ const VERDICT_TEXT = '{"risk":"low","authorization":"allow","reason":"read-only"
 /**
  * A stub `ctx.llm` answering per `provider/model`, recording every call.
  * `{ text }` streams that text and a normal `finish`; `{ text, noFinish: true }`
- * ends the stream without any finish chunk (an AbortSignal cutoff or a dropped
- * connection); `{ error }` reports a provider failure.
+ * ends the stream without any finish chunk (a dropped connection); `{ text,
+ * awaitAbort: true }` streams the text and then parks until the attempt's own
+ * abort fires, ending cleanly without a finish chunk — the truncated-stream
+ * shape of §3.1.10; `{ error }` reports a provider failure.
  */
 function makeStubLlm(answerByModel, calls = []) {
 	return {
@@ -51,12 +53,20 @@ function makeStubLlm(answerByModel, calls = []) {
 			const answer = answerByModel[`${config.provider}/${config.model}`] ?? {};
 			return {
 				config,
-				stream: async function* () {
+				stream: async function* (streamArgs = {}) {
 					if (answer.error !== undefined) {
 						yield { type: "finish", reason: { kind: "error", failure: answer.error } };
 						return;
 					}
 					yield { type: "text-delta", text: answer.text ?? "" };
+					if (answer.awaitAbort === true) {
+						const signal = streamArgs.signal;
+						await new Promise((resolve) => {
+							if (signal?.aborted === true) resolve();
+							else signal?.addEventListener("abort", resolve, { once: true });
+						});
+						return;
+					}
 					if (answer.noFinish !== true) yield { type: "finish", reason: { kind: "stop" } };
 				}
 			};
@@ -1503,6 +1513,58 @@ test("handler: a stream that ends without a finish chunk is flagged in the audit
 	assert.equal(entries[0].error, "unparseable judge output (empty reply)");
 	assert.equal(entries[0].endedWithoutFinish, true);
 	assert.equal(entries[0].textChars, 0);
+});
+
+test("handler: a reply truncated by the candidate timeout is not judged on, even when a verdict already arrived", async () => {
+	// §3.1.10：流先吐完整 verdict、再挂住直到候选超时触发，然后「干净」结束（没有
+	// finish chunk）。这样的文本此前会被当作正常判定采信——截断点于是成了判定的
+	// 选择者：若截断落在草稿 JSON 与最终 verdict 之间，只剩一个可解析对象，草稿
+	// 就成了判定。中止标志是确定性的证据，它必须压过已经到手的那段文本。
+	const llm = makeStubLlm({ "cpa-wx301/judge-model": { text: VERDICT_TEXT, awaitAbort: true } });
+	const cfg = baseConfig({
+		rules: [],
+		ai: { provider: "cpa-wx301", model: "judge-model", timeoutMs: 60, failOpen: "ask" }
+	});
+	const entries = [];
+	const handler = createHandler({
+		config: cfg,
+		record: async (entry) => entries.push(entry),
+		llmRunner: makeLlmRunner(llm, () => cfg.ai)
+	});
+	const { outcome } = await run(handler, makeReq({ command: "something" }));
+	assert.notEqual(outcome, "allowed-once");
+	assert.equal(entries[0].kind, "ai-error");
+	assert.equal(entries[0].finishKind, "timeout");
+	assert.equal(entries[0].error, "judge attempt did not finish within 60ms");
+});
+
+test("handler: a truncated candidate advances the chain instead of deciding", async () => {
+	const llm = makeStubLlm({
+		"cpa-wx301/judge-model": { text: VERDICT_TEXT, awaitAbort: true },
+		"deepseek-official/deepseek-flash": { text: VERDICT_TEXT }
+	});
+	const cfg = baseConfig({
+		rules: [],
+		ai: {
+			provider: "cpa-wx301",
+			model: "judge-model",
+			timeoutMs: 60,
+			fallbacks: [{ provider: "deepseek-official", model: "deepseek-flash" }]
+		}
+	});
+	const entries = [];
+	const handler = createHandler({
+		config: cfg,
+		record: async (entry) => entries.push(entry),
+		llmRunner: makeLlmRunner(llm, () => cfg.ai)
+	});
+	const { outcome } = await run(handler, makeReq({ command: "something" }));
+	// 被截断的主候选算一次失败尝试，链前进到 fallback——而不是用它的半截文本定案。
+	assert.equal(outcome, "allowed-once");
+	assert.equal(entries[0].kind, "ai");
+	assert.equal(entries[0].judgeAttempts, 2);
+	assert.equal(entries[0].judgeFallbackFrom, "cpa-wx301/judge-model");
+	assert.equal(entries[0].judgeModel, "deepseek-official/deepseek-flash");
 });
 
 test("handler: text without a verdict is audited as no-verdict, with the original text kept", async () => {
